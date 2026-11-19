@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 
 use windows_sys::Win32::System::EventLog::{
-    EVT_HANDLE, EvtClose, EvtFormatMessage, EvtNext, EvtOpenPublisherMetadata, EvtQuery, EvtRender, EvtSubscribe,
+    EVT_HANDLE, EVT_VARIANT, EvtClose, EvtFormatMessage, EvtNext, EvtOpenPublisherMetadata, EvtQuery, EvtRender,
+    EvtSubscribe,
 };
 use windows_sys::Win32::System::Time::SystemTimeToFileTime;
 
@@ -305,23 +306,41 @@ unsafe fn render_xml(ev: EVT_HANDLE) -> Option<String> {
     }
 }
 
-unsafe fn format_message(meta: EVT_HANDLE, ev: EVT_HANDLE) -> Option<String> {
+/// Variante stringa di `EVT_VARIANT`, per passare a Windows valori al posto di quelli dell'evento.
+#[repr(C)]
+struct StringVariant {
+    text: *const u16,
+    count: u32,
+    kind: u32,
+}
+
+fn squeeze(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Testo dell'evento composto da Windows. Con `values` non vuoto quei valori prendono il posto
+/// dei dati dell'evento.
+unsafe fn format_message(meta: EVT_HANDLE, ev: EVT_HANDLE, values: &[Vec<u16>]) -> Option<String> {
     unsafe {
         if meta == 0 as EVT_HANDLE {
             return None;
         }
+        let variants: Vec<StringVariant> = values
+            .iter()
+            .map(|v| StringVariant {
+                text: v.as_ptr(),
+                // Per le stringhe Windows vuole qui la lunghezza in caratteri, senza lo zero finale.
+                count: v.len().saturating_sub(1) as u32,
+                kind: 1, // EvtVarTypeString
+            })
+            .collect();
+        let (count, ptr) = if variants.is_empty() {
+            (0, null())
+        } else {
+            (variants.len() as u32, variants.as_ptr() as *const EVT_VARIANT)
+        };
         let mut used = 0u32;
-        EvtFormatMessage(
-            meta,
-            ev,
-            0,
-            0,
-            null(),
-            EVT_FORMAT_MESSAGE_EVENT,
-            0,
-            null_mut(),
-            &mut used,
-        );
+        EvtFormatMessage(meta, ev, 0, count, ptr, EVT_FORMAT_MESSAGE_EVENT, 0, null_mut(), &mut used);
         if used == 0 {
             return None;
         }
@@ -330,8 +349,8 @@ unsafe fn format_message(meta: EVT_HANDLE, ev: EVT_HANDLE) -> Option<String> {
             meta,
             ev,
             0,
-            0,
-            null(),
+            count,
+            ptr,
             EVT_FORMAT_MESSAGE_EVENT,
             buf.len() as u32,
             buf.as_mut_ptr(),
@@ -340,9 +359,115 @@ unsafe fn format_message(meta: EVT_HANDLE, ev: EVT_HANDLE) -> Option<String> {
         {
             return None;
         }
-        let s = win::from_wide(&buf);
-        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let s = squeeze(&win::from_wide(&buf));
         if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+// Comporre il testo con Windows costa circa 0,3 ms a evento, quasi tutto il tempo di una lettura:
+// un disco guasto scrive decine di migliaia di eventi uguali nella forma. Per ogni tipo di evento
+// si chiede quindi a Windows il testo una volta con dei segnaposto al posto dei dati, e poi i dati
+// si inseriscono qui. Il modello vale solo dopo aver riprodotto esattamente il testo di Windows su
+// alcuni eventi veri; altrimenti per quel tipo si continua a chiedere il testo a Windows (succede
+// quando Windows traduce un dato, per esempio un codice di stato nella sua descrizione), ricordando
+// però i testi già composti: gli eventi ripetuti di uno stesso volume hanno gli stessi dati.
+
+const MARK_OPEN: char = '\u{E000}';
+const MARK_CLOSE: char = '\u{E001}';
+/// Quanti eventi devono coincidere con il testo di Windows prima di fidarsi del modello.
+const TEMPLATE_CHECKS: u8 = 3;
+/// Testi ricordati per ogni tipo di evento senza modello.
+const EXACT_MEMORY: usize = 2000;
+
+enum MsgKind {
+    Template { text: String, checks: u8 },
+    /// Testi composti da Windows, per insieme di dati.
+    Exact { seen: HashMap<String, Option<String>> },
+}
+
+impl MsgKind {
+    fn exact(values: &[String], message: &Option<String>) -> MsgKind {
+        MsgKind::Exact {
+            seen: HashMap::from([(values.join("\u{1F}"), message.clone())]),
+        }
+    }
+}
+
+/// Chiave: sorgente, codice, versione e numero di dati dell'evento.
+type MsgKey = (String, u32, u32, usize);
+
+static MSG_KINDS: std::sync::LazyLock<Mutex<HashMap<MsgKey, MsgKind>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Inserisce i dati dell'evento nel modello; `None` se il modello cita un dato che non c'è.
+fn fill_template(template: &str, values: &[String]) -> Option<String> {
+    let mut out = String::with_capacity(template.len() + 64);
+    let mut rest = template;
+    while let Some(i) = rest.find(MARK_OPEN) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + MARK_OPEN.len_utf8()..];
+        let end = after.find(MARK_CLOSE)?;
+        out.push_str(values.get(after[..end].parse::<usize>().ok()?)?);
+        rest = &after[end + MARK_CLOSE.len_utf8()..];
+    }
+    out.push_str(rest);
+    Some(squeeze(&out))
+}
+
+unsafe fn message_for(meta: EVT_HANDLE, ev: EVT_HANDLE, key: MsgKey, values: &[String]) -> Option<String> {
+    unsafe {
+        if meta == 0 as EVT_HANDLE {
+            return None;
+        }
+        if FORCE_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
+            return format_message(meta, ev, &[]);
+        }
+        let mut kinds = MSG_KINDS.lock().ok()?;
+        match kinds.get_mut(&key) {
+            Some(MsgKind::Exact { seen }) => {
+                let data = values.join("\u{1F}");
+                if let Some(known) = seen.get(&data) {
+                    return known.clone();
+                }
+                let exact = format_message(meta, ev, &[]);
+                if seen.len() < EXACT_MEMORY {
+                    seen.insert(data, exact.clone());
+                }
+                exact
+            }
+            Some(MsgKind::Template { text, checks }) => {
+                let mine = fill_template(text, values);
+                if *checks >= TEMPLATE_CHECKS && mine.is_some() {
+                    return mine;
+                }
+                let exact = format_message(meta, ev, &[]);
+                if exact.is_some() && exact == mine {
+                    *checks += 1;
+                } else {
+                    kinds.insert(key, MsgKind::exact(values, &exact));
+                }
+                exact
+            }
+            None => {
+                let exact = format_message(meta, ev, &[]);
+                let marks: Vec<Vec<u16>> = (0..values.len())
+                    .map(|i| win::wide(&format!("{MARK_OPEN}{i}{MARK_CLOSE}")))
+                    .collect();
+                let template = if marks.is_empty() {
+                    exact.clone()
+                } else {
+                    format_message(meta, ev, &marks)
+                };
+                let kind = match template {
+                    Some(text) if exact.is_some() && fill_template(&text, values) == exact => {
+                        MsgKind::Template { text, checks: 1 }
+                    }
+                    _ => MsgKind::exact(values, &exact),
+                };
+                kinds.insert(key, kind);
+                exact
+            }
+        }
     }
 }
 
@@ -356,10 +481,14 @@ unsafe fn build_event(ev: EVT_HANDLE, metas: &mut HashMap<String, EVT_HANDLE>, b
             EvtOpenPublisherMetadata(0 as EVT_HANDLE, w.as_ptr(), null(), 0, 0)
         });
         let values = data_values(&xml);
-        let message = format_message(meta, ev).unwrap_or_else(|| values.join(" · "));
         let id = tag_text(&xml, "EventID")
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
+        let version = tag_text(&xml, "Version")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let message = message_for(meta, ev, (provider.clone(), id, version, values.len()), &values)
+            .unwrap_or_else(|| values.join(" · "));
         let filetime = attr_value(&xml, "TimeCreated", "SystemTime")
             .map(parse_time)
             .unwrap_or(0);
@@ -472,6 +601,58 @@ impl Drop for Subscription {
     }
 }
 
+/// Con questo acceso il testo di ogni evento viene chiesto a Windows, senza modelli: serve solo a
+/// `check` per avere il termine di paragone.
+static FORCE_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Verifica (`--check-events`): legge gli stessi eventi con i modelli e chiedendo ogni testo a
+/// Windows, confronta i risultati uno a uno e stampa i tempi.
+pub fn check(hours: u64, max: usize) -> bool {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let query = xpath(&format!("TimeCreated[timediff(@SystemTime) <= {}]", hours * 3_600_000));
+    let t = Instant::now();
+    let fast = run_query(&query, true, max);
+    let fast_secs = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let again = run_query(&query, true, max);
+    let again_secs = t.elapsed().as_secs_f64();
+    FORCE_EXACT.store(true, Ordering::SeqCst);
+    let t = Instant::now();
+    let exact = run_query(&query, true, max);
+    let exact_secs = t.elapsed().as_secs_f64();
+    FORCE_EXACT.store(false, Ordering::SeqCst);
+
+    let reference: HashMap<u64, &StorEvent> = exact.iter().map(|e| (e.record_id, e)).collect();
+    let (mut compared, mut different) = (0usize, 0usize);
+    for e in fast.iter().chain(again.iter()) {
+        let Some(r) = reference.get(&e.record_id) else { continue };
+        compared += 1;
+        if e.message != r.message || e.disk != r.disk || e.letter != r.letter {
+            different += 1;
+            if different <= 5 {
+                println!("  DIVERSO {} {}:\n    modello: {}\n    Windows: {}", e.provider, e.id, e.message, r.message);
+            }
+        }
+    }
+    let (mut with_template, mut without) = (0usize, 0usize);
+    if let Ok(kinds) = MSG_KINDS.lock() {
+        for kind in kinds.values() {
+            match kind {
+                MsgKind::Template { .. } => with_template += 1,
+                MsgKind::Exact { .. } => without += 1,
+            }
+        }
+    }
+    println!("Eventi letti: {} (ultime {hours} ore, al massimo {max})", fast.len());
+    println!("  con i modelli, prima lettura:  {fast_secs:.2} s");
+    println!("  con i modelli, letture dopo:   {again_secs:.2} s");
+    println!("  testo chiesto a Windows:       {exact_secs:.2} s");
+    println!("  tipi di evento con modello: {with_template}, senza: {without}");
+    println!("  testi confrontati: {compared}, diversi: {different}");
+    different == 0
+}
+
 fn run_query(query: &[u16], reverse: bool, max: usize) -> Vec<StorEvent> {
     let mut out = Vec::new();
     let channel = win::wide("System");
@@ -486,7 +667,7 @@ fn run_query(query: &[u16], reverse: bool, max: usize) -> Vec<StorEvent> {
         let boot = boot_filetime();
         let mut metas: HashMap<String, EVT_HANDLE> = HashMap::new();
         'outer: loop {
-            let mut handles = [0 as EVT_HANDLE; 32];
+            let mut handles = [0 as EVT_HANDLE; 128];
             let mut got = 0u32;
             if EvtNext(hq, handles.len() as u32, handles.as_mut_ptr(), 2000, 0, &mut got) == 0 || got == 0 {
                 break;

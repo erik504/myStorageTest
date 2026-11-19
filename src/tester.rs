@@ -202,6 +202,13 @@ pub struct Shared {
     pub cleaned: Option<bool>,
     /// Eventi di sistema sul disco registrati durante la prova.
     pub sys_events: Vec<StorEvent>,
+    /// Scansione della superficie, lungo il disco e non nel tempo: per ogni tratto letto la
+    /// posizione in byte, la velocità in MB/s e la latenza più alta in millisecondi.
+    pub surface: Vec<[f64; 3]>,
+    /// Posizioni in byte dei blocchi che non si sono lasciati leggere.
+    pub surface_bad: Vec<u64>,
+    /// Dimensione in byte dell'area da scandire (0 = scansione non richiesta).
+    pub surface_len: u64,
 }
 
 impl Shared {
@@ -224,6 +231,19 @@ impl Shared {
     }
 }
 
+/// Numero massimo di tratti conservati per il grafico della superficie.
+const SURFACE_MAX_POINTS: usize = 4000;
+
+/// Punto del grafico della superficie da un tratto (inizio, byte letti, tempo, latenza più alta).
+fn surface_point(tract: (u64, u64, f64, f64)) -> [f64; 3] {
+    let speed = if tract.2 > 0.0 {
+        tract.1 as f64 / tract.2 / 1e6
+    } else {
+        0.0
+    };
+    [tract.0 as f64, speed, tract.3 * 1000.0]
+}
+
 /// Microsecondi rappresentati dal limite inferiore di un secchio dell'istogramma.
 pub fn bucket_micros(i: usize) -> f64 {
     10f64.powf(i as f64 / HIST_PER_DECADE as f64)
@@ -240,6 +260,8 @@ pub struct TestRun {
     stop: Arc<AtomicBool>,
     op_started: Arc<AtomicU64>,
     t0: Instant,
+    /// Data e ora di inizio, per riconoscere la prova quando la si rivede più tardi.
+    pub started: String,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -272,6 +294,7 @@ impl TestRun {
             stop,
             op_started,
             t0,
+            started: win::now_string(),
             thread: Some(thread),
         }
     }
@@ -1421,9 +1444,14 @@ impl Engine {
             Ok(_) => u64::from_le_bytes(len_buf),
             Err(_) => self.cfg.total,
         };
+        self.shared.lock().unwrap().surface_len = length;
         let mut buf = AlignedBuf::new(SURFACE_BLOCK);
         let mut off = 0u64;
         let mut completed = true;
+        // Tratto di disco in corso: inizio, byte letti, tempo di lettura, latenza più alta.
+        let mut tract = (0u64, 0u64, 0.0f64, 0.0f64);
+        let mut tract_every = Duration::from_millis(100);
+        let mut tract_since = Instant::now();
         while off < length {
             if self.halted() {
                 completed = false;
@@ -1438,10 +1466,19 @@ impl Engine {
                 Ok(0) => break,
                 Ok(n) => {
                     s.add(self, n as u64, dt, "lettura della superficie");
+                    tract.1 += n as u64;
+                    tract.2 += dt;
+                    tract.3 = tract.3.max(dt);
                     off += n as u64;
                 }
                 Err(code) => {
                     s.errors += 1;
+                    {
+                        let mut sh = self.shared.lock().unwrap();
+                        if sh.surface_bad.len() < SURFACE_MAX_POINTS {
+                            sh.surface_bad.push(off);
+                        }
+                    }
                     let class = self.error(Phase::Surface, "lettura", &path, off, want as u32, code);
                     if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
                         completed = false;
@@ -1450,7 +1487,25 @@ impl Engine {
                     off += want as u64;
                 }
             }
+            if tract.1 > 0 && (tract_since.elapsed() >= tract_every || off >= length) {
+                let mut sh = self.shared.lock().unwrap();
+                sh.surface.push(surface_point(tract));
+                // Oltre il limite i tratti si fondono a due a due e da lì in poi durano il doppio.
+                if sh.surface.len() > SURFACE_MAX_POINTS {
+                    sh.surface = sh
+                        .surface
+                        .chunks(2)
+                        .map(|c| [c[0][0], c.iter().map(|p| p[1]).sum::<f64>() / c.len() as f64, c.iter().map(|p| p[2]).fold(0.0, f64::max)])
+                        .collect();
+                    tract_every *= 2;
+                }
+                tract = (off, 0, 0.0, 0.0);
+                tract_since = Instant::now();
+            }
             self.progress(off as f64 / length as f64);
+        }
+        if tract.1 > 0 {
+            self.shared.lock().unwrap().surface.push(surface_point(tract));
         }
         let note = format!(
             "{} letti su {}",

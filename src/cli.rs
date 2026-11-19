@@ -19,6 +19,10 @@ Uso:
   mystoragetest --list              elenca volumi e dischi
   mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
   mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
+  mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
+  mystoragetest --selftest N breve|estesa|stop
+                                    avvia o interrompe l'autodiagnosi del disco N (da amministratore)
+  mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
   mystoragetest --test X: [opzioni] esegue le prove sul volume X:
 
 Opzioni di --test:
@@ -36,7 +40,7 @@ pub fn run(args: &[String]) -> Option<i32> {
     let first = args.first()?.as_str();
     if !matches!(
         first,
-        "--list" | "--smart" | "--events" | "--test" | "--quit" | "--help" | "-h" | "/?"
+        "--list" | "--smart" | "--events" | "--test" | "--quit" | "--help" | "-h" | "/?" | "--check-events" | "--selftest"
     ) {
         return None;
     }
@@ -62,6 +66,11 @@ pub fn run(args: &[String]) -> Option<i32> {
                 }
             }
         }
+        "--check-events" => {
+            let max = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+            if eventlog::check(720, max) { 0 } else { 2 }
+        }
+        "--selftest" => selftest_cmd(&args[1..]),
         "--list" => list(),
         "--smart" => smart_cmd(args.get(1).and_then(|s| s.parse().ok())),
         "--events" => events(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(24)),
@@ -282,4 +291,72 @@ fn test(args: &[String]) -> i32 {
         Some(Outcome::Failed) => 2,
         _ => 3,
     }
+}
+
+/// `--selftest [N] [breve|estesa|stop]`: stato dell'autodiagnosi, oppure avvio o interruzione sul disco N.
+fn selftest_cmd(args: &[String]) -> i32 {
+    let only: Option<u32> = args.first().and_then(|s| s.parse().ok());
+    let action = args.iter().find_map(|a| match a.to_lowercase().as_str() {
+        "breve" | "short" => Some(smart::SelfTestCmd::Short),
+        "estesa" | "esteso" | "long" | "extended" => Some(smart::SelfTestCmd::Extended),
+        "stop" | "interrompi" | "abort" => Some(smart::SelfTestCmd::Abort),
+        _ => None,
+    });
+    let inv = disks::scan();
+    if let Some(cmd) = action {
+        let Some(disk) = only.and_then(|n| inv.disk(n)) else {
+            println!("Indicare il numero del disco, per esempio: --selftest 2 breve");
+            return 2;
+        };
+        return match smart::self_test(disk, cmd) {
+            Ok(()) => {
+                println!("{} sul disco {}: comando accettato.", cmd.label(), disk.number);
+                0
+            }
+            Err(e) => {
+                println!("{} sul disco {} non riuscita: {e}.", cmd.label(), disk.number);
+                2
+            }
+        };
+    }
+    for d in inv.disks.iter().filter(|d| only.is_none_or(|n| n == d.number)) {
+        let r = smart::read(d);
+        let st = &r.selftest;
+        println!("Disco {} — {} ({})", d.number, d.title(), bus_name(d.bus));
+        if !r.available {
+            println!("  SMART non disponibile. {}\n", r.note);
+            continue;
+        }
+        if !st.supported {
+            println!("  Il disco non dichiara l'autodiagnosi.\n");
+            continue;
+        }
+        let minutes = |m: Option<u32>| m.map(|m| format!("circa {m} min")).unwrap_or_else(|| "durata non dichiarata".into());
+        println!(
+            "  Autodiagnosi disponibile · breve: {} · estesa: {}",
+            minutes(st.short_minutes),
+            minutes(st.extended_minutes)
+        );
+        match &st.running {
+            Some((kind, done)) => println!("  In corso: {kind}, {done} % completato"),
+            None => println!("  Nessuna prova in corso"),
+        }
+        if st.cannot_start.is_empty() {
+            println!("  Si può avviare da qui");
+        } else {
+            println!("  Non si può avviare da qui: {}", st.cannot_start);
+        }
+        if st.entries.is_empty() {
+            println!("  Nessuna prova registrata");
+        } else if !st.full_log {
+            println!("  Registro delle prove non leggibile senza comandi diretti; esito dell'ultima:");
+        }
+        for e in st.entries.iter().take(8) {
+            let hours = e.hours.map(|h| format!("a {h} ore di accensione")).unwrap_or_default();
+            let lba = e.lba.map(|l| format!(" · primo errore al blocco {l}")).unwrap_or_default();
+            println!("    {:<14} {:<48} {hours}{lba}", e.kind, e.result);
+        }
+        println!();
+    }
+    0
 }

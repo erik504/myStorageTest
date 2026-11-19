@@ -1,8 +1,10 @@
 [package]
 name = "mystoragetest"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Test, diagnosi e monitoraggio dei dischi per Windows 10 e 11"
+license = "MIT"
+repository = "https://github.com/erik504/myStorageTest"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }

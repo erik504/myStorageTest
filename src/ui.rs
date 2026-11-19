@@ -12,7 +12,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextStyle,
     Ui, Vec2, ViewportCommand, vec2,
 };
-use egui_plot::{Bar, BarChart, GridInput, GridMark, Line, Plot, PlotPoints, Points, VLine};
+use egui_plot::{Bar, BarChart, GridInput, GridMark, HLine, Line, LineStyle, Plot, PlotPoints, Points, VLine};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 use crate::disks::{self, Inventory, PhysDisk, Volume, bus_name};
@@ -20,13 +20,13 @@ use crate::eventlog::{self, StorEvent};
 use crate::icon::{self, Tone};
 use crate::monitor::Monitor;
 use crate::settings::{self, Settings};
-use crate::smart::{self, Health, SmartReport};
+use crate::smart::{self, Health, SelfTestCmd, SmartReport};
 use crate::tester::{self, HIST_BUCKETS, LogLevel, Outcome, Phase, TestConfig, TestRun};
 use crate::tray::{self, Tray, TrayEvent};
 use crate::win::{self, human_bytes};
 
 /// Numero massimo di eventi di sistema caricati nella scheda Eventi.
-const EVENTS_MAX: usize = 20_000;
+const EVENTS_MAX: usize = 100_000;
 
 const BG: Color32 = Color32::from_rgb(13, 16, 22);
 const PANEL: Color32 = Color32::from_rgb(18, 22, 30);
@@ -230,8 +230,11 @@ enum Tab {
     Test,
     Smart,
     Events,
-    Monitor,
+    Temp,
 }
+
+/// Nome sulla riga di comando della pagina del monitoraggio, che non appartiene a un disco.
+const MONITOR_KEY: &str = "monitoraggio";
 
 impl Tab {
     /// Nome usato sulla riga di comando per riaprire la stessa scheda dopo un riavvio.
@@ -240,16 +243,26 @@ impl Tab {
             Tab::Test => "test",
             Tab::Smart => "smart",
             Tab::Events => "eventi",
-            Tab::Monitor => "monitoraggio",
+            Tab::Temp => "temperatura",
         }
     }
 
     fn from_key(s: &str) -> Option<Tab> {
-        [Tab::Test, Tab::Smart, Tab::Events, Tab::Monitor]
+        [Tab::Test, Tab::Smart, Tab::Events, Tab::Temp]
             .into_iter()
             .find(|t| t.key() == s)
     }
 }
+
+/// Identità di un disco che non cambia quando Windows lo rinumera: modello e numero di serie.
+fn disk_key(d: &PhysDisk) -> String {
+    format!("{}|{}", d.model, d.serial)
+}
+
+/// Ogni quanto si rileggono temperatura e SMART degli SSD interni mentre il programma è aperto.
+const SAMPLE_SECS: u64 = 30;
+/// Campioni di temperatura conservati per disco (a 30 secondi sono circa sette giorni).
+const TEMPS_MAX: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sel {
@@ -268,6 +281,8 @@ struct Startup {
     selected: Option<Sel>,
     /// `--tab NOME`: scheda da aprire.
     tab: Option<Tab>,
+    /// `--tab monitoraggio`: apre la pagina del monitoraggio.
+    monitor_view: bool,
 }
 
 impl Startup {
@@ -281,6 +296,7 @@ impl Startup {
                 .map(|c| Sel::Volume(c.to_ascii_uppercase()))
                 .or_else(|| value("--disk").and_then(|s| s.parse().ok()).map(Sel::Disk)),
             tab: value("--tab").and_then(|s| Tab::from_key(s)),
+            monitor_view: value("--tab").is_some_and(|s| s == MONITOR_KEY),
         }
     }
 }
@@ -304,6 +320,10 @@ struct Script {
     next_at: Instant,
     busy: Arc<AtomicBool>,
     autotest: bool,
+    /// Disco su cui gira la prova, per tornarci dopo averne guardato un altro.
+    home: Option<Sel>,
+    /// Secondo volume provato insieme al primo, se richiesto.
+    second: Option<Sel>,
 }
 
 pub struct App {
@@ -316,11 +336,31 @@ pub struct App {
     selected: Option<Sel>,
     tab: Tab,
     opt: TestOptions,
-    run: Option<TestRun>,
+    /// Una prova per volume: la pagina Test di ogni disco resta com'era anche dopo la fine della
+    /// prova e quando si guarda un altro disco.
+    runs: HashMap<char, TestRun>,
+    /// Vero quando l'area principale mostra il monitoraggio invece di un disco.
+    monitor_view: bool,
     smart: HashMap<u32, SmartReport>,
     smart_rx: Option<Receiver<Vec<SmartReport>>>,
+    /// Storico delle temperature della sessione per disco (vedi `disk_key`): secondi dall'avvio
+    /// del programma e gradi.
+    temps: HashMap<String, Vec<[f64; 2]>>,
+    session_start: Instant,
+    session_start_ft: u64,
+    /// Prossima rilettura periodica dello SMART (temperature e autodiagnosi).
+    next_sample: Instant,
+    /// Ultima rilettura dei dischi lenti da svegliare: USB e dischi a piatti.
+    slow_sampled: Instant,
+    /// Comando di autodiagnosi in corso di invio: disco, comando, esito.
+    selftest_rx: Option<Receiver<(u32, SelfTestCmd, Result<(), String>)>>,
+    /// Ultimo messaggio sull'autodiagnosi di ogni disco: riuscito o no, testo.
+    selftest_note: HashMap<u32, (bool, String)>,
+    /// Dischi con un'autodiagnosi in corso all'ultima lettura.
+    selftest_running: HashMap<u32, &'static str>,
     events: Vec<StorEvent>,
-    events_rx: Option<Receiver<Vec<StorEvent>>>,
+    /// Lettura degli eventi in corso: vero se aggiunge solo quelli nuovi a quelli già letti.
+    events_rx: Option<Receiver<(bool, Vec<StorEvent>)>>,
     events_hours: u64,
     events_loaded: Option<u64>,
     events_only_disk: bool,
@@ -339,12 +379,15 @@ pub struct App {
     script: Option<Script>,
     /// Solo per le verifiche automatiche: istante in cui provare da sé il riavvio.
     restart_test: Option<Instant>,
-    /// Rettangoli dei grafici di velocità, latenza e distribuzione nell'ultimo fotogramma.
-    chart_rects: [egui::Rect; 3],
+    /// Rettangoli dei grafici nell'ultimo fotogramma: velocità, latenza, distribuzione, superficie,
+    /// temperatura.
+    chart_rects: [egui::Rect; 5],
     /// Solo per le verifiche automatiche: puntatore simulato, per provare i fumetti dei grafici
     /// senza toccare il mouse vero.
     fake_pointer: Option<egui::Pos2>,
     fake_pointer_gone: bool,
+    /// Al prossimo disegno porta in vista il grafico della superficie.
+    scroll_to_surface: bool,
 }
 
 impl App {
@@ -369,7 +412,10 @@ impl App {
             next_at: Instant::now() + Duration::from_millis(1200),
             busy: Arc::new(AtomicBool::new(false)),
             autotest: std::env::var_os("MYSTORAGETEST_AUTOTEST").is_some(),
+            home: None,
+            second: None,
         });
+        let scripted = script.is_some();
 
         let inventory = disks::scan();
         let wanted = std::env::var("MYSTORAGETEST_VOL")
@@ -394,6 +440,15 @@ impl App {
             last_scan: Instant::now(),
             selected,
             tab: startup.tab.unwrap_or(Tab::Test),
+            monitor_view: startup.monitor_view,
+            temps: HashMap::new(),
+            session_start: Instant::now(),
+            session_start_ft: win::now_filetime(),
+            next_sample: Instant::now() + Duration::from_secs(if scripted { 2 } else { SAMPLE_SECS }),
+            slow_sampled: Instant::now(),
+            selftest_rx: None,
+            selftest_note: HashMap::new(),
+            selftest_running: HashMap::new(),
             opt: TestOptions {
                 file_tests: true,
                 seq_read: true,
@@ -405,7 +460,7 @@ impl App {
                 log_speed: false,
                 log_latency: true,
             },
-            run: None,
+            runs: HashMap::new(),
             smart: HashMap::new(),
             smart_rx: None,
             events: Vec::new(),
@@ -425,9 +480,10 @@ impl App {
             script,
             restart_test: (std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() && startup.after.is_none())
                 .then(|| Instant::now() + Duration::from_millis(1500)),
-            chart_rects: [egui::Rect::NOTHING; 3],
+            chart_rects: [egui::Rect::NOTHING; 5],
             fake_pointer: None,
             fake_pointer_gone: false,
+            scroll_to_surface: false,
         };
         if app.settings.monitor_enabled {
             app.start_monitor(&cc.egui_ctx);
@@ -461,21 +517,26 @@ impl App {
         }
     }
 
+    /// Vero se è in corso una prova su un volume qualsiasi.
     fn testing(&self) -> bool {
-        self.run.as_ref().is_some_and(|r| r.running())
+        self.runs.values().any(|r| r.running())
     }
 
     /// Legge lo SMART in background: di tutti i dischi oppure solo di quelli selezionati.
     fn load_smart(&mut self, ctx: &egui::Context, all: bool) {
+        let wanted = self.sel_disks();
+        self.read_smart(ctx, |d| all || wanted.contains(&d.number));
+    }
+
+    fn read_smart(&mut self, ctx: &egui::Context, which: impl Fn(&PhysDisk) -> bool) {
         if self.smart_rx.is_some() {
             return;
         }
-        let wanted = self.sel_disks();
         let list: Vec<PhysDisk> = self
             .inventory
             .disks
             .iter()
-            .filter(|d| all || wanted.contains(&d.number))
+            .filter(|d| which(d))
             .cloned()
             .collect();
         if list.is_empty() {
@@ -484,13 +545,111 @@ impl App {
         self.smart_rx = Some(background(ctx, move || list.iter().map(smart::read).collect()));
     }
 
+    /// Ogni quanto si rileggono i dischi che una lettura potrebbe svegliare (USB e a piatti):
+    /// l'intervallo SMART scelto per il monitoraggio.
+    fn slow_interval(&self) -> Duration {
+        Duration::from_secs(self.settings.smart_interval_min.clamp(1, 1440) as u64 * 60)
+    }
+
+    /// Rilettura periodica: aggiorna temperature e autodiagnosi. Gli SSD interni ogni
+    /// `SAMPLE_SECS`, più spesso se è in corso un'autodiagnosi; gli altri dischi di rado.
+    fn sample_smart(&mut self, ctx: &egui::Context) {
+        let pace = if self.script.is_some() {
+            2 // le verifiche automatiche non possono aspettare mezzo minuto per avere uno storico
+        } else if self.selftest_running.is_empty() {
+            SAMPLE_SECS
+        } else {
+            10
+        };
+        self.next_sample = Instant::now() + Duration::from_secs(pace);
+        let slow_due = self.slow_sampled.elapsed() >= self.slow_interval();
+        if slow_due {
+            self.slow_sampled = Instant::now();
+        }
+        let running = self.selftest_running.clone();
+        self.read_smart(ctx, |d| {
+            let virtual_disk = matches!(d.bus, 14 | 15 | 16);
+            let awake = d.ssd == Some(true) && d.bus != disks::BUS_USB;
+            !virtual_disk && (awake || slow_due || running.contains_key(&d.number))
+        });
+    }
+
+    /// Accoglie una lettura SMART: aggiorna lo storico delle temperature e segue le autodiagnosi.
+    fn smart_arrived(&mut self, list: Vec<SmartReport>) {
+        let secs = self.session_start.elapsed().as_secs_f64();
+        for r in list {
+            let disk = self.inventory.disk(r.disk).cloned();
+            if let (Some(d), Some(t)) = (&disk, r.temperature) {
+                let history = self.temps.entry(disk_key(d)).or_default();
+                history.push([secs, t as f64]);
+                if history.len() > TEMPS_MAX {
+                    history.drain(..TEMPS_MAX / 10);
+                }
+            }
+            match r.selftest.running {
+                Some((kind, _)) => {
+                    self.selftest_running.insert(r.disk, kind);
+                }
+                None => {
+                    // Era in corso all'ultima lettura: è finita, e il primo del registro è il suo esito.
+                    if let Some(kind) = self.selftest_running.remove(&r.disk) {
+                        let entry = r.selftest.entries.first();
+                        let ok = entry.is_none_or(|e| e.outcome == Health::Good);
+                        let result = entry.map(|e| e.result.clone()).unwrap_or_else(|| "terminata".into());
+                        let text = format!("Autodiagnosi ({}) terminata: {result}", kind.to_lowercase());
+                        let name = disk.as_ref().map(|d| d.title()).unwrap_or_default();
+                        settings::append_log(&format!(
+                            "{}\t{}\tDisco {} ({name}) — {text}",
+                            win::now_string(),
+                            if ok { "Informazione" } else { "Critico" },
+                            r.disk
+                        ));
+                        if self.monitor.is_some() && self.settings.notifications {
+                            self.tray.notify(
+                                if ok { Tone::Ok } else { Tone::Error },
+                                &format!("Disco {} — {name}", r.disk),
+                                &text,
+                            );
+                        }
+                        self.selftest_note.insert(r.disk, (ok, text));
+                    }
+                }
+            }
+            self.smart.insert(r.disk, r);
+        }
+    }
+
+    /// Invia al disco il comando di autodiagnosi, in background.
+    fn send_selftest(&mut self, ctx: &egui::Context, disk: u32, cmd: SelfTestCmd) {
+        let Some(d) = self.inventory.disk(disk).cloned() else { return };
+        if self.selftest_rx.is_some() {
+            return;
+        }
+        self.selftest_note.remove(&disk);
+        self.selftest_rx = Some(background(ctx, move || (disk, cmd, smart::self_test(&d, cmd))));
+    }
+
+    /// Legge da capo gli eventi del periodo scelto.
     fn load_events(&mut self, ctx: &egui::Context) {
         if self.events_rx.is_some() {
             return;
         }
         let hours = self.events_hours;
         self.events_loaded = Some(hours);
-        self.events_rx = Some(background(ctx, move || eventlog::query_hours(hours, EVENTS_MAX)));
+        self.events_rx = Some(background(ctx, move || (false, eventlog::query_hours(hours, EVENTS_MAX))));
+    }
+
+    /// Aggiunge agli eventi già letti solo quelli arrivati dopo.
+    fn refresh_events(&mut self, ctx: &egui::Context) {
+        if self.events_rx.is_some() {
+            return;
+        }
+        match self.events.iter().map(|e| e.record_id).max() {
+            Some(newest) if self.events_loaded == Some(self.events_hours) => {
+                self.events_rx = Some(background(ctx, move || (true, eventlog::query_after(newest, EVENTS_MAX))));
+            }
+            _ => self.events_loaded = None,
+        }
     }
 
     fn start_test(&mut self) {
@@ -513,7 +672,7 @@ impl App {
             file_scan_limit: (self.settings.scan_limit_gb as u64) << 30,
             surface: self.opt.surface && self.elevated,
         };
-        self.run = Some(TestRun::start(config));
+        self.runs.insert(vol.letter, TestRun::start(config));
     }
 
     fn restart_elevated(&mut self, ctx: &egui::Context) {
@@ -523,7 +682,8 @@ impl App {
         // La nuova istanza aspetta la fine di questa (`--after`): altrimenti la troverebbe ancora viva,
         // la scambierebbe per un'istanza già aperta e si chiuderebbe subito. Riapre poi lo stesso disco
         // e la stessa scheda.
-        let mut params = format!("--after {} --tab {}", std::process::id(), self.tab.key());
+        let tab = if self.monitor_view { MONITOR_KEY } else { self.tab.key() };
+        let mut params = format!("--after {} --tab {tab}", std::process::id());
         match self.selected {
             Some(Sel::Volume(l)) => params.push_str(&format!(" --vol {l}")),
             Some(Sel::Disk(n)) => params.push_str(&format!(" --disk {n}")),
@@ -557,7 +717,10 @@ impl App {
         ui.label(dim("Test, diagnosi e monitoraggio dei dischi"));
         ui.add_space(6.0);
 
-        let testing = self.testing();
+        self.sidebar_monitor(ui);
+        ui.add_space(2.0);
+
+        let warn_at = self.settings.temp_warn_c;
         let mut pick: Option<Sel> = None;
         let bottom = 86.0;
         egui::ScrollArea::vertical()
@@ -567,9 +730,12 @@ impl App {
             .show(ui, |ui| {
                 ui.label(dim("VOLUMI"));
                 for v in &self.inventory.volumes {
-                    let selected = self.selected == Some(Sel::Volume(v.letter));
+                    let selected = !self.monitor_view && self.selected == Some(Sel::Volume(v.letter));
                     let disk = v.disks.first().and_then(|n| self.inventory.disk(*n));
-                    let health = v.disks.iter().filter_map(|n| self.smart.get(n)).map(|r| r.health).max();
+                    let reports = || v.disks.iter().filter_map(|n| self.smart.get(n));
+                    let health = reports().map(|r| r.health).max();
+                    let temp = reports().filter_map(|r| r.temperature).max();
+                    let testing = self.runs.get(&v.letter).is_some_and(|r| r.running());
                     let frame = Frame::new()
                         .fill(if selected { CARD_HI } else { CARD })
                         .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
@@ -596,13 +762,7 @@ impl App {
                                 } else {
                                     v.label.as_str()
                                 };
-                                ui.add(egui::Label::new(RichText::new(label).size(14.0)).truncate());
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if let Some(h) = health.filter(|h| *h != Health::Unknown) {
-                                        let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                                        ui.painter().circle_filled(r.center(), 4.0, health_color(h));
-                                    }
-                                });
+                                title_with_status(ui, RichText::new(label).size(14.0), temp, health, warn_at, testing);
                             });
                             usage_bar(ui, 1.0 - v.free as f32 / v.total.max(1) as f32);
                             ui.add(
@@ -621,10 +781,10 @@ impl App {
                     if selected && self.scroll_to_selected {
                         resp.scroll_to_me(Some(Align::Center));
                     }
-                    if resp.hovered() && !testing {
+                    if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    if resp.clicked() && !testing {
+                    if resp.clicked() {
                         pick = Some(Sel::Volume(v.letter));
                     }
                 }
@@ -633,7 +793,8 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(dim("DISCHI SENZA LETTERA"));
                     for d in others {
-                        let selected = self.selected == Some(Sel::Disk(d.number));
+                        let selected = !self.monitor_view && self.selected == Some(Sel::Disk(d.number));
+                        let report = self.smart.get(&d.number);
                         let frame = Frame::new()
                             .fill(if selected { CARD_HI } else { CARD })
                             .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
@@ -642,17 +803,24 @@ impl App {
                         let resp = frame
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.add(
-                                    egui::Label::new(
+                                ui.horizontal(|ui| {
+                                    title_with_status(
+                                        ui,
                                         RichText::new(format!("Disco {} · {}", d.number, d.title())).size(13.5),
-                                    )
-                                    .truncate(),
-                                );
+                                        report.and_then(|r| r.temperature),
+                                        report.map(|r| r.health),
+                                        warn_at,
+                                        false,
+                                    );
+                                });
                                 ui.label(dim(format!("{} · {}", bus_name(d.bus), human_bytes(d.size))));
                             })
                             .response;
                         let resp = ui.interact(resp.rect, ui.scope_id().with(("disk", d.number)), Sense::click());
-                        if resp.clicked() && !testing {
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
                             pick = Some(Sel::Disk(d.number));
                         }
                     }
@@ -660,10 +828,8 @@ impl App {
             });
         self.scroll_to_selected = false;
         if let Some(p) = pick {
-            if self.selected != Some(p) {
-                self.selected = Some(p);
-                self.run = None;
-            }
+            self.selected = Some(p);
+            self.monitor_view = false;
         }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -675,10 +841,82 @@ impl App {
                     self.restart_elevated(&ctx);
                 }
                 ui.label(dim(
-                    "SMART dei dischi USB e scansione della superficie richiedono l'amministratore.",
+                    "SMART dei dischi USB, autodiagnosi e scansione della superficie richiedono l'amministratore.",
                 ));
             }
         });
+    }
+
+    /// Voce «Monitoraggio» in cima alla colonna: la casella lo accende e lo spegne, il resto della
+    /// scheda apre la sua pagina.
+    fn sidebar_monitor(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let (unread, level) = self
+            .monitor
+            .as_ref()
+            .map(|m| {
+                let sh = m.shared.lock().unwrap();
+                (sh.unread, sh.unread_level)
+            })
+            .unwrap_or((0, None));
+        let active = self.monitor.is_some();
+        let selected = self.monitor_view;
+        let mut enabled = self.settings.monitor_enabled;
+        let mut check = egui::Rect::NOTHING;
+        let frame = Frame::new()
+            .fill(if selected { CARD_HI } else { CARD })
+            .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(10, 8));
+        let resp = frame
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.horizontal(|ui| {
+                    check = ui
+                        .checkbox(&mut enabled, "")
+                        .on_hover_text("Accende o spegne il monitoraggio")
+                        .rect;
+                    let title = if unread > 0 {
+                        format!("Monitoraggio ({unread})")
+                    } else {
+                        "Monitoraggio".to_string()
+                    };
+                    ui.label(bold(title, 15.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if active {
+                            let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                            ui.painter()
+                                .circle_filled(r.center(), 4.0, level.map(health_color).unwrap_or(GOOD));
+                        }
+                    });
+                });
+                ui.label(dim(match (active, unread) {
+                    (false, _) => "Spento".to_string(),
+                    (true, 0) => "Attivo · nessun problema".to_string(),
+                    (true, 1) => "Attivo · 1 avviso da leggere".to_string(),
+                    (true, n) => format!("Attivo · {n} avvisi da leggere"),
+                }));
+            })
+            .response;
+        // La casella resta cliccabile per conto suo: il resto della scheda apre la pagina.
+        let mut area = resp.rect;
+        area.min.x = check.max.x + 2.0;
+        let resp = ui.interact(area, ui.scope_id().with("monitoraggio"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            self.monitor_view = true;
+        }
+        if enabled != self.settings.monitor_enabled {
+            self.settings.monitor_enabled = enabled;
+            if enabled {
+                self.start_monitor(&ctx);
+            } else {
+                self.monitor = None;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -686,6 +924,15 @@ impl App {
     // -----------------------------------------------------------------------------------------
 
     fn main(&mut self, ui: &mut Ui) {
+        if self.monitor_view {
+            ui.label(bold("Monitoraggio", 26.0));
+            ui.label(dim(
+                "Sorveglianza continua di tutti i dischi: errori nel registro di sistema, SMART e autodiagnosi.",
+            ));
+            ui.add_space(4.0);
+            self.page_monitor(ui);
+            return;
+        }
         let disks = self.sel_disks();
         ui.horizontal(|ui| {
             match self.selected {
@@ -739,23 +986,11 @@ impl App {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            let unread = self
-                .monitor
-                .as_ref()
-                .map(|m| m.shared.lock().unwrap().unread)
-                .unwrap_or(0);
             for (tab, label) in [
-                (Tab::Test, "Test".to_string()),
-                (Tab::Smart, "SMART".to_string()),
-                (Tab::Events, "Eventi di sistema".to_string()),
-                (
-                    Tab::Monitor,
-                    if unread > 0 {
-                        format!("Monitoraggio ({unread})")
-                    } else {
-                        "Monitoraggio".to_string()
-                    },
-                ),
+                (Tab::Test, "Test"),
+                (Tab::Smart, "SMART"),
+                (Tab::Events, "Eventi di sistema"),
+                (Tab::Temp, "Temperatura"),
             ] {
                 let active = self.tab == tab;
                 let text = RichText::new(label)
@@ -777,7 +1012,7 @@ impl App {
             Tab::Test => self.tab_test(ui),
             Tab::Smart => self.tab_smart(ui),
             Tab::Events => self.tab_events(ui),
-            Tab::Monitor => self.tab_monitor(ui),
+            Tab::Temp => self.tab_temp(ui),
         }
     }
 
@@ -816,7 +1051,9 @@ impl App {
             });
             return;
         };
-        let testing = self.testing();
+        // Ogni volume ha la sua prova: quelle sugli altri dischi continuano senza bloccare questa pagina.
+        let testing = self.runs.get(&vol.letter).is_some_and(|r| r.running());
+        let scroll_to_surface = std::mem::take(&mut self.scroll_to_surface);
         let max = TestConfig::max_file_size(vol.free, &vol.fs);
 
         card().show(ui, |ui| {
@@ -891,7 +1128,7 @@ impl App {
                             .min_size(vec2(132.0, 40.0))
                             .corner_radius(CornerRadius::same(10));
                         if ui.add(b).clicked() {
-                            if let Some(r) = &self.run {
+                            if let Some(r) = self.runs.get(&vol.letter) {
                                 r.stop();
                             }
                         }
@@ -909,7 +1146,7 @@ impl App {
             });
         });
 
-        let Some(run) = &self.run else {
+        let Some(run) = self.runs.get(&vol.letter) else {
             ui.add_space(8.0);
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -954,6 +1191,7 @@ impl App {
                 if !sh.sys_events.is_empty() {
                     pill(ui, &format!("{} eventi di sistema", sh.sys_events.len()), BAD);
                 }
+                ui.label(dim(format!("prova del {}", run.started)));
             }
             None => {
                 ui.spinner();
@@ -1063,70 +1301,85 @@ impl App {
             }
         }
 
-        // Grafici.
+        // Grafici. La scansione della superficie ha un grafico suo, lungo il disco e non nel tempo:
+        // dura ore e schiaccerebbe tutte le altre prove in un angolo.
+        let surface = sh.surface_len > 0 || !sh.surface.is_empty();
+        let rows = if surface { 3.0 } else { 2.0 };
         let avail = ui.available_height();
-        let chart_h = ((avail - 10.0) / 2.0).max(120.0);
+        let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 120.0 });
         let (log_speed, log_latency) = (self.opt.log_speed, self.opt.log_latency);
         let (mut toggle_speed, mut toggle_latency) = (false, false);
-        let mut rects = (egui::Rect::NOTHING, egui::Rect::NOTHING, egui::Rect::NOTHING);
-        ui.columns(2, |cols| {
-            chart_frame(
-                &mut cols[0],
-                "Velocità (MB/s)",
-                chart_h,
-                |ui| toggle_speed = log_toggle(ui, log_speed),
-                |ui| {
-                    legend_row(
-                        ui,
-                        sh.series.iter().filter(|(_, s)| !s.speed.is_empty()).map(|(p, _)| *p),
-                        "",
+        let mut rects = [egui::Rect::NOTHING; 4];
+        // Le prove che stanno sui grafici nel tempo: tutte tranne la scansione della superficie.
+        let timed = |has_data: fn(&tester::PhaseSeries) -> bool| {
+            sh.series
+                .iter()
+                .filter(move |(p, s)| *p != Phase::Surface && has_data(s))
+                .map(|(p, _)| *p)
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("grafici")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.columns(2, |cols| {
+                    chart_frame(
+                        &mut cols[0],
+                        "Velocità (MB/s)",
+                        chart_h,
+                        |ui| toggle_speed = log_toggle(ui, log_speed),
+                        |ui| {
+                            legend_row(ui, timed(|s| !s.speed.is_empty()), "");
+                            rects[0] = speed_chart(ui, &sh, log_speed);
+                        },
                     );
-                    rects.0 = speed_chart(ui, &sh, log_speed);
-                },
-            );
-            chart_frame(
-                &mut cols[1],
-                "Latenza (linea tenue = massimo)",
-                chart_h,
-                |ui| toggle_latency = log_toggle(ui, log_latency),
-                |ui| {
-                    legend_row(
-                        ui,
-                        sh.series.iter().filter(|(_, s)| !s.lat_avg.is_empty()).map(|(p, _)| *p),
-                        "",
+                    chart_frame(
+                        &mut cols[1],
+                        "Latenza (linea tenue = massimo)",
+                        chart_h,
+                        |ui| toggle_latency = log_toggle(ui, log_latency),
+                        |ui| {
+                            legend_row(ui, timed(|s| !s.lat_avg.is_empty()), "");
+                            rects[1] = latency_chart(ui, &sh, log_latency);
+                        },
                     );
-                    rects.1 = latency_chart(ui, &sh, log_latency);
-                },
-            );
-        });
-        ui.columns(2, |cols| {
-            chart_frame(
-                &mut cols[0],
-                "Distribuzione della latenza (% delle operazioni)",
-                chart_h,
-                |_| {},
-                |ui| {
-                    legend_row(
-                        ui,
-                        sh.series
-                            .iter()
-                            .filter(|(_, s)| s.hist.iter().any(|c| *c > 0))
-                            .map(|(p, _)| *p),
-                        "",
+                });
+                ui.columns(2, |cols| {
+                    chart_frame(
+                        &mut cols[0],
+                        "Distribuzione della latenza (% delle operazioni)",
+                        chart_h,
+                        |_| {},
+                        |ui| {
+                            legend_row(ui, timed(|s| s.hist.iter().any(|c| *c > 0)), "");
+                            rects[2] = histogram_chart(ui, &sh);
+                        },
                     );
-                    rects.2 = histogram_chart(ui, &sh);
-                },
-            );
-            chart_frame(
-                &mut cols[1],
-                "Attività ed errori",
-                chart_h,
-                |_| {},
-                |ui| log_list(ui, &sh),
-            );
-        });
+                    chart_frame(
+                        &mut cols[1],
+                        "Attività ed errori",
+                        chart_h,
+                        |_| {},
+                        |ui| log_list(ui, &sh),
+                    );
+                });
+                if surface {
+                    chart_frame(
+                        ui,
+                        "Scansione della superficie (MB/s lungo il disco)",
+                        chart_h,
+                        |_| {},
+                        |ui| {
+                            surface_legend(ui, &sh);
+                            rects[3] = surface_chart(ui, &sh);
+                        },
+                    );
+                    if scroll_to_surface {
+                        ui.scroll_to_cursor(Some(Align::BOTTOM));
+                    }
+                }
+            });
         drop(sh);
-        self.chart_rects = [rects.0, rects.1, rects.2];
+        self.chart_rects[..4].copy_from_slice(&rects);
         if toggle_speed {
             self.opt.log_speed = !self.opt.log_speed;
         }
@@ -1159,6 +1412,8 @@ impl App {
             });
             return;
         }
+        let sending = self.selftest_rx.is_some();
+        let mut action: Option<(u32, SelfTestCmd)> = None;
         egui::ScrollArea::vertical().id_salt("smart").auto_shrink([false, false]).show(ui, |ui| {
             for n in &disks {
                 let Some(d) = self.inventory.disk(*n) else { continue };
@@ -1194,6 +1449,8 @@ impl App {
                         ui.label(RichText::new(format!("⚠ {issue}")).color(WARN));
                     }
                     ui.add_space(4.0);
+                    selftest_section(ui, *n, r, self.selftest_note.get(n), sending, &mut action);
+                    ui.add_space(4.0);
                     egui::Grid::new(("smart", *n)).num_columns(4).spacing([18.0, 5.0]).striped(true).show(ui, |ui| {
                         ui.label(dim("ID"));
                         ui.label(dim("Attributo"));
@@ -1218,6 +1475,90 @@ impl App {
                 ui.add_space(4.0);
             }
         });
+        if let Some((disk, cmd)) = action {
+            let ctx = ui.ctx().clone();
+            self.send_selftest(&ctx, disk, cmd);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Scheda Temperatura
+    // -----------------------------------------------------------------------------------------
+
+    fn tab_temp(&mut self, ui: &mut Ui) {
+        let disks = self.sel_disks();
+        if disks.is_empty() {
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label("Questo volume non corrisponde a un disco fisico riconoscibile: non c'è una temperatura da leggere.");
+            });
+            return;
+        }
+        let warn_at = self.settings.temp_warn_c;
+        let start_ft = self.session_start_ft;
+        let footer = 44.0;
+        let avail = (ui.available_height() - footer).max(160.0);
+        let each = ((avail - 12.0 * (disks.len() as f32 - 1.0)) / disks.len() as f32).max(230.0);
+        let mut rect = egui::Rect::NOTHING;
+        egui::ScrollArea::vertical()
+            .id_salt("temperature")
+            .auto_shrink([false, false])
+            .max_height(avail)
+            .show(ui, |ui| {
+                for n in &disks {
+                    let Some(d) = self.inventory.disk(*n) else { continue };
+                    let history = self.temps.get(&disk_key(d)).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let report = self.smart.get(n);
+                    card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.set_height(each - 40.0);
+                        ui.horizontal(|ui| {
+                            ui.label(bold(format!("Disco {} · {}", d.number, d.title()), 16.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if let Some(t) = history.last().map(|q| q[1] as i32) {
+                                    pill(ui, &format!("{t} °C"), if t >= warn_at { WARN } else { GOOD });
+                                }
+                            });
+                        });
+                        if history.is_empty() {
+                            ui.add_space(4.0);
+                            let why = match report {
+                                Some(r) if !r.note.is_empty() => r.note.as_str(),
+                                Some(_) => "Il disco non dichiara la sua temperatura.",
+                                None => "Nessuna lettura finora.",
+                            };
+                            ui.label(RichText::new(why).color(WARN));
+                            return;
+                        }
+                        let (mut low, mut high, mut sum) = (f64::MAX, f64::MIN, 0.0);
+                        for q in history {
+                            low = low.min(q[1]);
+                            high = high.max(q[1]);
+                            sum += q[1];
+                        }
+                        ui.label(dim(format!(
+                            "minima {} °C · massima {} °C · media {} °C · {} dalle {}",
+                            num(low, 0),
+                            num(high, 0),
+                            num(sum / history.len() as f64, 1),
+                            if history.len() == 1 {
+                                "1 lettura".to_string()
+                            } else {
+                                format!("{} letture", int(history.len() as u64))
+                            },
+                            clock(start_ft, history[0][0])
+                        )));
+                        rect = temp_chart(ui, ("temperatura", *n), history, warn_at, start_ft);
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        self.chart_rects[4] = rect;
+        ui.label(dim(format!(
+            "Storico di questa sessione, dall'apertura del programma. Gli SSD interni vengono letti ogni {SAMPLE_SECS} secondi; \
+             i dischi USB e quelli a piatti ogni {} minuti (l'intervallo SMART del monitoraggio), per non tenerli svegli.",
+            self.settings.smart_interval_min
+        )));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1249,8 +1590,10 @@ impl App {
                     }
                 });
             ui.checkbox(&mut self.events_only_disk, "Solo il disco selezionato");
+            // Dopo la prima lettura «Aggiorna» aggiunge solo gli eventi nuovi.
             if ui.button("Aggiorna").clicked() {
-                self.events_loaded = None;
+                let ctx = ui.ctx().clone();
+                self.refresh_events(&ctx);
             }
             if self.events_rx.is_some() {
                 ui.spinner();
@@ -1351,10 +1694,10 @@ impl App {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Scheda Monitoraggio
+    // Pagina Monitoraggio (si apre dalla voce in cima alla colonna dei dischi)
     // -----------------------------------------------------------------------------------------
 
-    fn tab_monitor(&mut self, ui: &mut Ui) {
+    fn page_monitor(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let before = self.settings.clone();
         card().show(ui, |ui| {
@@ -1429,18 +1772,12 @@ impl App {
                         health_color(l),
                     ),
                 }
+                // Solo l'ora: con la data la riga finirebbe sotto i pulsanti a destra.
+                let hour = |stamp: &str, missing: &str| stamp.get(11..).unwrap_or(missing).to_string();
                 ui.label(dim(format!(
                     "ultimo controllo eventi {} · ultima lettura SMART {}",
-                    if sh.last_event_check.is_empty() {
-                        "—"
-                    } else {
-                        &sh.last_event_check
-                    },
-                    if sh.last_smart_check.is_empty() {
-                        "in corso…"
-                    } else {
-                        &sh.last_smart_check
-                    }
+                    hour(&sh.last_event_check, "—"),
+                    hour(&sh.last_smart_check, "in corso…")
                 )));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Notifica di prova").clicked() {
@@ -1565,7 +1902,22 @@ impl App {
                     self.settings.rand_secs = 5;
                     self.settings.scan_limit_gb = 2;
                     self.start_test();
+                    // Con `MYSTORAGETEST_VOL2` parte nello stesso momento una seconda prova su un
+                    // altro volume: verifica che le prove siano indipendenti, una per disco.
+                    let home = self.selected;
+                    let second = std::env::var("MYSTORAGETEST_VOL2")
+                        .ok()
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c.to_ascii_uppercase())
+                        .filter(|l| self.inventory.volume(*l).is_some());
+                    if let Some(l) = second {
+                        self.selected = Some(Sel::Volume(l));
+                        self.start_test();
+                        self.selected = home;
+                    }
                     let script = self.script.as_mut().unwrap();
+                    script.home = home;
+                    script.second = second.map(Sel::Volume);
                     wait(script, 4200);
                 } else {
                     shot(script, "0-avvio.png");
@@ -1574,7 +1926,7 @@ impl App {
             1 if autotest => shot(script, "1-test-in-corso.png"),
             2 if autotest => {
                 // Attende la fine della prova.
-                if self.run.as_ref().is_some_and(|r| r.running()) {
+                if self.testing() {
                     self.script.as_mut().unwrap().step = 2;
                 } else {
                     wait(self.script.as_mut().unwrap(), 500);
@@ -1594,27 +1946,77 @@ impl App {
             5 if autotest => shot(script, "2a-fumetto-velocita.png"),
             7 if autotest => shot(script, "2b-fumetto-latenza.png"),
             9 if autotest => shot(script, "2c-fumetto-istogramma.png"),
-            10 => {
+            // Grafico della superficie: la scansione vera richiede l'amministratore, quindi qui si
+            // prova solo il disegno, con dati inventati.
+            10 if autotest => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                if let Some(Sel::Volume(l)) = self.selected {
+                    if let Some(run) = self.runs.get(&l) {
+                        fake_surface(&mut run.shared.lock().unwrap());
+                    }
+                }
+                self.scroll_to_surface = true;
+                wait(self.script.as_mut().unwrap(), 500);
+            }
+            11 if autotest => {
+                let rect = self.chart_rects[3];
+                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.755, rect.height() * 0.4));
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            12 if autotest => shot(script, "2d-superficie.png"),
+            // Una pagina Test per disco: si guarda un altro volume e poi si torna.
+            13 if autotest => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                let home = script.home;
+                self.selected = script.second.or_else(|| {
+                    self.inventory
+                        .volumes
+                        .iter()
+                        .map(|v| Sel::Volume(v.letter))
+                        .find(|s| Some(*s) != home)
+                        .or(home)
+                });
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            14 if autotest => shot(script, "2e-altro-disco.png"),
+            15 if autotest => {
+                self.selected = script.home;
+                self.scroll_to_selected = true;
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            16 if autotest => shot(script, "2f-ritorno.png"),
+            17 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            11 => shot(script, "3-smart.png"),
-            12 => {
+            18 => shot(script, "3-smart.png"),
+            19 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            13 => {
+            20 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 13;
+                    script.step = 20;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            14 => {
+            21 => {
+                self.tab = Tab::Temp;
+                wait(self.script.as_mut().unwrap(), 800);
+            }
+            22 => {
+                let rect = self.chart_rects[4];
+                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.6, rect.height() * 0.5));
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            23 => shot(script, "5-temperatura.png"),
+            24 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
                 // si prova proprio la notifica con un avviso simulato.
@@ -1622,11 +2024,11 @@ impl App {
                     self.settings.notifications = false;
                 }
                 self.start_monitor(ctx);
-                self.tab = Tab::Monitor;
+                self.monitor_view = true;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            15 => shot(script, "5-monitoraggio.png"),
-            16 => {
+            25 => shot(script, "6-monitoraggio.png"),
+            26 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1634,6 +2036,27 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Solo per le verifiche automatiche: dati inventati per provare il disegno del grafico della
+/// superficie, perché la scansione vera richiede i privilegi di amministratore. Imitano un hard
+/// disk, più lento verso la fine, con una zona in difficoltà a tre quarti.
+fn fake_surface(sh: &mut tester::Shared) {
+    let len = 500.0 * GIB;
+    sh.surface_len = len as u64;
+    sh.surface = (0..600)
+        .map(|i| {
+            let f = i as f64 / 600.0;
+            let mut speed = 210.0 - 95.0 * f + 6.0 * (i as f64 * 0.7).sin();
+            let mut slowest = 22.0 + 4.0 * (i as f64 * 1.3).sin().abs();
+            if (0.74..0.77).contains(&f) {
+                speed *= 0.25;
+                slowest = 1800.0;
+            }
+            [f * len, speed, slowest]
+        })
+        .collect();
+    sh.surface_bad = vec![(0.751 * len) as u64, (0.757 * len) as u64];
 }
 
 fn tile(ui: &mut Ui, title: &str, value: &str, unit: &str, sub: &str, color: Color32) {
@@ -1725,7 +2148,7 @@ fn fmt_decade(ms: f64) -> String {
     }
 }
 
-fn base_plot<'a>(id: &'static str, height: f32) -> Plot<'a> {
+fn base_plot<'a>(id: impl std::hash::Hash + std::fmt::Debug, height: f32) -> Plot<'a> {
     Plot::new(id)
         .height(height.max(40.0))
         .allow_scroll(false)
@@ -1861,6 +2284,323 @@ fn tip_note(ui: &mut Ui, text: &str) {
     ui.label(dim(text));
 }
 
+/// Ora del giorno ("14:09:31") di un istante espresso in secondi dall'avvio del programma.
+fn clock(start_ft: u64, secs: f64) -> String {
+    let stamp = win::local_time_string(start_ft + (secs.max(0.0) * 1e7) as u64);
+    stamp.get(11..19).unwrap_or_default().to_string()
+}
+
+/// Storico della temperatura di un disco, con la soglia di avviso quando è vicina.
+fn temp_chart(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, history: &[[f64; 2]], warn_at: i32, start_ft: u64) -> egui::Rect {
+    let (mut low, mut high) = (f64::MAX, f64::MIN);
+    for q in history {
+        low = low.min(q[1]);
+        high = high.max(q[1]);
+    }
+    let color = ACCENT;
+    let out = base_plot(id, ui.available_height())
+        .include_y(low - 3.0)
+        .include_y(high + 3.0)
+        .x_axis_formatter(move |m, range| {
+            let text = clock(start_ft, m.value);
+            // Su pochi minuti servono anche i secondi.
+            let wanted = if range.end() - range.start() < 600.0 { 8 } else { 5 };
+            text.get(..wanted).unwrap_or_default().to_string()
+        })
+        .y_axis_formatter(|m, _| format!("{} °C", num(m.value, 0)))
+        .show(ui, |p| -> Option<[f64; 2]> {
+            if (warn_at as f64) <= high + 10.0 {
+                p.hline(
+                    HLine::new("soglia", warn_at as f64)
+                        .color(WARN.gamma_multiply(0.7))
+                        .width(1.0)
+                        .style(LineStyle::dashed_loose()),
+                );
+            }
+            draw_series(p, "temperatura", history.to_vec(), color, 2.0);
+            let x = hover_x(p)?;
+            let i = history.partition_point(|q| q[0] < x);
+            let q = [i.wrapping_sub(1), i]
+                .into_iter()
+                .filter_map(|j| history.get(j))
+                .min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs()))?;
+            hover_marks(p, q[0], &[(q[1], color)]);
+            Some(*q)
+        });
+    if let Some(q) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(q[0]), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("●").color(color).size(11.0));
+                ui.label(bold("Temperatura del disco", 14.0).color(TEXT));
+            });
+            ui.label(dim(format!("alle {}", clock(start_ft, q[0]))));
+            tip_value(ui, format!("{} °C", num(q[1], 0)));
+            let meaning = if q[1] >= warn_at as f64 {
+                format!(
+                    "Oltre la soglia di avviso ({warn_at} °C). Temperature alte per molto tempo accorciano la vita del disco: conviene migliorare la ventilazione."
+                )
+            } else {
+                format!(
+                    "Nella norma: l'avviso scatta a {warn_at} °C. È normale che salga durante le prove o le copie e ridiscenda a riposo."
+                )
+            };
+            tip_note(ui, &meaning);
+        });
+    }
+    out.response.rect
+}
+
+/// Riquadro dell'autodiagnosi dentro la scheda SMART di un disco: stato, comandi, prove registrate.
+fn selftest_section(
+    ui: &mut Ui,
+    disk: u32,
+    r: &SmartReport,
+    note: Option<&(bool, String)>,
+    sending: bool,
+    action: &mut Option<(u32, SelfTestCmd)>,
+) {
+    let st = &r.selftest;
+    Frame::new()
+        .fill(CARD_HI)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 5.0;
+            ui.horizontal(|ui| {
+                ui.label(bold("Autodiagnosi del disco (self-test)", 14.5));
+                if !st.supported {
+                    return;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let can = st.cannot_start.is_empty() && !sending;
+                    let running = st.running.is_some();
+                    let minutes = |m: Option<u32>| m.map(|m| format!(" · {m} min")).unwrap_or_default();
+                    // Da destra a sinistra: l'ultimo aggiunto è il primo che si legge.
+                    if ui.add_enabled(can && running, egui::Button::new("Interrompi")).clicked() {
+                        *action = Some((disk, SelfTestCmd::Abort));
+                    }
+                    let extended = format!("Estesa{}", minutes(st.extended_minutes));
+                    if ui.add_enabled(can && !running, egui::Button::new(extended)).clicked() {
+                        *action = Some((disk, SelfTestCmd::Extended));
+                    }
+                    let short = format!("Breve{}", minutes(st.short_minutes));
+                    if ui.add_enabled(can && !running, egui::Button::new(short)).clicked() {
+                        *action = Some((disk, SelfTestCmd::Short));
+                    }
+                    if sending {
+                        ui.spinner();
+                    }
+                });
+            });
+            if !st.supported {
+                ui.label(dim("Questo disco non dichiara una funzione di autodiagnosi."));
+                return;
+            }
+            ui.label(dim(
+                "Il disco controlla da sé elettronica e memoria: la prova breve dura pochi minuti, quella estesa legge \
+                 tutta la superficie. Intanto il disco resta utilizzabile. L'esito lo registra il disco stesso; \
+                 il programma lo rilegge e, con il monitoraggio attivo, avvisa se una prova fallisce.",
+            ));
+            if let Some((kind, done)) = st.running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("In corso: {} — {done} %", kind.to_lowercase()));
+                });
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / 100.0)
+                        .desired_height(5.0)
+                        .fill(ACCENT)
+                        .corner_radius(CornerRadius::same(3)),
+                );
+            }
+            if let Some((ok, text)) = note {
+                ui.label(RichText::new(text).color(if *ok { GOOD } else { BAD }).size(13.0));
+            }
+            if !st.cannot_start.is_empty() {
+                ui.label(RichText::new(&st.cannot_start).color(WARN).size(13.0));
+            }
+            if st.entries.is_empty() {
+                ui.label(dim("Il disco non ha prove registrate."));
+                return;
+            }
+            if !st.full_log {
+                ui.label(dim(
+                    "Il registro completo delle prove si legge solo da amministratore: qui c'è l'esito dell'ultima.",
+                ));
+            }
+            egui::Grid::new(("autodiagnosi", disk))
+                .num_columns(4)
+                .spacing([18.0, 4.0])
+                .show(ui, |ui| {
+                    for title in ["Prova", "Esito", "Ore di accensione", "Primo errore"] {
+                        ui.label(dim(title));
+                    }
+                    ui.end_row();
+                    for e in st.entries.iter().take(6) {
+                        ui.label(RichText::new(e.kind).size(13.0));
+                        ui.label(RichText::new(&e.result).size(13.0).color(match e.outcome {
+                            Health::Good => GOOD,
+                            Health::Critical => BAD,
+                            Health::Warning => WARN,
+                            Health::Unknown => TEXT,
+                        }));
+                        ui.label(dim(e.hours.map(int).unwrap_or_else(|| "—".into())));
+                        ui.label(dim(e.lba.map(|l| format!("blocco {}", int(l))).unwrap_or_else(|| "—".into())));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+/// Le serie che stanno sui grafici nel tempo: tutte tranne la scansione della superficie, che ha
+/// un grafico suo lungo il disco.
+fn timed_series(sh: &tester::Shared) -> impl Iterator<Item = &(Phase, tester::PhaseSeries)> {
+    sh.series.iter().filter(|(p, _)| *p != Phase::Surface)
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Legenda del grafico della superficie: quanto è stato letto e quanti blocchi non si leggono.
+fn surface_legend(ui: &mut Ui, sh: &tester::Shared) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
+        ui.label(RichText::new("●").color(phase_color(Phase::Surface)).size(10.0));
+        ui.label(RichText::new("Velocità di lettura  ").color(DIM).size(12.0));
+        let bad = sh.surface_bad.len();
+        ui.label(RichText::new("●").color(if bad > 0 { BAD } else { GOOD }).size(10.0));
+        ui.label(
+            RichText::new(match bad {
+                0 => "nessun blocco illeggibile  ".to_string(),
+                1 => "1 blocco illeggibile  ".to_string(),
+                n => format!("{} blocchi illeggibili  ", int(n as u64)),
+            })
+            .color(DIM)
+            .size(12.0),
+        );
+        if let Some(last) = sh.surface.last() {
+            ui.label(
+                RichText::new(format!(
+                    "letti {} di {}",
+                    human_bytes(last[0] as u64),
+                    human_bytes(sh.surface_len)
+                ))
+                .color(Color32::from_rgb(96, 106, 124))
+                .size(12.0),
+            );
+        } else {
+            ui.label(RichText::new("in attesa dei dati…").color(DIM).size(12.0));
+        }
+    });
+}
+
+/// Scansione della superficie: velocità di lettura lungo il disco, con i blocchi illeggibili segnati.
+fn surface_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
+    let color = phase_color(Phase::Surface);
+    let out = base_plot("superficie", ui.available_height())
+        .include_y(0.0)
+        .include_x(0.0)
+        .include_x(sh.surface_len as f64 / GIB)
+        .x_axis_formatter(|m, _| format!("{} GB", num(m.value.max(0.0), 0)))
+        .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
+        .show(ui, |p| -> Option<[f64; 3]> {
+            let pts: Vec<[f64; 2]> = sh.surface.iter().map(|q| [q[0] / GIB, q[1]]).collect();
+            if !pts.is_empty() {
+                draw_series(p, "superficie", pts, color, 2.0);
+            }
+            for (i, bad) in sh.surface_bad.iter().enumerate().take(400) {
+                p.vline(
+                    VLine::new(format!("illeggibile {i}"), *bad as f64 / GIB)
+                        .color(BAD.gamma_multiply(0.85))
+                        .width(1.0),
+                );
+            }
+            // Sotto il puntatore: il tratto di disco più vicino.
+            let x = hover_x(p)? * GIB;
+            let i = sh.surface.partition_point(|q| q[0] < x);
+            let q = [i.wrapping_sub(1), i]
+                .into_iter()
+                .filter_map(|j| sh.surface.get(j))
+                .min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs()))?;
+            hover_marks(p, q[0] / GIB, &[(q[1], color)]);
+            Some(*q)
+        });
+    if let Some(q) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(q[0] / GIB), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("●").color(color).size(11.0));
+                ui.label(bold(Phase::Surface.label(), 14.0).color(TEXT));
+            });
+            let percent = if sh.surface_len > 0 {
+                format!(" ({} % del disco)", num(q[0] * 100.0 / sh.surface_len as f64, 1))
+            } else {
+                String::new()
+            };
+            ui.label(dim(format!("a {} dall'inizio{percent}", human_bytes(q[0] as u64))));
+            let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
+            tip_value(ui, format!("{speed} MB/s"));
+            ui.label(
+                RichText::new(format!("lettura più lenta in questo tratto: {}", fmt_ms(q[2])))
+                    .color(TEXT)
+                    .size(13.0),
+            );
+            // Blocchi illeggibili fra questo tratto e il successivo.
+            let next = sh
+                .surface
+                .iter()
+                .map(|n| n[0])
+                .find(|start| *start > q[0])
+                .unwrap_or(sh.surface_len as f64);
+            let bad = sh
+                .surface_bad
+                .iter()
+                .filter(|b| (**b as f64) >= q[0] && (**b as f64) < next)
+                .count();
+            if bad > 0 {
+                ui.label(RichText::new(format!("Blocchi illeggibili in questo tratto: {bad}")).color(BAD).size(13.0));
+            }
+            tip_note(
+                ui,
+                "Velocità di lettura in questo punto del disco. Sugli hard disk cala in modo regolare verso \
+                 la fine; un crollo isolato o una lettura molto lenta indicano una zona in difficoltà.",
+            );
+            tip_note(ui, phase_meaning(Phase::Surface));
+        });
+    }
+    out.response.rect
+}
+
+/// Prima riga di una scheda della colonna dei dischi: il nome, troncato se serve, e a destra la
+/// temperatura seguita dal pallino dello stato. `busy` aggiunge il segno di prova in corso.
+fn title_with_status(ui: &mut Ui, title: RichText, temp: Option<i32>, health: Option<Health>, warn_at: i32, busy: bool) {
+    let health = health.filter(|h| *h != Health::Unknown);
+    let reserved = if temp.is_some() { 48.0 } else { 0.0 }
+        + if health.is_some() { 18.0 } else { 0.0 }
+        + if busy { 24.0 } else { 0.0 };
+    let width = (ui.available_width() - reserved).max(24.0);
+    ui.allocate_ui_with_layout(vec2(width, 20.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.add(egui::Label::new(title).truncate());
+    });
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if let Some(h) = health {
+            let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+            ui.painter().circle_filled(r.center(), 4.0, health_color(h));
+        }
+        if let Some(t) = temp {
+            ui.label(
+                RichText::new(format!("{t} °C"))
+                    .size(12.5)
+                    .color(if t >= warn_at { WARN } else { DIM }),
+            );
+        }
+        if busy {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
+    });
+}
+
 /// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
 fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
     let y_of = move |v: f64| if log { v.max(0.1).log10() } else { v };
@@ -1873,7 +2613,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
     };
     let out = plot.show(ui, |p| -> Option<(Phase, [f64; 2])> {
-        for (phase, s) in &sh.series {
+        for (phase, s) in timed_series(sh) {
             if s.speed.is_empty() {
                 continue;
             }
@@ -1882,7 +2622,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
         }
         // Sotto il puntatore: il campione più vicino, con la linea verticale sulla sua posizione.
         let x = hover_x(p)?;
-        let (phase, i) = nearest_sample(sh.series.iter().map(|(ph, s)| (*ph, s.speed.as_slice())), x)?;
+        let (phase, i) = nearest_sample(timed_series(sh).map(|(ph, s)| (*ph, s.speed.as_slice())), x)?;
         let q = sh.series.iter().find(|(ph, _)| *ph == phase)?.1.speed[i];
         hover_marks(p, q[0], &[(y_of(q[1]), phase_color(phase))]);
         Some((phase, q))
@@ -1920,7 +2660,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
     };
     // Istante, latenza media e latenza massima del campione sotto il puntatore.
     let out = plot.show(ui, |p| -> Option<(Phase, f64, f64, Option<f64>)> {
-        for (phase, s) in &sh.series {
+        for (phase, s) in timed_series(sh) {
             if s.lat_avg.is_empty() {
                 continue;
             }
@@ -1930,7 +2670,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             draw_series(p, phase.short(), map(&s.lat_avg), color, 2.0);
         }
         let x = hover_x(p)?;
-        let (phase, i) = nearest_sample(sh.series.iter().map(|(ph, s)| (*ph, s.lat_avg.as_slice())), x)?;
+        let (phase, i) = nearest_sample(timed_series(sh).map(|(ph, s)| (*ph, s.lat_avg.as_slice())), x)?;
         let s = &sh.series.iter().find(|(ph, _)| *ph == phase)?.1;
         let avg = s.lat_avg[i];
         let max = s.lat_max.get(i).map(|q| q[1]);
@@ -1979,7 +2719,7 @@ fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
         .y_axis_formatter(|m, _| format!("{} %", num(m.value, 0)))
         .show(ui, |p| -> Option<usize> {
             let mut any = false;
-            for (phase, s) in &sh.series {
+            for (phase, s) in timed_series(sh) {
                 let total: u64 = s.hist.iter().sum();
                 if total == 0 {
                     continue;
@@ -2014,9 +2754,7 @@ fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
             let edge =|i: usize| fmt_ms(tester::bucket_micros(i) / 1000.0);
             ui.label(bold(format!("Risposte tra {} e {}", edge(bucket), edge(bucket + 1)), 14.0).color(TEXT));
             // Una riga per ogni prova che ha risposte in questo intervallo: nome, quota, numero.
-            let rows: Vec<(Phase, u64, u64)> = sh
-                .series
-                .iter()
+            let rows: Vec<(Phase, u64, u64)> = timed_series(sh)
                 .map(|(phase, s)| (*phase, s.hist.get(bucket).copied().unwrap_or(0), s.hist.iter().sum()))
                 .filter(|(_, n, _)| *n > 0)
                 .collect();
@@ -2137,7 +2875,7 @@ impl eframe::App for App {
                         .as_ref()
                         .is_some_and(|m| m.shared.lock().unwrap().unread > 0)
                     {
-                        self.tab = Tab::Monitor;
+                        self.monitor_view = true;
                     }
                 }
                 TrayEvent::Quit => {
@@ -2173,18 +2911,44 @@ impl eframe::App for App {
         }
         if let Some(rx) = &self.smart_rx {
             if let Ok(list) = rx.try_recv() {
-                for r in list {
-                    self.smart.insert(r.disk, r);
-                }
                 self.smart_rx = None;
+                self.smart_arrived(list);
             }
         }
         if let Some(rx) = &self.events_rx {
-            if let Ok(list) = rx.try_recv() {
-                self.events = list;
+            if let Ok((only_new, mut list)) = rx.try_recv() {
                 self.events_rx = None;
+                if only_new {
+                    // Arrivano dal più vecchio al più recente: in testa, con il più recente per primo.
+                    list.reverse();
+                    list.append(&mut self.events);
+                    list.truncate(EVENTS_MAX);
+                }
+                self.events = list;
             }
         }
+        if let Some(rx) = &self.selftest_rx {
+            if let Ok((disk, cmd, result)) = rx.try_recv() {
+                self.selftest_rx = None;
+                let note = match (&result, cmd) {
+                    (Ok(()), SelfTestCmd::Abort) => (true, "Interruzione richiesta al disco.".to_string()),
+                    (Ok(()), _) => (
+                        true,
+                        format!("{} avviata: l'avanzamento e l'esito compaiono qui.", cmd.label()),
+                    ),
+                    (Err(e), _) => (false, format!("{} non riuscita: {e}.", cmd.label())),
+                };
+                self.selftest_note.insert(disk, note);
+                // Rilegge subito il disco, per mostrare la prova in corso.
+                self.read_smart(ctx, |d| d.number == disk);
+                self.next_sample = Instant::now() + Duration::from_secs(5);
+            }
+        }
+        // Rilettura periodica di temperature e autodiagnosi, anche con la finestra nascosta.
+        if self.smart_rx.is_none() && Instant::now() >= self.next_sample {
+            self.sample_smart(ctx);
+        }
+        ctx.request_repaint_after(self.next_sample.saturating_duration_since(Instant::now()) + Duration::from_millis(50));
 
         if self.settings != self.saved && self.script.is_none() {
             self.settings.save();
@@ -2230,7 +2994,7 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.run = None;
+        self.runs.clear();
         self.monitor = None;
         self.tray.shutdown();
     }

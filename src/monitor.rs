@@ -255,6 +255,27 @@ impl Worker {
                 1,
             );
         }
+        // Autodiagnosi: una prova fallita che alla lettura precedente non c'era. Se ha già fatto
+        // peggiorare lo stato del disco l'avviso qui sopra la riporta fra i problemi.
+        let failed = |r: &SmartReport| {
+            r.selftest
+                .entries
+                .first()
+                .filter(|e| e.outcome == Health::Critical)
+                .cloned()
+        };
+        if let Some(e) = failed(rep).filter(|_| !worse) {
+            if prev.as_ref().and_then(failed).as_ref() != Some(&e) {
+                let place = e.lba.map(|l| format!(" · primo errore al blocco {l}")).unwrap_or_default();
+                self.raise(
+                    format!("smart:{id}:selftest:{:?}", e.hours),
+                    Health::Critical,
+                    format!("{name} — autodiagnosi fallita"),
+                    format!("Prova {}: {}{place}", e.kind.to_lowercase(), e.result),
+                    1,
+                );
+            }
+        }
         if let Some(p) = &prev {
             for (counter, value) in &rep.counters {
                 let before = p.counters.iter().find(|(n, _)| n == counter).map(|(_, v)| *v);
