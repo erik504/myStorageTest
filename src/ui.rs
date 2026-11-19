@@ -12,7 +12,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextStyle,
     Ui, Vec2, ViewportCommand, vec2,
 };
-use egui_plot::{Bar, BarChart, GridInput, GridMark, Line, Plot, PlotPoints, Points};
+use egui_plot::{Bar, BarChart, GridInput, GridMark, Line, Plot, PlotPoints, Points, VLine};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 use crate::disks::{self, Inventory, PhysDisk, Volume, bus_name};
@@ -233,10 +233,56 @@ enum Tab {
     Monitor,
 }
 
+impl Tab {
+    /// Nome usato sulla riga di comando per riaprire la stessa scheda dopo un riavvio.
+    fn key(self) -> &'static str {
+        match self {
+            Tab::Test => "test",
+            Tab::Smart => "smart",
+            Tab::Events => "eventi",
+            Tab::Monitor => "monitoraggio",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Tab> {
+        [Tab::Test, Tab::Smart, Tab::Events, Tab::Monitor]
+            .into_iter()
+            .find(|t| t.key() == s)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sel {
     Volume(char),
     Disk(u32),
+}
+
+/// Stato iniziale chiesto dalla riga di comando.
+#[derive(Clone, Copy)]
+struct Startup {
+    /// `--monitor`: parte nascosto nell'area di notifica.
+    hidden: bool,
+    /// `--after PID`: rilanciato dall'istanza PID, che si sta chiudendo.
+    after: Option<u32>,
+    /// `--vol X` oppure `--disk N`: disco da selezionare.
+    selected: Option<Sel>,
+    /// `--tab NOME`: scheda da aprire.
+    tab: Option<Tab>,
+}
+
+impl Startup {
+    fn parse(args: &[String]) -> Startup {
+        let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+        Startup {
+            hidden: args.iter().any(|a| a == "--monitor"),
+            after: value("--after").and_then(|s| s.parse().ok()),
+            selected: value("--vol")
+                .and_then(|s| s.chars().next())
+                .map(|c| Sel::Volume(c.to_ascii_uppercase()))
+                .or_else(|| value("--disk").and_then(|s| s.parse().ok()).map(Sel::Disk)),
+            tab: value("--tab").and_then(|s| Tab::from_key(s)),
+        }
+    }
 }
 
 struct TestOptions {
@@ -291,10 +337,19 @@ pub struct App {
     /// Al primo disegno porta in vista il volume selezionato nella colonna dei dischi.
     scroll_to_selected: bool,
     script: Option<Script>,
+    /// Solo per le verifiche automatiche: istante in cui provare da sé il riavvio.
+    restart_test: Option<Instant>,
+    /// Rettangoli dei grafici di velocità, latenza e distribuzione nell'ultimo fotogramma.
+    chart_rects: [egui::Rect; 3],
+    /// Solo per le verifiche automatiche: puntatore simulato, per provare i fumetti dei grafici
+    /// senza toccare il mouse vero.
+    fake_pointer: Option<egui::Pos2>,
+    fake_pointer_gone: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, start_hidden: bool) -> App {
+    fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> App {
+        let start_hidden = startup.hidden;
         setup_style(&cc.egui_ctx);
         let mut settings = Settings::load();
         if start_hidden {
@@ -320,11 +375,15 @@ impl App {
         let wanted = std::env::var("MYSTORAGETEST_VOL")
             .ok()
             .and_then(|s| s.chars().next())
-            .map(|c| c.to_ascii_uppercase());
-        let selected = wanted
-            .filter(|l| inventory.volume(*l).is_some())
-            .or_else(|| inventory.volumes.first().map(|v| v.letter))
-            .map(Sel::Volume);
+            .map(|c| Sel::Volume(c.to_ascii_uppercase()));
+        let selected = startup
+            .selected
+            .or(wanted)
+            .filter(|s| match s {
+                Sel::Volume(l) => inventory.volume(*l).is_some(),
+                Sel::Disk(n) => inventory.disk(*n).is_some(),
+            })
+            .or_else(|| inventory.volumes.first().map(|v| Sel::Volume(v.letter)));
 
         let mut app = App {
             saved: settings.clone(),
@@ -334,7 +393,7 @@ impl App {
             inventory_rx: None,
             last_scan: Instant::now(),
             selected,
-            tab: Tab::Test,
+            tab: startup.tab.unwrap_or(Tab::Test),
             opt: TestOptions {
                 file_tests: true,
                 seq_read: true,
@@ -364,6 +423,11 @@ impl App {
             needs_center: start_hidden,
             scroll_to_selected: true,
             script,
+            restart_test: (std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() && startup.after.is_none())
+                .then(|| Instant::now() + Duration::from_millis(1500)),
+            chart_rects: [egui::Rect::NOTHING; 3],
+            fake_pointer: None,
+            fake_pointer_gone: false,
         };
         if app.settings.monitor_enabled {
             app.start_monitor(&cc.egui_ctx);
@@ -456,8 +520,21 @@ impl App {
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let (verb, file) = (win::wide("runas"), win::wide(&exe));
-        let rc = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), 1) };
+        // La nuova istanza aspetta la fine di questa (`--after`): altrimenti la troverebbe ancora viva,
+        // la scambierebbe per un'istanza già aperta e si chiuderebbe subito. Riapre poi lo stesso disco
+        // e la stessa scheda.
+        let mut params = format!("--after {} --tab {}", std::process::id(), self.tab.key());
+        match self.selected {
+            Some(Sel::Volume(l)) => params.push_str(&format!(" --vol {l}")),
+            Some(Sel::Disk(n)) => params.push_str(&format!(" --disk {n}")),
+            None => {}
+        }
+        // Solo per le verifiche automatiche: stesso percorso, senza la richiesta di elevazione.
+        let verb = if std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() { "open" } else { "runas" };
+        let (verb, file, params) = (win::wide(verb), win::wide(&exe), win::wide(&params));
+        let rc = unsafe {
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), null(), 1)
+        };
         if rc as isize > 32 {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -991,6 +1068,7 @@ impl App {
         let chart_h = ((avail - 10.0) / 2.0).max(120.0);
         let (log_speed, log_latency) = (self.opt.log_speed, self.opt.log_latency);
         let (mut toggle_speed, mut toggle_latency) = (false, false);
+        let mut rects = (egui::Rect::NOTHING, egui::Rect::NOTHING, egui::Rect::NOTHING);
         ui.columns(2, |cols| {
             chart_frame(
                 &mut cols[0],
@@ -1003,7 +1081,7 @@ impl App {
                         sh.series.iter().filter(|(_, s)| !s.speed.is_empty()).map(|(p, _)| *p),
                         "",
                     );
-                    speed_chart(ui, &sh, log_speed);
+                    rects.0 = speed_chart(ui, &sh, log_speed);
                 },
             );
             chart_frame(
@@ -1017,7 +1095,7 @@ impl App {
                         sh.series.iter().filter(|(_, s)| !s.lat_avg.is_empty()).map(|(p, _)| *p),
                         "",
                     );
-                    latency_chart(ui, &sh, log_latency);
+                    rects.1 = latency_chart(ui, &sh, log_latency);
                 },
             );
         });
@@ -1036,7 +1114,7 @@ impl App {
                             .map(|(p, _)| *p),
                         "",
                     );
-                    histogram_chart(ui, &sh);
+                    rects.2 = histogram_chart(ui, &sh);
                 },
             );
             chart_frame(
@@ -1048,6 +1126,7 @@ impl App {
             );
         });
         drop(sh);
+        self.chart_rects = [rects.0, rects.1, rects.2];
         if toggle_speed {
             self.opt.log_speed = !self.opt.log_speed;
         }
@@ -1502,33 +1581,52 @@ impl App {
                 }
             }
             3 if autotest => shot(script, "2-test-finito.png"),
-            4 => {
+            // Fumetti dei grafici: il puntatore è simulato, il mouse vero non viene toccato.
+            4 | 6 | 8 if autotest => {
+                let (rect, fx) = match step {
+                    4 => (self.chart_rects[0], 0.55),
+                    6 => (self.chart_rects[1], 0.55),
+                    _ => (self.chart_rects[2], 0.30),
+                };
+                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * fx, rect.height() * 0.45));
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            5 if autotest => shot(script, "2a-fumetto-velocita.png"),
+            7 if autotest => shot(script, "2b-fumetto-latenza.png"),
+            9 if autotest => shot(script, "2c-fumetto-istogramma.png"),
+            10 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            5 => shot(script, "3-smart.png"),
-            6 => {
+            11 => shot(script, "3-smart.png"),
+            12 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            7 => {
+            13 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 7;
+                    script.step = 13;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            8 => {
+            14 => {
                 self.settings.monitor_enabled = true;
+                // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
+                // si prova proprio la notifica con un avviso simulato.
+                if std::env::var_os("MYSTORAGETEST_FAKE_ALERT").is_none() {
+                    self.settings.notifications = false;
+                }
                 self.start_monitor(ctx);
                 self.tab = Tab::Monitor;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            9 => shot(script, "5-monitoraggio.png"),
-            10 => {
+            15 => shot(script, "5-monitoraggio.png"),
+            16 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -1653,7 +1751,119 @@ fn draw_series<'a>(p: &mut egui_plot::PlotUi<'a>, name: &str, pts: Vec<[f64; 2]>
     p.line(Line::new(name, PlotPoints::from(pts)).color(color).width(width));
 }
 
-fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) {
+/// Che cosa fa una prova, in una riga: compare nei fumetti dei grafici.
+fn phase_meaning(p: Phase) -> &'static str {
+    match p {
+        Phase::SeqWrite => "La prova scrive il file di prova dall'inizio alla fine, a blocchi da 1 MB.",
+        Phase::SeqRead => {
+            "La prova rilegge il file di prova dall'inizio alla fine e controlla che i dati siano quelli scritti."
+        }
+        Phase::RandRead => "La prova legge blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
+        Phase::RandWrite => "La prova scrive blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
+        Phase::Flush => {
+            "La prova scrive un blocco da 4 KB e chiede al disco di salvarlo subito in modo definitivo: \
+             si misura il tempo di quella conferma."
+        }
+        Phase::FileScan => "La prova legge i file già presenti sul volume, senza modificarli.",
+        Phase::Surface => "La prova legge l'intero volume da un capo all'altro, anche dove non ci sono file.",
+    }
+}
+
+/// Ascissa indicata dal puntatore, se è sopra l'area del grafico.
+fn hover_x(p: &egui_plot::PlotUi<'_>) -> Option<f64> {
+    if !p.response().hovered() {
+        return None;
+    }
+    p.pointer_coordinate().map(|c| c.x)
+}
+
+/// Campione più vicino nel tempo all'ascissa `x`, cercato in tutte le serie (che sono in ordine di tempo).
+fn nearest_sample<'s>(series: impl Iterator<Item = (Phase, &'s [[f64; 2]])>, x: f64) -> Option<(Phase, usize)> {
+    let mut best: Option<(Phase, usize, f64)> = None;
+    for (phase, pts) in series {
+        let i = pts.partition_point(|q| q[0] < x);
+        for j in [i.wrapping_sub(1), i] {
+            if let Some(q) = pts.get(j) {
+                let d = (q[0] - x).abs();
+                if best.is_none_or(|b| d < b.2) {
+                    best = Some((phase, j, d));
+                }
+            }
+        }
+    }
+    best.map(|(phase, i, _)| (phase, i))
+}
+
+fn hover_line(p: &mut egui_plot::PlotUi<'_>, x: f64) {
+    p.vline(
+        VLine::new("posizione", x)
+            .color(Color32::from_rgba_unmultiplied(214, 222, 236, 150))
+            .width(1.0),
+    );
+}
+
+/// Linea verticale sulla posizione indicata e un segno su ciascun valore.
+fn hover_marks(p: &mut egui_plot::PlotUi<'_>, x: f64, values: &[(f64, Color32)]) {
+    hover_line(p, x);
+    for (i, (y, color)) in values.iter().enumerate() {
+        let at = || PlotPoints::from(vec![[x, *y]]);
+        p.points(Points::new(format!("bordo del segno {i}"), at()).radius(5.5).color(TEXT));
+        p.points(Points::new(format!("segno {i}"), at()).radius(3.5).color(*color));
+    }
+}
+
+/// Fumetto che segue il puntatore sopra un grafico. Si tiene di fianco alla linea verticale (`line_x`,
+/// in coordinate dello schermo) per non coprire il punto indicato; passa a sinistra se a destra non c'è posto.
+fn chart_tip(resp: &egui::Response, line_x: f32, add: impl FnOnce(&mut Ui)) {
+    let Some(pointer) = resp.ctx.pointer_latest_pos() else { return };
+    let anchor = egui::Rect::from_min_max(
+        egui::pos2(pointer.x.min(line_x) - 10.0, pointer.y - 12.0),
+        egui::pos2(pointer.x.max(line_x) + 10.0, pointer.y + 12.0),
+    );
+    let mut tip = egui::Tooltip::always_open(
+        resp.ctx.clone(),
+        resp.layer_id,
+        resp.id,
+        egui::PopupAnchor::ParentRect(anchor),
+    )
+    .width(330.0);
+    tip.popup = tip
+        .popup
+        .gap(8.0)
+        .align(egui::RectAlign::RIGHT_START)
+        .align_alternatives(&[
+            egui::RectAlign::LEFT_START,
+            egui::RectAlign::RIGHT_END,
+            egui::RectAlign::LEFT_END,
+        ]);
+    tip.show(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        add(ui);
+    });
+}
+
+/// Intestazione del fumetto: la prova a cui appartiene il punto e l'istante indicato.
+fn tip_head(ui: &mut Ui, phase: Phase, secs: f64) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new("●").color(phase_color(phase)).size(11.0));
+        ui.label(bold(phase.label(), 14.0).color(TEXT));
+    });
+    ui.label(dim(format!("{} s dall'inizio della prova", num(secs, 1))));
+}
+
+fn tip_value(ui: &mut Ui, text: String) {
+    ui.label(bold(text, 20.0).color(TEXT));
+}
+
+fn tip_note(ui: &mut Ui, text: &str) {
+    ui.add_space(3.0);
+    ui.label(dim(text));
+}
+
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
+fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
+    let y_of = move |v: f64| if log { v.max(0.1).log10() } else { v };
     let plot = base_plot("velocita", ui.available_height()).x_axis_formatter(|m, _| format!("{} s", num(m.value, 0)));
     let plot = if log {
         plot.y_grid_spacer(decade_marks(1.0))
@@ -1662,27 +1872,44 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) {
         plot.include_y(0.0)
             .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
     };
-    plot.show(ui, |p| {
+    let out = plot.show(ui, |p| -> Option<(Phase, [f64; 2])> {
         for (phase, s) in &sh.series {
             if s.speed.is_empty() {
                 continue;
             }
-            let pts: Vec<[f64; 2]> = s
-                .speed
-                .iter()
-                .map(|q| [q[0], if log { q[1].max(0.1).log10() } else { q[1] }])
-                .collect();
+            let pts: Vec<[f64; 2]> = s.speed.iter().map(|q| [q[0], y_of(q[1])]).collect();
             draw_series(p, phase.short(), pts, phase_color(*phase), 2.0);
         }
+        // Sotto il puntatore: il campione più vicino, con la linea verticale sulla sua posizione.
+        let x = hover_x(p)?;
+        let (phase, i) = nearest_sample(sh.series.iter().map(|(ph, s)| (*ph, s.speed.as_slice())), x)?;
+        let q = sh.series.iter().find(|(ph, _)| *ph == phase)?.1.speed[i];
+        hover_marks(p, q[0], &[(y_of(q[1]), phase_color(phase))]);
+        Some((phase, q))
     });
+    if let Some((phase, q)) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(q[0]), |ui| {
+            tip_head(ui, phase, q[0]);
+            let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
+            tip_value(ui, format!("{speed} MB/s"));
+            if matches!(phase, Phase::RandRead | Phase::RandWrite) {
+                let iops = (q[1] * 1e6 / tester::BLOCK as f64).round() as u64;
+                ui.label(RichText::new(format!("circa {} operazioni al secondo", int(iops))).color(TEXT).size(13.0));
+            }
+            tip_note(
+                ui,
+                "Velocità: quanti dati passano ogni secondo in questo momento della prova. Più alta è meglio.",
+            );
+            tip_note(ui, phase_meaning(phase));
+        });
+    }
+    out.response.rect
 }
 
-fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) {
-    let map = move |pts: &[[f64; 2]]| -> Vec<[f64; 2]> {
-        pts.iter()
-            .map(|p| [p[0], if log { p[1].max(1e-4).log10() } else { p[1] }])
-            .collect()
-    };
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
+fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
+    let y_of = move |v: f64| if log { v.max(1e-4).log10() } else { v };
+    let map = move |pts: &[[f64; 2]]| -> Vec<[f64; 2]> { pts.iter().map(|p| [p[0], y_of(p[1])]).collect() };
     let plot = base_plot("latenza", ui.available_height()).x_axis_formatter(|m, _| format!("{} s", num(m.value, 0)));
     let plot = if log {
         plot.y_grid_spacer(decade_marks(1.0))
@@ -1691,7 +1918,8 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) {
         plot.include_y(0.0)
             .y_axis_formatter(|m, _| format!("{} ms", num(m.value, 1)))
     };
-    plot.show(ui, |p| {
+    // Istante, latenza media e latenza massima del campione sotto il puntatore.
+    let out = plot.show(ui, |p| -> Option<(Phase, f64, f64, Option<f64>)> {
         for (phase, s) in &sh.series {
             if s.lat_avg.is_empty() {
                 continue;
@@ -1701,12 +1929,43 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) {
             draw_series(p, &name, map(&s.lat_max), color.gamma_multiply(0.35), 1.0);
             draw_series(p, phase.short(), map(&s.lat_avg), color, 2.0);
         }
+        let x = hover_x(p)?;
+        let (phase, i) = nearest_sample(sh.series.iter().map(|(ph, s)| (*ph, s.lat_avg.as_slice())), x)?;
+        let s = &sh.series.iter().find(|(ph, _)| *ph == phase)?.1;
+        let avg = s.lat_avg[i];
+        let max = s.lat_max.get(i).map(|q| q[1]);
+        let color = phase_color(phase);
+        let mut marks = vec![(y_of(avg[1]), color)];
+        if let Some(max) = max {
+            marks.insert(0, (y_of(max), color.gamma_multiply(0.55)));
+        }
+        hover_marks(p, avg[0], &marks);
+        Some((phase, avg[0], avg[1], max))
     });
+    if let Some((phase, secs, avg, max)) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(secs), |ui| {
+            tip_head(ui, phase, secs);
+            tip_value(ui, fmt_ms(avg));
+            let detail = match max {
+                Some(max) => format!("in media · caso peggiore {}", fmt_ms(max)),
+                None => "in media".to_string(),
+            };
+            ui.label(RichText::new(detail).color(TEXT).size(13.0));
+            tip_note(
+                ui,
+                "Latenza: il tempo che il disco impiega a completare una singola operazione. \
+                 Più bassa è meglio; oltre 2 s è uno stallo.",
+            );
+            tip_note(ui, phase_meaning(phase));
+        });
+    }
+    out.response.rect
 }
 
-fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) {
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
+fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
     let per_decade = tester::HIST_PER_DECADE as f64;
-    base_plot("istogramma", ui.available_height())
+    let out = base_plot("istogramma", ui.available_height())
         .include_y(0.0)
         .x_grid_spacer(decade_marks(per_decade))
         .x_axis_formatter(|m, _| {
@@ -1718,12 +1977,14 @@ fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) {
             }
         })
         .y_axis_formatter(|m, _| format!("{} %", num(m.value, 0)))
-        .show(ui, |p| {
+        .show(ui, |p| -> Option<usize> {
+            let mut any = false;
             for (phase, s) in &sh.series {
                 let total: u64 = s.hist.iter().sum();
                 if total == 0 {
                     continue;
                 }
+                any = true;
                 let color = phase_color(*phase);
                 let bars: Vec<Bar> = s
                     .hist
@@ -1739,7 +2000,57 @@ fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) {
                     .collect();
                 p.bar_chart(BarChart::new(phase.short(), bars).color(color));
             }
+            // Sotto il puntatore: l'intervallo di latenza (la colonna) su cui si trova.
+            let x = hover_x(p)?;
+            if !any || x < 0.0 || x >= HIST_BUCKETS as f64 {
+                return None;
+            }
+            let bucket = x.floor() as usize;
+            hover_line(p, bucket as f64 + 0.5);
+            Some(bucket)
         });
+    if let Some(bucket) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(bucket as f64 + 0.5), |ui| {
+            let edge =|i: usize| fmt_ms(tester::bucket_micros(i) / 1000.0);
+            ui.label(bold(format!("Risposte tra {} e {}", edge(bucket), edge(bucket + 1)), 14.0).color(TEXT));
+            // Una riga per ogni prova che ha risposte in questo intervallo: nome, quota, numero.
+            let rows: Vec<(Phase, u64, u64)> = sh
+                .series
+                .iter()
+                .map(|(phase, s)| (*phase, s.hist.get(bucket).copied().unwrap_or(0), s.hist.iter().sum()))
+                .filter(|(_, n, _)| *n > 0)
+                .collect();
+            let any = !rows.is_empty();
+            egui::Grid::new("fumetto-istogramma")
+                .num_columns(3)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    for (phase, n, total) in rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(RichText::new("●").color(phase_color(phase)).size(11.0));
+                            ui.label(RichText::new(phase.label()).color(TEXT).size(13.0));
+                        });
+                        ui.label(bold(format!("{} %", num(n as f64 * 100.0 / total as f64, 1)), 13.0).color(TEXT));
+                        ui.label(dim(if n == 1 {
+                            "1 operazione".to_string()
+                        } else {
+                            format!("{} operazioni", int(n))
+                        }));
+                        ui.end_row();
+                    }
+                });
+            if !any {
+                ui.label(dim("Nessuna operazione ha risposto in questo intervallo di tempo."));
+            }
+            tip_note(
+                ui,
+                "Quota delle operazioni di ogni prova che hanno risposto in questo intervallo di tempo. \
+                 Le colonne a sinistra sono le risposte rapide, quelle a destra le lente.",
+            );
+        });
+    }
+    out.response.rect
 }
 
 fn log_list(ui: &mut Ui, sh: &tester::Shared) {
@@ -1799,6 +2110,11 @@ impl eframe::App for App {
             } else {
                 ctx.request_repaint();
             }
+        }
+
+        if self.restart_test.is_some_and(|t| Instant::now() >= t) {
+            self.restart_test = None;
+            self.restart_elevated(ctx);
         }
 
         // Comandi dall'icona nell'area di notifica.
@@ -1890,6 +2206,15 @@ impl eframe::App for App {
         self.drive_script(ctx);
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Solo per le verifiche automatiche: simula il puntatore senza toccare il mouse vero.
+        if let Some(pos) = self.fake_pointer {
+            raw_input.events.push(egui::Event::PointerMoved(pos));
+        } else if std::mem::take(&mut self.fake_pointer_gone) {
+            raw_input.events.push(egui::Event::PointerGone);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         egui::Panel::left("dischi")
             .exact_size(300.0)
@@ -1913,9 +2238,14 @@ impl Drop for App {
 
 /// Apre la finestra. `--monitor` la avvia nascosta nell'area di notifica.
 pub fn run(args: &[String]) -> i32 {
-    let start_hidden = args.iter().any(|a| a == "--monitor");
+    let startup = Startup::parse(args);
+    let start_hidden = startup.hidden;
     let scripted = std::env::var_os("MYSTORAGETEST_SHOT").is_some();
-    if !scripted && tray::show_running_instance() {
+    if let Some(pid) = startup.after {
+        // Rilanciato da «Riavvia come amministratore»: l'istanza precedente si sta chiudendo e non va
+        // presa per un'istanza già aperta. Si aspetta che abbia tolto la sua icona.
+        win::wait_process_exit(pid, 15_000);
+    } else if !scripted && tray::show_running_instance() {
         return 0;
     }
     let mut viewport = egui::ViewportBuilder::default()
@@ -1949,7 +2279,7 @@ pub fn run(args: &[String]) -> i32 {
     match eframe::run_native(
         "myStorageTest",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, start_hidden)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, startup)))),
     ) {
         Ok(()) => 0,
         Err(e) => {

@@ -14,8 +14,9 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, MSG, PostMessageW,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON,
+    MSG, MSGFLT_ALLOW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
     WNDCLASSW,
 };
@@ -324,7 +325,7 @@ impl Tray {
         std::thread::Builder::new()
             .name("tray".into())
             .spawn(move || unsafe {
-                let class = win::wide(CLASS_NAME);
+                let class = win::wide(&class_name());
                 let hinst = GetModuleHandleW(null());
                 let mut wc: WNDCLASSW = std::mem::zeroed();
                 wc.lpfnWndProc = Some(wndproc);
@@ -349,6 +350,9 @@ impl Tray {
                     cell.store(-1, Ordering::SeqCst);
                     return;
                 }
+                // Un'istanza elevata non riceve i messaggi dei processi normali: si lascia passare solo
+                // la richiesta di mostrare la finestra, così un secondo avvio la riporta in primo piano.
+                ChangeWindowMessageFilterEx(hwnd, WM_TRAY_SHOW, MSGFLT_ALLOW, null_mut());
                 let created = win::wide("TaskbarCreated");
                 INNER.with(|i| {
                     *i.borrow_mut() = Some(Inner {
@@ -410,24 +414,36 @@ impl Tray {
     }
 }
 
-fn post_to_running_instance(msg: u32) -> bool {
-    let class = win::wide(CLASS_NAME);
+/// Nome della classe della finestra nascosta, che fa anche da segnale di «istanza in esecuzione».
+/// `MYSTORAGETEST_INSTANCE` lo distingue nelle verifiche automatiche, così le istanze di prova non
+/// vedono quella che l'utente sta usando.
+fn class_name() -> String {
+    match std::env::var("MYSTORAGETEST_INSTANCE") {
+        Ok(s) if !s.is_empty() => format!("{CLASS_NAME}-{s}"),
+        _ => CLASS_NAME.to_string(),
+    }
+}
+
+/// `None` se non c'è un'istanza in esecuzione; altrimenti dice se il messaggio è stato consegnato
+/// (Windows blocca i messaggi diretti a un'istanza con privilegi più alti).
+fn post_to_running_instance(msg: u32) -> Option<bool> {
+    let class = win::wide(&class_name());
     unsafe {
         let hwnd = FindWindowW(class.as_ptr(), null());
         if hwnd.is_null() {
-            return false;
+            return None;
         }
-        PostMessageW(hwnd, msg, 0, 0);
-        true
+        Some(PostMessageW(hwnd, msg, 0, 0) != 0)
     }
 }
 
 /// Chiede a un'istanza già in esecuzione di mostrare la finestra. Vero se ne esiste una.
 pub fn show_running_instance() -> bool {
-    post_to_running_instance(WM_TRAY_SHOW)
+    post_to_running_instance(WM_TRAY_SHOW).is_some()
 }
 
-/// Chiede a un'istanza già in esecuzione di chiudersi. Vero se ne esiste una.
-pub fn quit_running_instance() -> bool {
+/// Chiede a un'istanza già in esecuzione di chiudersi. `None` se non ce n'è una, `Some(false)` se
+/// la richiesta è stata bloccata perché l'istanza ha privilegi di amministratore.
+pub fn quit_running_instance() -> Option<bool> {
     post_to_running_instance(WM_TRAY_QUIT)
 }

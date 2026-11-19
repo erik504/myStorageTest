@@ -45,12 +45,21 @@ pub fn run(args: &[String]) -> Option<i32> {
     }
     Some(match first {
         "--quit" => {
-            if crate::tray::quit_running_instance() {
-                println!("Chiusura richiesta all'istanza in esecuzione.");
-                0
-            } else {
-                println!("Nessuna istanza in esecuzione.");
-                1
+            match crate::tray::quit_running_instance() {
+                Some(true) => {
+                    println!("Chiusura richiesta all'istanza in esecuzione.");
+                    0
+                }
+                Some(false) => {
+                    println!(
+                        "L'istanza in esecuzione ha privilegi di amministratore: ripeti il comando da un prompt elevato."
+                    );
+                    1
+                }
+                None => {
+                    println!("Nessuna istanza in esecuzione.");
+                    1
+                }
             }
         }
         "--list" => list(),

@@ -182,6 +182,17 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// Attende la fine di un altro processo; vero se è terminato (o non esiste più) entro il tempo dato.
+pub fn wait_process_exit(pid: u32, timeout_ms: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        return true;
+    }
+    let h = Handle(h);
+    unsafe { WaitForSingleObject(h.0, timeout_ms) == 0 }
+}
+
 pub fn rd_u16(b: &[u8], off: usize) -> u16 {
     if off + 2 > b.len() {
         0

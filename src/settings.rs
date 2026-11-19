@@ -48,7 +48,12 @@ pub fn data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("myStorageTest")
+    // Le istanze di prova (`MYSTORAGETEST_INSTANCE`) tengono impostazioni e registro per conto proprio,
+    // senza toccare quelli dell'utente.
+    match std::env::var("MYSTORAGETEST_INSTANCE") {
+        Ok(s) if !s.is_empty() => base.join(format!("myStorageTest-{s}")),
+        _ => base.join("myStorageTest"),
+    }
 }
 
 impl Settings {

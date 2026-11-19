@@ -8,7 +8,9 @@ quando si ha un dubbio, e accorgersi subito quando un disco comincia a dare erro
 
 ## Cosa fa
 
-**Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze:
+**Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze
+(passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore e che cosa
+significa):
 
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
@@ -82,6 +84,8 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
 `--test` esce con 0 se non ci sono errori, 1 con avvisi, 2 con errori, 3 se interrotto.
 
 «Avvia con Windows» nella scheda Monitoraggio registra `mystoragetest --monitor` per l'utente corrente.
+L'avvio automatico parte senza privilegi di amministratore: in quel caso lo SMART dei dischi USB non
+viene sorvegliato e per quei dischi restano gli errori del registro di sistema.
 
 ## Compilare
 
@@ -100,13 +104,17 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - test completi su un NVMe interno e su un SSD NVMe in contenitore USB, con controllo che il file di prova sparisca;
 - SMART senza privilegi su sei NVMe e due SATA interni;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB;
-- monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`.
+- monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
+- fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato;
+- «Riavvia come amministratore»: la sequenza di chiusura e riapertura, provata senza elevazione;
+- SMART da amministratore di un SSD NVMe in contenitore USB con bridge JMicron (152D:0581): la lettura riesce (prova fatta a mano dall'interfaccia).
 
 Non ancora verificato:
 
-- **SMART dei dischi USB** e **SMART SATA con soglie**: richiedono l'amministratore; i comandi sono scritti secondo i protocolli documentati ma non sono stati eseguiti su hardware reale;
+- **SMART dei dischi USB con bridge SAT, Realtek e ASMedia** e **SMART SATA con soglie**: richiedono l'amministratore; i comandi sono scritti secondo i protocolli documentati ma non sono stati eseguiti su hardware reale;
 - **scansione della superficie**: richiede l'amministratore;
 - riapertura della finestra dall'icona e chiusura nell'area di notifica;
+- riapertura di un'istanza elevata avviando di nuovo il programma senza privilegi;
 - comportamento davanti a errori di I/O veri: sui dischi sani a disposizione non si sono presentati;
 - Windows 11: le API usate sono le stesse, ma il programma non vi è stato eseguito.
 
@@ -129,4 +137,7 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 
 Le variabili d'ambiente `MYSTORAGETEST_SHOT`, `MYSTORAGETEST_AUTOTEST`, `MYSTORAGETEST_VOL`,
 `MYSTORAGETEST_NOACTIVATE`, `MYSTORAGETEST_POS` e `MYSTORAGETEST_FAKE_ALERT` servono alle verifiche
-automatiche dell'interfaccia: eseguono una prova, salvano le schermate di ogni scheda e chiudono.
+automatiche dell'interfaccia: eseguono una prova, salvano le schermate di ogni scheda (comprese quelle dei
+fumetti dei grafici, con un puntatore simulato) e chiudono. `MYSTORAGETEST_INSTANCE` dà alle istanze di
+prova un nome, impostazioni e registro separati, così non interferiscono con quella in uso;
+`MYSTORAGETEST_RESTART_TEST` prova il riavvio del programma senza la richiesta di elevazione.
