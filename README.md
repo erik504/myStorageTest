@@ -20,6 +20,8 @@ il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
 - flush su disco, misurato operazione per operazione;
+- rilettura di verifica dei blocchi scritti dalla scrittura casuale e dal flush: è una fase a sé
+  («Verifica»), visibile nello stato, nel registro delle attività e nei grafici;
 - lettura dei file già presenti sul volume, in sola lettura, per trovare settori illeggibili;
 - lettura grezza della superficie del volume (solo da amministratore), su un grafico a parte: velocità
   lungo il disco, con i blocchi illeggibili segnati. Si può scandire tutta o solo un tratto («dal… al…»).

@@ -43,6 +43,8 @@ pub enum Phase {
     RandRead,
     RandWrite,
     Flush,
+    /// Rilettura dei blocchi appena scritti dalla scrittura casuale e dal flush, per controllarli.
+    Verify,
     FileScan,
     Surface,
 }
@@ -55,6 +57,7 @@ impl Phase {
             Phase::RandRead => "Lettura casuale 4K",
             Phase::RandWrite => "Scrittura casuale 4K",
             Phase::Flush => "Flush su disco",
+            Phase::Verify => "Verifica dei blocchi scritti",
             Phase::FileScan => "Scansione dei file esistenti",
             Phase::Surface => "Scansione della superficie",
         }
@@ -67,6 +70,7 @@ impl Phase {
             Phase::RandRead => "Lettura 4K",
             Phase::RandWrite => "Scrittura 4K",
             Phase::Flush => "Flush",
+            Phase::Verify => "Verifica",
             Phase::FileScan => "File esistenti",
             Phase::Surface => "Superficie",
         }
@@ -861,11 +865,24 @@ impl Engine {
         if self.cfg.rand_read && !self.halted() {
             self.rand_read(&h, &path, &map);
         }
+        // Dopo la scrittura casuale e dopo il flush i blocchi scritti vengono riletti e confrontati.
+        // Sono letture vere, che durano: hanno una fase loro, visibile nello stato e nei grafici,
+        // invece di lasciare un vuoto fra una prova e l'altra.
+        let mut verify = Sampler::new(Phase::Verify);
+        let mut different = 0u32;
         if self.cfg.rand_write && !self.halted() {
-            self.rand_write(&h, &path, &mut map);
+            different += self.rand_write(&h, &path, &mut map, &mut verify);
         }
         if self.cfg.flush && !self.halted() {
-            self.flush_test(&h, &path, &mut map);
+            different += self.flush_test(&h, &path, &mut map, &mut verify);
+        }
+        if verify.ops > 0 {
+            let note = if different == 0 {
+                format!("{} blocchi riletti, dati identici", verify.ops)
+            } else {
+                format!("{} blocchi riletti, {different} diversi o illeggibili", verify.ops)
+            };
+            verify.finish(self, !self.halted(), note);
         }
 
         // Chiudendo l'handle Windows elimina il file; si controlla che sia sparito davvero.
@@ -1073,7 +1090,8 @@ impl Engine {
         s.finish(self, completed, String::new());
     }
 
-    fn rand_write(&self, h: &Handle, path: &str, map: &mut [u8]) {
+    /// Restituisce quanti blocchi la rilettura di verifica ha trovato diversi o illeggibili.
+    fn rand_write(&self, h: &Handle, path: &str, map: &mut [u8], verify: &mut Sampler) -> u32 {
         self.begin(Phase::RandWrite);
         let mut s = Sampler::new(Phase::RandWrite);
         let mut buf = AlignedBuf::new(BLOCK);
@@ -1127,12 +1145,15 @@ impl Engine {
                 self.error(Phase::RandWrite, "flush", path, 0, 0, code);
             }
         }
-        s.errors += self.verify_blocks(h, path, Phase::RandWrite, &mut written, map);
+        let different = self.verify_blocks(h, path, Phase::RandWrite, &mut written, map, verify);
+        s.errors += different;
         s.finish(self, completed, String::new());
+        different
     }
 
     /// Scrive un blocco e forza il flush su disco, misurando la durata di ogni flush.
-    fn flush_test(&self, h: &Handle, path: &str, map: &mut [u8]) {
+    /// Restituisce quanti blocchi la rilettura di verifica ha trovato diversi o illeggibili.
+    fn flush_test(&self, h: &Handle, path: &str, map: &mut [u8], verify: &mut Sampler) -> u32 {
         self.begin(Phase::Flush);
         let mut s = Sampler::new(Phase::Flush);
         s.every_op = true;
@@ -1192,27 +1213,46 @@ impl Engine {
             self.progress((el / budget).max(i as f64 / MAX_FLUSHES as f64));
         }
         s.emit(self);
-        s.errors += self.verify_blocks(h, path, Phase::Flush, &mut written, map);
+        let different = self.verify_blocks(h, path, Phase::Flush, &mut written, map, verify);
+        s.errors += different;
         s.finish(self, completed, String::new());
+        different
     }
 
-    /// Rilegge i blocchi appena scritti e controlla che contengano i dati attesi.
-    fn verify_blocks(&self, h: &Handle, path: &str, phase: Phase, written: &mut Vec<u64>, map: &[u8]) -> u32 {
+    /// Rilegge i blocchi appena scritti da `phase` e controlla che contengano i dati attesi. Le
+    /// letture finiscono nella fase «Verifica» (`verify`); gli errori restano attribuiti a `phase`.
+    fn verify_blocks(
+        &self,
+        h: &Handle,
+        path: &str,
+        phase: Phase,
+        written: &mut Vec<u64>,
+        map: &[u8],
+        verify: &mut Sampler,
+    ) -> u32 {
         written.sort_unstable();
         written.dedup();
+        written.retain(|b| map[*b as usize] != 0);
+        if written.is_empty() || self.halted() {
+            return 0;
+        }
+        self.begin(Phase::Verify);
+        let total = written.len();
         let mut buf = AlignedBuf::new(BLOCK);
         let mut errors = 0u32;
-        for &b in written.iter() {
+        for (done, &b) in written.iter().enumerate() {
             if self.halted() || errors > MAX_PHASE_ERRORS {
                 break;
             }
-            let generation = map[b as usize];
-            if generation == 0 {
-                continue;
+            if done % 64 == 0 {
+                self.progress(done as f64 / total as f64);
             }
+            let generation = map[b as usize];
             let off = b * BLOCK as u64;
-            match self.io(|| read_at(h, off, buf.as_mut_slice())).0 {
+            let (r, dt) = self.io(|| read_at(h, off, buf.as_mut_slice()));
+            match r {
                 Ok(n) if n as usize == BLOCK => {
+                    verify.add(self, n as u64, dt, "rilettura di verifica");
                     if let Some(pos) = verify_block(buf.as_slice(), self.seed, b, generation) {
                         errors += 1;
                         self.integrity_error(
@@ -1233,6 +1273,22 @@ impl Engine {
                         break;
                     }
                 }
+            }
+        }
+        // Gli ultimi campioni vanno nel grafico prima che cominci la prova successiva.
+        verify.emit(self);
+        if !self.halted() {
+            let after = if phase == Phase::Flush { "il flush" } else { "la scrittura casuale" };
+            if errors == 0 {
+                self.log(
+                    LogLevel::Good,
+                    format!("Verifica dopo {after}: {total} blocchi riletti, dati identici"),
+                );
+            } else {
+                self.log(
+                    LogLevel::Error,
+                    format!("Verifica dopo {after}: {errors} blocchi diversi o illeggibili su {total}"),
+                );
             }
         }
         errors

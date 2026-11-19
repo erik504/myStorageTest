@@ -47,6 +47,7 @@ fn phase_color(p: Phase) -> Color32 {
         Phase::RandRead => Color32::from_rgb(34, 211, 238),
         Phase::RandWrite => Color32::from_rgb(244, 114, 182),
         Phase::Flush => Color32::from_rgb(167, 139, 250),
+        Phase::Verify => Color32::from_rgb(250, 204, 21),
         Phase::FileScan => Color32::from_rgb(52, 211, 153),
         Phase::Surface => Color32::from_rgb(163, 177, 198),
     }
@@ -1430,6 +1431,10 @@ impl App {
                         format!("{} · p99 {}", fmt_ms(res.lat_avg_ms), fmt_ms(res.lat_p99_ms)),
                     ),
                     (None, Some(v)) if live(p) => (int((v * 1e6 / 4096.0) as u64), "in corso…".into()),
+                    // La scrittura è finita ma il suo esito arriva dopo la rilettura di verifica.
+                    (None, Some(v)) if p == Phase::RandWrite && live(Phase::Verify) => {
+                        (int((v * 1e6 / 4096.0) as u64), "verifica dei dati…".into())
+                    }
                     _ => ("—".into(), String::new()),
                 };
                 tile(&mut cols[2 + i], p.short(), &value, "IOPS", &sub, phase_color(p));
@@ -2559,8 +2564,28 @@ fn draw_series<'a>(p: &mut egui_plot::PlotUi<'a>, name: &str, pts: Vec<[f64; 2]>
                 .color(color)
                 .radius(3.0),
         );
+        p.line(Line::new(name, PlotPoints::from(pts)).color(color).width(width));
+        return;
     }
-    p.line(Line::new(name, PlotPoints::from(pts)).color(color).width(width));
+    // Dove fra due campioni c'è un vuoto molto più lungo del passo abituale la linea si interrompe
+    // (per esempio fra i due tratti della verifica, prima e dopo il flush): unire i due lati con
+    // una retta farebbe credere che lì ci siano misure.
+    let mut steps: Vec<f64> = pts.windows(2).map(|w| w[1][0] - w[0][0]).collect();
+    steps.sort_by(f64::total_cmp);
+    let usual = steps[steps.len() / 2];
+    let mut start = 0;
+    for end in 1..=pts.len() {
+        if end < pts.len() && !(usual > 0.0 && pts[end][0] - pts[end - 1][0] > usual * 6.0) {
+            continue;
+        }
+        let piece = pts[start..end].to_vec();
+        if piece.len() == 1 {
+            p.points(Points::new(name, PlotPoints::from(piece)).color(color).radius(1.5));
+        } else {
+            p.line(Line::new(name, PlotPoints::from(piece)).color(color).width(width));
+        }
+        start = end;
+    }
 }
 
 /// Che cosa fa una prova, in una riga: compare nei fumetti dei grafici.
@@ -2575,6 +2600,10 @@ fn phase_meaning(p: Phase) -> &'static str {
         Phase::Flush => {
             "La prova scrive un blocco da 4 KB e chiede al disco di salvarlo subito in modo definitivo: \
              si misura il tempo di quella conferma."
+        }
+        Phase::Verify => {
+            "Finite la scrittura casuale e il flush, la prova rilegge uno per uno i blocchi appena scritti e \
+             controlla che contengano i dati attesi."
         }
         Phase::FileScan => "La prova legge i file già presenti sul volume, senza modificarli.",
         Phase::Surface => "La prova legge l'intero volume da un capo all'altro, anche dove non ci sono file.",
@@ -3122,7 +3151,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             tip_head(ui, phase, q[0]);
             let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
             tip_value(ui, format!("{speed} MB/s"));
-            if matches!(phase, Phase::RandRead | Phase::RandWrite) {
+            if matches!(phase, Phase::RandRead | Phase::RandWrite | Phase::Verify) {
                 let iops = (q[1] * 1e6 / tester::BLOCK as f64).round() as u64;
                 ui.label(RichText::new(format!("circa {} operazioni al secondo", int(iops))).color(TEXT).size(13.0));
             }

@@ -277,7 +277,7 @@ fn test(args: &[String]) -> i32 {
     println!("\nRisultati:");
     for r in &sh.results {
         let speed = match r.phase {
-            Phase::RandRead | Phase::RandWrite => format!("{:>9.0} IOPS", r.iops),
+            Phase::RandRead | Phase::RandWrite | Phase::Verify => format!("{:>9.0} IOPS", r.iops),
             Phase::Flush => format!("{:>9} flush", r.ops),
             _ => format!("{:>9.1} MB/s", r.mbps),
         };
