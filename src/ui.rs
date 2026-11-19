@@ -1,6 +1,6 @@
 //! Interfaccia grafica: scelta del disco, prove con grafici in tempo reale, SMART, eventi e monitoraggio.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextStyle,
     Ui, Vec2, ViewportCommand, vec2,
 };
-use egui_plot::{Bar, BarChart, GridInput, GridMark, HLine, Line, LineStyle, Plot, PlotPoints, Points, VLine};
+use egui_plot::{Bar, BarChart, GridInput, GridMark, HLine, Line, LineStyle, Plot, PlotPoints, Points, Span, VLine};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 use crate::disks::{self, Inventory, PhysDisk, Volume, bus_name};
@@ -314,6 +314,8 @@ struct TestOptions {
     log_latency: bool,
     /// Asse logaritmico per la distribuzione della latenza; spento, l'asse è lineare.
     log_hist: bool,
+    /// Asse logaritmico per la latenza nei grafici della superficie.
+    log_surface: bool,
 }
 
 /// Sequenza automatica usata per verificare l'interfaccia: salva le schermate e chiude.
@@ -418,7 +420,15 @@ pub struct App {
     /// Ultimo stato annotato della scansione di ogni volume: in corso o no, percentuale raggiunta.
     surface_noted: HashMap<char, (bool, f64)>,
     surface_saved: Instant,
-    /// Solo per le verifiche automatiche: eventi da immettere nel prossimo fotogramma (rotellina, tasti).
+    /// Volumi la cui scansione in corso (o appena finita) rilegge un tratto scelto sul grafico: non
+    /// sposta il punto ricordato per la ripresa né il tratto proposto.
+    surface_adhoc: HashSet<char>,
+    /// Nell'ultimo fotogramma: il grafico della latenza lungo il disco e il bottone «Riscandisci»
+    /// (servono alle verifiche automatiche).
+    surface_latency_rect: egui::Rect,
+    rescan_rect: egui::Rect,
+    /// Solo per le verifiche automatiche: eventi da immettere nel prossimo fotogramma (rotellina,
+    /// tasti, bottoni del mouse).
     fake_events: Vec<egui::Event>,
 }
 
@@ -494,6 +504,7 @@ impl App {
                 log_speed: false,
                 log_latency: true,
                 log_hist: true,
+                log_surface: true,
             },
             runs: HashMap::new(),
             smart: HashMap::new(),
@@ -523,6 +534,9 @@ impl App {
             surface_range: HashMap::new(),
             surface_noted: HashMap::new(),
             surface_saved: Instant::now(),
+            surface_adhoc: HashSet::new(),
+            surface_latency_rect: egui::Rect::NOTHING,
+            rescan_rect: egui::Rect::NOTHING,
             fake_events: Vec::new(),
         };
         if app.settings.monitor_enabled {
@@ -720,7 +734,8 @@ impl App {
                 let sh = run.shared.lock().unwrap();
                 // Conta solo la scansione davvero cominciata: una prova fermata prima non deve
                 // cancellare il punto ricordato.
-                if !sh.surface_started || sh.surface_len == 0 {
+                // Nemmeno la rilettura di un tratto scelto sul grafico lo sposta.
+                if !sh.surface_started || sh.surface_len == 0 || self.surface_adhoc.contains(letter) {
                     continue;
                 }
                 (sh.running, sh.surface_reached as f64 * 100.0 / sh.surface_len as f64)
@@ -760,9 +775,28 @@ impl App {
     }
 
     fn start_test(&mut self) {
+        self.launch(None);
+    }
+
+    /// Rilegge solo un tratto di superficie del volume selezionato, scelto sul grafico (da, a:
+    /// frazioni del disco). Le altre prove non girano; il tratto proposto per la prossima scansione
+    /// e il punto ricordato per la ripresa restano quelli di prima.
+    fn rescan_surface(&mut self, from: f64, to: f64) {
+        if self.can_surface && to > from {
+            self.launch(Some((from.clamp(0.0, 1.0), to.clamp(0.0, 1.0))));
+        }
+    }
+
+    /// Avvia la prova sul volume selezionato: con le opzioni della pagina oppure, se c'è `section`,
+    /// con la sola scansione di quel tratto di superficie.
+    fn launch(&mut self, section: Option<(f64, f64)>) {
         let Some(vol) = self.sel_volume().cloned() else { return };
         let key = self.volume_key(&vol);
-        let (surface_from, surface_to) = self.surface_range_for(&key);
+        let whole = section.is_none();
+        let (surface_from, surface_to) = section.unwrap_or_else(|| {
+            let (from, to) = self.surface_range_for(&key);
+            (from / 100.0, to / 100.0)
+        });
         let max = TestConfig::max_file_size(vol.free, &vol.fs);
         let config = TestConfig {
             letter: vol.letter,
@@ -770,19 +804,24 @@ impl App {
             total: vol.total,
             free: vol.free,
             disks: vol.disks.clone(),
-            file_tests: self.opt.file_tests,
+            file_tests: whole && self.opt.file_tests,
             file_size: (self.settings.test_size_mb << 20).min(max),
             seq_read: self.opt.seq_read,
             rand_read: self.opt.rand_read,
             rand_write: self.opt.rand_write,
             flush: self.opt.flush,
             rand_secs: self.settings.rand_secs as f64,
-            file_scan: self.opt.file_scan,
+            file_scan: whole && self.opt.file_scan,
             file_scan_limit: (self.settings.scan_limit_gb as u64) << 30,
-            surface: self.opt.surface && self.can_surface,
-            surface_from: surface_from / 100.0,
-            surface_to: surface_to / 100.0,
+            surface: (!whole || self.opt.surface) && self.can_surface,
+            surface_from,
+            surface_to,
         };
+        if whole {
+            self.surface_adhoc.remove(&vol.letter);
+        } else {
+            self.surface_adhoc.insert(vol.letter);
+        }
         // Ripresa: i tratti di superficie già letti in questa sessione restano nel grafico, tranne
         // quelli che la nuova scansione sta per rileggere.
         let earlier = self.runs.get(&vol.letter).filter(|_| config.surface).and_then(|run| {
@@ -793,14 +832,14 @@ impl App {
             let length = sh.surface_len as f64;
             let (from, to) = (config.surface_from * length, config.surface_to * length);
             let outside = |position: f64| position < from || position >= to;
-            let mut tracts: Vec<[f64; 3]> = sh
+            let mut tracts: Vec<tester::Tract> = sh
                 .surface_before
                 .iter()
                 .chain(sh.surface.iter())
-                .filter(|q| outside(q[0]))
+                .filter(|q| outside(q.start))
                 .copied()
                 .collect();
-            tracts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            tracts.sort_by(|a, b| a.start.total_cmp(&b.start));
             let bad: Vec<u64> = sh.surface_bad.iter().filter(|b| outside(**b as f64)).copied().collect();
             Some((sh.surface_len, tracts, bad))
         });
@@ -1493,11 +1532,19 @@ impl App {
         let rows = if surface { 3.0 } else { 2.0 };
         let avail = ui.available_height();
         let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 120.0 });
-        let log_h = if only_surface { (avail * 0.3).max(130.0) } else { chart_h };
-        let surface_h = if only_surface { (avail - log_h - 10.0).max(220.0) } else { chart_h };
+        let log_h = if only_surface { (avail * 0.24).max(100.0) } else { chart_h };
+        // La superficie ha due grafici uno sopra l'altro: le serve più altezza che agli altri riquadri.
+        let surface_h = if only_surface { (avail - log_h - 10.0).max(300.0) } else { chart_h.max(320.0) };
         let (log_speed, log_latency, log_hist) = (self.opt.log_speed, self.opt.log_latency, self.opt.log_hist);
         let (mut toggle_speed, mut toggle_latency, mut toggle_hist) = (false, false, false);
         let mut rects = [egui::Rect::NOTHING; 4];
+        // Grafici della superficie: scala della latenza, tratto scelto con il mouse e che cosa farne.
+        let log_surface = self.opt.log_surface;
+        let can_surface = self.can_surface;
+        let surface_len = sh.surface_len as f64;
+        let picked = surface_gesture(ui.ctx(), vol.letter).pick.filter(|_| surface_len > 0.0);
+        let (mut toggle_surface, mut unpick, mut rescan) = (false, false, None::<(f64, f64)>);
+        let (mut latency_rect, mut rescan_rect) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
         // Le prove che stanno sui grafici nel tempo: tutte tranne la scansione della superficie.
         let timed = |has_data: fn(&tester::PhaseSeries) -> bool| {
             sh.series
@@ -1561,12 +1608,40 @@ impl App {
                 if surface {
                     chart_frame(
                         ui,
-                        "Scansione della superficie (MB/s lungo il disco)",
+                        "Scansione della superficie: velocità (MB/s) e latenza lungo il disco",
                         surface_h,
-                        |_| {},
+                        |ui| {
+                            let mut log = log_surface;
+                            toggle_surface = ui
+                                .checkbox(&mut log, RichText::new("latenza in scala logaritmica").size(12.5).color(DIM))
+                                .changed();
+                            // Tratto scelto trascinando sul grafico: si può rileggere solo quello.
+                            let Some((lo, hi)) = picked else { return };
+                            unpick = ui.small_button("×").on_hover_text("Toglie la scelta del tratto").clicked();
+                            let button = egui::Button::new(
+                                RichText::new(format!("Riscandisci {}", gb_span(lo, hi))).size(12.5).color(Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .corner_radius(CornerRadius::same(6));
+                            let response = ui
+                                .add_enabled(can_surface && !testing, button)
+                                .on_hover_text(
+                                    "Rilegge solo questo tratto di superficie. Nel grafico il resto del disco \
+                                     resta quello delle scansioni precedenti.",
+                                )
+                                .on_disabled_hover_text(if can_surface {
+                                    "Attendi la fine della prova in corso"
+                                } else {
+                                    "La scansione della superficie richiede l'avvio come amministratore"
+                                });
+                            rescan_rect = response.rect;
+                            if response.clicked() {
+                                rescan = Some((lo * GIB / surface_len, hi * GIB / surface_len));
+                            }
+                        },
                         |ui| {
                             surface_legend(ui, &sh, vol.letter);
-                            rects[3] = surface_chart(ui, &sh, vol.letter);
+                            [rects[3], latency_rect] = surface_charts(ui, &sh, vol.letter, log_surface);
                         },
                     );
                     if scroll_to_surface {
@@ -1587,6 +1662,19 @@ impl App {
         }
         if toggle_hist {
             self.opt.log_hist = !self.opt.log_hist;
+        }
+        if toggle_surface {
+            self.opt.log_surface = !self.opt.log_surface;
+        }
+        self.surface_latency_rect = latency_rect;
+        self.rescan_rect = rescan_rect;
+        if unpick {
+            let mut gesture = surface_gesture(ui.ctx(), vol.letter);
+            (gesture.pick, gesture.anchor) = (None, None);
+            set_surface_gesture(ui.ctx(), vol.letter, gesture);
+        }
+        if let Some((from, to)) = rescan {
+            self.rescan_surface(from, to);
         }
     }
 
@@ -2122,10 +2210,23 @@ impl App {
             let _ = std::fs::write(script.dir.join("superficie.txt"), script.report.join("\n") + "\n");
         };
         let view = || {
-            ctx.data(|d| d.get_temp::<Option<(f64, f64)>>(surface_zoom_id(letter)))
-                .flatten()
+            surface_gesture(ctx, letter)
+                .view
                 .map(|(lo, hi)| format!("da {lo:.3} a {hi:.3} GB"))
                 .unwrap_or_else(|| "tutto il disco".into())
+        };
+        let picked = || {
+            surface_gesture(ctx, letter)
+                .pick
+                .map(|(lo, hi)| format!("da {lo:.3} a {hi:.3} GB"))
+                .unwrap_or_else(|| "nessuno".into())
+        };
+        // Bottone sinistro del mouse premuto o rilasciato in un punto.
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
         };
         let press = |key: egui::Key| {
             [true, false].map(|pressed| egui::Event::Key {
@@ -2238,7 +2339,71 @@ impl App {
                 self.scroll_to_surface = true;
                 shot(self, "s6-tratto.png");
             }
+            // Scelta di un tratto trascinando sul grafico della latenza, poi «Riscandisci».
             19 => {
+                let rect = self.surface_latency_rect;
+                let from = rect.left_top() + vec2(rect.width() * 0.30, rect.height() * 0.5);
+                self.fake_pointer = Some(from);
+                self.fake_events.push(button(from, true));
+                wait(self, 150);
+            }
+            20 => {
+                let rect = self.surface_latency_rect;
+                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.45, rect.height() * 0.5));
+                wait(self, 250);
+            }
+            21 => {
+                if let Some(pos) = self.fake_pointer {
+                    self.fake_events.push(button(pos, false));
+                }
+                wait(self, 300);
+            }
+            22 => {
+                note(self, format!("dopo il trascinamento — tratto scelto {}", picked()));
+                shot(self, "s7-tratto-scelto.png");
+            }
+            23 => {
+                self.fake_pointer = Some(self.rescan_rect.center());
+                wait(self, 250);
+            }
+            24 => {
+                self.fake_events.push(button(self.rescan_rect.center(), true));
+                wait(self, 120);
+            }
+            25 => {
+                self.fake_events.push(button(self.rescan_rect.center(), false));
+                wait(self, 300);
+            }
+            26 if self.testing() => again(self, 26),
+            26 => wait(self, 400),
+            27 => {
+                let started = if self.surface_adhoc.contains(&letter) { "sì" } else { "no" };
+                let text = format!("dopo «Riscandisci» (avviata: {started}) — {}", state(self));
+                note(self, text);
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.scroll_to_surface = true;
+                shot(self, "s8-riscandito.png");
+            }
+            // Un clic sul grafico toglie la scelta.
+            28 => {
+                let rect = self.chart_rects[3];
+                let pos = rect.left_top() + vec2(rect.width() * 0.8, rect.height() * 0.5);
+                self.fake_pointer = Some(pos);
+                self.fake_events.push(button(pos, true));
+                wait(self, 120);
+            }
+            29 => {
+                if let Some(pos) = self.fake_pointer {
+                    self.fake_events.push(button(pos, false));
+                }
+                wait(self, 300);
+            }
+            30 => {
+                note(self, format!("dopo un clic sul grafico — tratto scelto {}", picked()));
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                wait(self, 200);
+            }
+            31 => {
                 if isolated {
                     self.settings.save();
                 }
@@ -2441,7 +2606,13 @@ fn fake_surface(sh: &mut tester::Shared) {
                 speed *= 0.25;
                 slowest = 1800.0;
             }
-            [f * len, speed, slowest]
+            tester::Tract {
+                start: f * len,
+                mbps: speed,
+                // Un blocco da 4 MiB a quella velocità.
+                lat_avg_ms: 4.0 * 1048.576 / speed,
+                lat_max_ms: slowest,
+            }
         })
         .collect();
     sh.surface_bad = vec![(0.751 * len) as u64, (0.757 * len) as u64];
@@ -2528,6 +2699,50 @@ fn decade_marks(step: f64) -> impl Fn(GridInput) -> Vec<GridMark> {
         }
         marks
     }
+}
+
+/// Tacche a passi tondi (1, 2, 5 × 10ⁿ), abbastanza distanti perché ognuna abbia la sua etichetta
+/// anche in un grafico basso.
+fn round_marks(input: GridInput) -> Vec<GridMark> {
+    let (lo, hi) = input.bounds;
+    // `base_step_size` è il valore che corrisponde a 8 punti dello schermo: ne servono una trentina.
+    let wanted = input.base_step_size / 8.0 * 32.0;
+    if !wanted.is_finite() || wanted <= 0.0 {
+        return Vec::new();
+    }
+    let magnitude = 10f64.powf(wanted.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * magnitude)
+        .find(|s| *s >= wanted)
+        .unwrap_or(magnitude * 10.0);
+    let mut marks = Vec::new();
+    let mut i = (lo / step).ceil() as i64;
+    while (i as f64) * step <= hi && marks.len() < 64 {
+        marks.push(GridMark {
+            value: i as f64 * step,
+            step_size: step,
+        });
+        i += 1;
+    }
+    marks
+}
+
+/// Tacche di un asse logaritmico: le decadi e, dove c'è posto, anche 2 e 5 (un intervallo stretto
+/// avrebbe altrimenti una sola etichetta).
+fn log_marks(input: GridInput) -> Vec<GridMark> {
+    let (lo, hi) = input.bounds;
+    let mut marks = Vec::new();
+    for decade in lo.floor() as i64..=hi.ceil() as i64 {
+        // Il passo dichiarato decide se l'etichetta si vede: le intermedie solo se c'è spazio.
+        for (multiple, step_size) in [(1.0f64, 1.0), (2.0, 0.3), (5.0, 0.3)] {
+            let value = decade as f64 + multiple.log10();
+            if value >= lo && value <= hi && marks.len() < 64 {
+                marks.push(GridMark { value, step_size });
+            }
+        }
+    }
+    marks
 }
 
 /// Etichetta di una decade di tempo: "10 µs", "1 ms", "10 s".
@@ -2880,24 +3095,59 @@ fn timed_series(sh: &tester::Shared) -> impl Iterator<Item = &(Phase, tester::Ph
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// Legenda del grafico della superficie: quanto è stato letto, quanti blocchi non si leggono e lo zoom.
+/// Gesti sui grafici della superficie di un volume. Li condividono i suoi due grafici (velocità e
+/// latenza) e restano ricordati per volume: l'ingrandimento, il tratto scelto con il mouse e il
+/// punto indicato dal puntatore.
+#[derive(Clone, Copy, Default)]
+struct SurfaceGesture {
+    /// Tratto ingrandito, in GiB; `None` = tutto il disco.
+    view: Option<(f64, f64)>,
+    /// Tratto scelto trascinando, in GiB.
+    pick: Option<(f64, f64)>,
+    /// Punto in cui è cominciato il trascinamento in corso.
+    anchor: Option<f64>,
+    /// Inizio, in byte, del tratto sotto il puntatore: viene segnato in entrambi i grafici.
+    hover: Option<f64>,
+}
+
+fn surface_gesture_id(letter: char) -> egui::Id {
+    egui::Id::unique(("grafici della superficie", letter))
+}
+
+fn surface_gesture(ctx: &egui::Context, letter: char) -> SurfaceGesture {
+    ctx.data(|d| d.get_temp(surface_gesture_id(letter)))
+        .unwrap_or_default()
+}
+
+fn set_surface_gesture(ctx: &egui::Context, letter: char, gesture: SurfaceGesture) {
+    ctx.data_mut(|d| d.insert_temp(surface_gesture_id(letter), gesture));
+}
+
+/// Colore della latenza nei grafici della superficie.
+const SURFACE_LATENCY: Color32 = Color32::from_rgb(34, 211, 238);
+
+/// Legenda dei grafici della superficie: le due misure, quanto è stato letto, i blocchi che non si
+/// leggono e come muoversi.
 fn surface_legend(ui: &mut Ui, sh: &tester::Shared, letter: char) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
-        ui.label(RichText::new("●").color(phase_color(Phase::Surface)).size(10.0));
-        ui.label(RichText::new("Velocità di lettura  ").color(DIM).size(12.0));
+        let faint = Color32::from_rgb(96, 106, 124);
+        let entry = |ui: &mut Ui, color: Color32, text: String| {
+            ui.label(RichText::new("●").color(color).size(10.0));
+            ui.label(RichText::new(text).color(DIM).size(12.0));
+        };
+        entry(ui, phase_color(Phase::Surface), "Velocità  ".into());
+        entry(ui, SURFACE_LATENCY, "Latenza (tenue = massimo)  ".into());
         let bad = sh.surface_bad.len();
-        ui.label(RichText::new("●").color(if bad > 0 { BAD } else { GOOD }).size(10.0));
-        ui.label(
-            RichText::new(match bad {
+        entry(
+            ui,
+            if bad > 0 { BAD } else { GOOD },
+            match bad {
                 0 => "nessun blocco illeggibile  ".to_string(),
                 1 => "1 blocco illeggibile  ".to_string(),
                 n => format!("{} blocchi illeggibili  ", int(n as u64)),
-            })
-            .color(DIM)
-            .size(12.0),
+            },
         );
-        let faint = Color32::from_rgb(96, 106, 124);
         if sh.surface.is_empty() {
             ui.label(RichText::new("in attesa dei dati…  ").color(DIM).size(12.0));
         } else {
@@ -2914,181 +3164,307 @@ fn surface_legend(ui: &mut Ui, sh: &tester::Shared, letter: char) {
             ui.label(RichText::new(text).color(faint).size(12.0));
         }
         if !sh.surface_before.is_empty() {
-            ui.label(RichText::new("· più tenui i tratti delle scansioni precedenti  ").color(faint).size(12.0));
+            ui.label(RichText::new("· più tenui: scansioni precedenti  ").color(faint).size(12.0));
         }
-        // Stato dello zoom all'ultimo disegno del grafico.
-        let view: Option<(f64, f64)> = ui.data(|d| d.get_temp(surface_zoom_id(letter))).flatten();
-        let text = match view {
+        let text = match surface_gesture(ui.ctx(), letter).view {
             Some((lo, hi)) => format!(
-                "· ingrandito da {} a {} GB: trascina per spostarti, 0 per rivedere tutto",
-                num(lo, 1),
-                num(hi, 1)
+                "· ingrandito {}: tasto destro per spostarti, 0 per rivedere tutto, trascina per scegliere un tratto",
+                gb_span(lo, hi)
             ),
-            None => "· rotellina o + e − per ingrandire".to_string(),
+            None => "· rotellina o + e − per ingrandire, trascina per scegliere un tratto".to_string(),
         };
         ui.label(RichText::new(text).color(faint).size(12.0));
     });
 }
 
-/// Dove il grafico della superficie di un volume ricorda il tratto ingrandito, per la legenda.
-fn surface_zoom_id(letter: char) -> egui::Id {
-    egui::Id::unique(("zoom della superficie", letter))
+/// Il tratto letto più vicino alla posizione `x` (in byte), di questa scansione o delle precedenti.
+fn tract_near(sh: &tester::Shared, x: f64) -> Option<tester::Tract> {
+    [&sh.surface, &sh.surface_before]
+        .into_iter()
+        .flat_map(|tracts| {
+            let i = tracts.partition_point(|q| q.start < x);
+            [i.wrapping_sub(1), i].into_iter().filter_map(|j| tracts.get(j))
+        })
+        .min_by(|a, b| (a.start - x).abs().total_cmp(&(b.start - x).abs()))
+        .copied()
 }
 
-/// Scansione della superficie: velocità di lettura lungo il disco, con i blocchi illeggibili segnati.
-/// Si ingrandisce con la rotellina o con + e −, ci si sposta trascinando, 0 rimostra tutto il disco;
-/// ogni volume tiene il suo ingrandimento, durante la scansione e dopo.
-fn surface_chart(ui: &mut Ui, sh: &tester::Shared, letter: char) -> egui::Rect {
-    let color = phase_color(Phase::Surface);
+#[derive(Clone, Copy, PartialEq)]
+enum SurfaceKind {
+    Speed,
+    Latency,
+}
+
+/// Uno dei due grafici della superficie, lungo il disco. Si ingrandisce con la rotellina o con + e −,
+/// ci si sposta trascinando con il tasto destro, 0 rimostra tutto il disco; trascinando con il
+/// tasto sinistro si sceglie un tratto. Restituisce la risposta del grafico e, se il puntatore è
+/// su questo grafico, il tratto indicato con la posizione sullo schermo della sua linea verticale.
+fn surface_plot(
+    ui: &mut Ui,
+    sh: &tester::Shared,
+    letter: char,
+    kind: SurfaceKind,
+    height: f32,
+    log: bool,
+    shown: Option<f64>,
+) -> (egui::Response, Option<(tester::Tract, f32)>) {
+    let latency = kind == SurfaceKind::Latency;
     let total = sh.surface_len as f64 / GIB;
-    let was_zoomed = ui
-        .data(|d| d.get_temp::<Option<(f64, f64)>>(surface_zoom_id(letter)))
-        .flatten()
-        .is_some();
-    // I tasti valgono solo se non si sta scrivendo in una casella.
-    let keys = !ui.ctx().egui_wants_keyboard_input();
-    let out = base_plot(("superficie", letter), ui.available_height())
-        .allow_drag([was_zoomed, false])
-        .include_y(0.0)
+    let before = surface_gesture(ui.ctx(), letter);
+    // I tasti valgono solo se non si sta scrivendo in una casella, e li ascolta un grafico solo:
+    // l'altro lo segue, perché l'asse orizzontale è in comune.
+    let keys = !latency && !ui.ctx().egui_wants_keyboard_input();
+    let y_of = move |v: f64| if latency && log { v.max(1e-4).log10() } else { v };
+    // I due grafici hanno lo stesso asse orizzontale e lo stesso margine a sinistra, così un punto
+    // del disco sta alla stessa ascissa in entrambi.
+    let plot = base_plot(("superficie", letter, latency), height)
+        .link_axis(egui::Id::unique(("asse della superficie", letter)), [true, false])
+        .allow_drag([before.view.is_some(), false])
+        .pan_pointer_button(egui::PointerButton::Secondary)
+        .y_axis_min_width(58.0)
         .include_x(0.0)
         .include_x(total)
         .x_axis_formatter(|m, range| {
             // Da vicino servono i decimali.
             let decimals = if range.end() - range.start() < 20.0 { 1 } else { 0 };
             format!("{} GB", num(m.value.max(0.0), decimals))
-        })
-        .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
-        .show(ui, |p| -> (Option<[f64; 3]>, Option<(f64, f64)>) {
-            // Tratti delle scansioni precedenti, prima e dopo quello in corso, più tenui.
-            let (before, after): (Vec<[f64; 2]>, Vec<[f64; 2]>) = sh
-                .surface_before
-                .iter()
-                .map(|q| [q[0] / GIB, q[1]])
-                .partition(|q| q[0] * GIB < sh.surface_from as f64);
-            for (name, pts) in [("superficie, prima", before), ("superficie, dopo", after)] {
-                if !pts.is_empty() {
-                    draw_series(p, name, pts, color.gamma_multiply(0.5), 2.0);
-                }
-            }
-            let pts: Vec<[f64; 2]> = sh.surface.iter().map(|q| [q[0] / GIB, q[1]]).collect();
-            if !pts.is_empty() {
-                draw_series(p, "superficie", pts, color, 2.0);
-            }
-            for (i, bad) in sh.surface_bad.iter().enumerate().take(400) {
-                p.vline(
-                    VLine::new(format!("illeggibile {i}"), *bad as f64 / GIB)
-                        .color(BAD.gamma_multiply(0.85))
-                        .width(1.0),
-                );
-            }
-
-            // Zoom. La rotellina sopra il grafico ingrandisce attorno al puntatore invece di far
-            // scorrere la pagina; i tasti ingrandiscono attorno al centro (o al puntatore, se è sopra).
-            let hovered = p.response().hovered();
-            let (wheel, nearer, farther, reset) = p.ctx().input_mut(|i| {
-                let wheel = if hovered {
-                    std::mem::take(&mut i.smooth_scroll_delta).y
-                } else {
-                    0.0
-                };
-                let key = |k: egui::Key| keys && i.key_pressed(k);
-                (
-                    wheel,
-                    key(egui::Key::Plus) || key(egui::Key::Equals),
-                    key(egui::Key::Minus),
-                    key(egui::Key::Num0),
-                )
-            });
-            let bounds = p.plot_bounds();
-            let (lo, hi) = (bounds.min()[0], bounds.max()[0]);
-            let mut view = (!p.auto_bounds().x).then_some((lo.max(0.0), hi.min(total)));
-            let mut factor = (-(wheel as f64) * 0.004).exp();
-            if nearer {
-                factor *= 0.6;
-            }
-            if farther {
-                factor /= 0.6;
-            }
-            if reset || (factor > 1.0 && (hi - lo) * factor >= total) {
-                p.set_auto_bounds([true, true]);
-                view = None;
-            } else if total > 0.0 && hi > lo && (factor != 1.0 || view.is_some()) {
-                let width = ((hi - lo) * factor).clamp((total / 20_000.0).max(0.01), total);
-                let pivot = p
-                    .pointer_coordinate()
-                    .filter(|_| hovered)
-                    .map(|c| c.x)
-                    .unwrap_or((lo + hi) / 2.0)
-                    .clamp(lo, hi);
-                // Il punto sotto il puntatore resta fermo, e la vista non esce dal disco.
-                let start = (pivot - (pivot - lo) / (hi - lo) * width).clamp(0.0, (total - width).max(0.0));
-                if factor != 1.0 || (start - lo).abs() > width * 1e-6 {
-                    p.set_plot_bounds_x(start..=start + width);
-                }
-                view = Some((start, start + width));
-            }
-            // Sotto il puntatore: il tratto di disco più vicino, di questa scansione o delle precedenti.
-            let nearest = hover_x(p).and_then(|x| {
-                let x = x * GIB;
-                [&sh.surface, &sh.surface_before]
-                    .into_iter()
-                    .flat_map(|tracts| {
-                        let i = tracts.partition_point(|q| q[0] < x);
-                        [i.wrapping_sub(1), i].into_iter().filter_map(|j| tracts.get(j))
-                    })
-                    .min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs()))
-                    .copied()
-            });
-            if let Some(q) = nearest {
-                hover_marks(p, q[0] / GIB, &[(q[1], color)]);
-            }
-            (nearest, view)
         });
-    ui.data_mut(|d| d.insert_temp(surface_zoom_id(letter), out.inner.1));
-    if let Some(q) = out.inner.0 {
-        chart_tip(&out.response, out.transform.position_from_point_x(q[0] / GIB), |ui| {
+    let plot = match (latency, log) {
+        (false, _) => plot
+            .include_y(0.0)
+            .show_axes([false, true])
+            .y_grid_spacer(round_marks)
+            .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64)),
+        (true, true) => plot
+            .y_grid_spacer(log_marks)
+            .y_axis_formatter(|m, _| fmt_decade(10f64.powf(m.value))),
+        (true, false) => plot
+            .include_y(0.0)
+            .y_grid_spacer(round_marks)
+            .y_axis_formatter(|m, _| fmt_ms(m.value.max(0.0))),
+    };
+    // Le linee da disegnare: che cosa misurano, colore e spessore.
+    type Measure = fn(&tester::Tract) -> f64;
+    let lines: Vec<(Measure, Color32, f32)> = if latency {
+        vec![
+            (|q| q.lat_max_ms, SURFACE_LATENCY.gamma_multiply(0.4), 1.0),
+            (|q| q.lat_avg_ms, SURFACE_LATENCY, 2.0),
+        ]
+    } else {
+        vec![(|q| q.mbps, phase_color(Phase::Surface), 2.0)]
+    };
+    let out = plot.show(ui, |p| -> Option<tester::Tract> {
+        // Tratti delle scansioni precedenti, prima e dopo quello in corso, più tenui.
+        let (earlier, later): (Vec<&tester::Tract>, Vec<&tester::Tract>) = sh
+            .surface_before
+            .iter()
+            .partition(|q| q.start < sh.surface_from as f64);
+        for (measure, color, width) in &lines {
+            let points = |tracts: &[&tester::Tract]| -> Vec<[f64; 2]> {
+                tracts.iter().map(|q| [q.start / GIB, y_of(measure(q))]).collect()
+            };
+            for old in [&earlier, &later] {
+                if !old.is_empty() {
+                    draw_series(p, "superficie, prima", points(old), color.gamma_multiply(0.5), *width);
+                }
+            }
+            if !sh.surface.is_empty() {
+                let now: Vec<&tester::Tract> = sh.surface.iter().collect();
+                draw_series(p, "superficie", points(&now), *color, *width);
+            }
+        }
+        for (i, bad) in sh.surface_bad.iter().enumerate().take(400) {
+            p.vline(
+                VLine::new(format!("illeggibile {i}"), *bad as f64 / GIB)
+                    .color(BAD.gamma_multiply(0.85))
+                    .width(1.0),
+            );
+        }
+
+        // Lo stato dei gesti va riletto qui: l'altro grafico può averlo appena cambiato.
+        let mut gesture = surface_gesture(p.ctx(), letter);
+        if let Some((lo, hi)) = gesture.pick {
+            // Senza nome: altrimenti il grafico lo scrive dentro la fascia.
+            p.span(
+                Span::new("", lo..=hi)
+                    .fill(ACCENT.gamma_multiply(0.16))
+                    .border(Stroke::new(1.0, ACCENT)),
+            );
+        }
+
+        // Zoom. La rotellina sopra il grafico ingrandisce attorno al puntatore invece di far
+        // scorrere la pagina; i tasti ingrandiscono attorno al centro (o al puntatore, se è sopra).
+        let hovered = p.response().hovered();
+        let (wheel, nearer, farther, reset) = p.ctx().input_mut(|i| {
+            let wheel = if hovered {
+                std::mem::take(&mut i.smooth_scroll_delta).y
+            } else {
+                0.0
+            };
+            let key = |k: egui::Key| keys && i.key_pressed(k);
+            (
+                wheel,
+                key(egui::Key::Plus) || key(egui::Key::Equals),
+                key(egui::Key::Minus),
+                key(egui::Key::Num0),
+            )
+        });
+        let bounds = p.plot_bounds();
+        let (lo, hi) = (bounds.min()[0], bounds.max()[0]);
+        let mut view = (!p.auto_bounds().x).then_some((lo.max(0.0), hi.min(total)));
+        let mut factor = (-(wheel as f64) * 0.004).exp();
+        if nearer {
+            factor *= 0.6;
+        }
+        if farther {
+            factor /= 0.6;
+        }
+        if reset || (factor > 1.0 && (hi - lo) * factor >= total) {
+            p.set_auto_bounds([true, true]);
+            view = None;
+        } else if total > 0.0 && hi > lo && (factor != 1.0 || view.is_some()) {
+            let width = ((hi - lo) * factor).clamp((total / 20_000.0).max(0.01), total);
+            // Attorno al puntatore, anche quando è sull'altro grafico; altrimenti attorno al centro.
+            let pivot = p
+                .pointer_coordinate()
+                .filter(|_| hovered)
+                .map(|c| c.x)
+                .or(shown.map(|start| start / GIB).filter(|x| (lo..=hi).contains(x)))
+                .unwrap_or((lo + hi) / 2.0)
+                .clamp(lo, hi);
+            // Il punto sotto il puntatore resta fermo, e la vista non esce dal disco.
+            let start = (pivot - (pivot - lo) / (hi - lo) * width).clamp(0.0, (total - width).max(0.0));
+            if factor != 1.0 || (start - lo).abs() > width * 1e-6 {
+                p.set_plot_bounds_x(start..=start + width);
+            }
+            view = Some((start, start + width));
+        }
+        gesture.view = view;
+
+        // Scelta di un tratto: si trascina con il tasto sinistro; un clic toglie la scelta.
+        let primary = egui::PointerButton::Primary;
+        let (started, dragging, stopped, clicked) = {
+            let r = p.response();
+            (
+                r.drag_started_by(primary),
+                r.dragged_by(primary),
+                r.drag_stopped_by(primary),
+                r.clicked(),
+            )
+        };
+        let pointer = p.pointer_coordinate().map(|c| c.x.clamp(0.0, total));
+        if started {
+            let origin = p.ctx().input(|i| i.pointer.press_origin());
+            gesture.anchor = origin.map(|pos| p.plot_from_screen(pos).x.clamp(0.0, total)).or(pointer);
+            gesture.pick = None;
+        }
+        if dragging {
+            if let (Some(from), Some(to)) = (gesture.anchor, pointer) {
+                gesture.pick = Some((from.min(to), from.max(to)));
+            }
+        }
+        if stopped {
+            gesture.anchor = None;
+            // Meno di un blocco di lettura (4 MiB) non è un tratto.
+            if gesture.pick.is_some_and(|(lo, hi)| hi - lo < 4.0 / 1024.0) {
+                gesture.pick = None;
+            }
+        }
+        if clicked {
+            gesture.pick = None;
+        }
+
+        // Sotto il puntatore: il tratto di disco più vicino. Viene segnato anche nell'altro grafico.
+        let nearest = hover_x(p).and_then(|x| tract_near(sh, x * GIB));
+        if let Some(q) = nearest {
+            gesture.hover = Some(q.start);
+        }
+        if let Some(q) = nearest.or_else(|| shown.and_then(|start| tract_near(sh, start))) {
+            let marks: Vec<(f64, Color32)> = lines.iter().map(|(measure, color, _)| (y_of(measure(&q)), *color)).collect();
+            hover_marks(p, q.start / GIB, &marks);
+        }
+        set_surface_gesture(p.ctx(), letter, gesture);
+        nearest
+    });
+    let at = out
+        .inner
+        .map(|q| (q, out.transform.position_from_point_x(q.start / GIB)));
+    (out.response, at)
+}
+
+/// Tratto di disco «da X a Y GB», con i decimali che servono a distinguere i due estremi.
+fn gb_span(lo: f64, hi: f64) -> String {
+    let decimals = match hi - lo {
+        w if w >= 10.0 => 1,
+        w if w >= 0.1 => 2,
+        _ => 3,
+    };
+    format!("da {} a {} GB", num(lo, decimals), num(hi, decimals))
+}
+
+/// I due grafici della scansione della superficie, velocità sopra e latenza sotto, con il fumetto
+/// del tratto indicato. Restituisce i loro rettangoli (servono alle verifiche automatiche).
+fn surface_charts(ui: &mut Ui, sh: &tester::Shared, letter: char, log: bool) -> [egui::Rect; 2] {
+    // Il punto indicato all'ultimo disegno vale per entrambi i grafici; poi si riparte da capo.
+    let mut gesture = surface_gesture(ui.ctx(), letter);
+    let shown = gesture.hover.take();
+    set_surface_gesture(ui.ctx(), letter, gesture);
+    let top = ((ui.available_height() - 4.0) * 0.5).max(40.0);
+    let (speed, on_speed) = surface_plot(ui, sh, letter, SurfaceKind::Speed, top, log, shown);
+    let bottom = ui.available_height();
+    let (latency, on_latency) = surface_plot(ui, sh, letter, SurfaceKind::Latency, bottom, log, shown);
+    let pointed = on_speed
+        .map(|at| (&speed, at))
+        .or(on_latency.map(|at| (&latency, at)));
+    if let Some((response, (q, line_x))) = pointed {
+        chart_tip(response, line_x, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new("●").color(color).size(11.0));
+                ui.label(RichText::new("●").color(phase_color(Phase::Surface)).size(11.0));
                 ui.label(bold(Phase::Surface.label(), 14.0).color(TEXT));
             });
             let percent = if sh.surface_len > 0 {
-                format!(" ({} % del disco)", num(q[0] * 100.0 / sh.surface_len as f64, 1))
+                format!(" ({} % del disco)", num(q.start * 100.0 / sh.surface_len as f64, 1))
             } else {
                 String::new()
             };
-            ui.label(dim(format!("a {} dall'inizio{percent}", human_bytes(q[0] as u64))));
-            let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
+            ui.label(dim(format!("a {} dall'inizio{percent}", human_bytes(q.start as u64))));
+            let speed = if q.mbps >= 100.0 { int(q.mbps.round() as u64) } else { num(q.mbps, 1) };
             tip_value(ui, format!("{speed} MB/s"));
             ui.label(
-                RichText::new(format!("lettura più lenta in questo tratto: {}", fmt_ms(q[2])))
-                    .color(TEXT)
-                    .size(13.0),
+                RichText::new(format!(
+                    "latenza media {} · lettura più lenta {}",
+                    fmt_ms(q.lat_avg_ms),
+                    fmt_ms(q.lat_max_ms)
+                ))
+                .color(TEXT)
+                .size(13.0),
             );
             // Blocchi illeggibili fra questo tratto e il successivo.
             let next = sh
                 .surface
                 .iter()
-                .map(|n| n[0])
-                .find(|start| *start > q[0])
+                .map(|n| n.start)
+                .find(|start| *start > q.start)
                 .unwrap_or(sh.surface_len as f64);
             let bad = sh
                 .surface_bad
                 .iter()
-                .filter(|b| (**b as f64) >= q[0] && (**b as f64) < next)
+                .filter(|b| (**b as f64) >= q.start && (**b as f64) < next)
                 .count();
             if bad > 0 {
                 ui.label(RichText::new(format!("Blocchi illeggibili in questo tratto: {bad}")).color(BAD).size(13.0));
             }
             tip_note(
                 ui,
-                "Velocità di lettura in questo punto del disco. Sugli hard disk cala in modo regolare verso \
-                 la fine; un crollo isolato o una lettura molto lenta indicano una zona in difficoltà.",
+                "Velocità e latenza di lettura in questo punto del disco: ogni lettura è un blocco da 4 MB. \
+                 Sugli hard disk la velocità cala in modo regolare verso la fine; un crollo isolato o una \
+                 lettura molto lenta indicano una zona in difficoltà.",
             );
             tip_note(ui, phase_meaning(Phase::Surface));
         });
     }
-    out.response.rect
+    [speed.rect, latency.rect]
 }
 
 /// Prima riga di una scheda della colonna dei dischi: il nome, troncato se serve, e a destra la

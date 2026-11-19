@@ -209,9 +209,8 @@ pub struct Shared {
     pub cleaned: Option<bool>,
     /// Eventi di sistema sul disco registrati durante la prova.
     pub sys_events: Vec<StorEvent>,
-    /// Scansione della superficie, lungo il disco e non nel tempo: per ogni tratto letto la
-    /// posizione in byte, la velocità in MB/s e la latenza più alta in millisecondi.
-    pub surface: Vec<[f64; 3]>,
+    /// Scansione della superficie, lungo il disco e non nel tempo: i tratti letti, in ordine.
+    pub surface: Vec<Tract>,
     /// Posizioni in byte dei blocchi che non si sono lasciati leggere.
     pub surface_bad: Vec<u64>,
     /// Dimensione in byte del volume da scandire (0 = scansione non richiesta).
@@ -224,7 +223,7 @@ pub struct Shared {
     pub surface_started: bool,
     /// Tratti letti dalle scansioni precedenti della sessione, fuori da quello in corso: restano
     /// nel grafico quando una scansione viene ripresa. Li prepara chi avvia la prova.
-    pub surface_before: Vec<[f64; 3]>,
+    pub surface_before: Vec<Tract>,
 }
 
 impl Shared {
@@ -250,14 +249,27 @@ impl Shared {
 /// Numero massimo di tratti conservati per il grafico della superficie.
 const SURFACE_MAX_POINTS: usize = 4000;
 
-/// Punto del grafico della superficie da un tratto (inizio, byte letti, tempo, latenza più alta).
-fn surface_point(tract: (u64, u64, f64, f64)) -> [f64; 3] {
-    let speed = if tract.2 > 0.0 {
-        tract.1 as f64 / tract.2 / 1e6
-    } else {
-        0.0
-    };
-    [tract.0 as f64, speed, tract.3 * 1000.0]
+/// Un tratto di superficie letto dalla scansione.
+#[derive(Clone, Copy, Debug)]
+pub struct Tract {
+    /// Posizione di inizio nel volume, in byte.
+    pub start: f64,
+    /// Velocità di lettura nel tratto, in MB/s.
+    pub mbps: f64,
+    /// Latenza media e massima delle letture del tratto, in millisecondi.
+    pub lat_avg_ms: f64,
+    pub lat_max_ms: f64,
+}
+
+/// Tratto del grafico della superficie dalle sue misure: inizio, byte letti, tempo di lettura,
+/// latenza più alta, numero di letture.
+fn surface_point(tract: (u64, u64, f64, f64, u32)) -> Tract {
+    Tract {
+        start: tract.0 as f64,
+        mbps: if tract.2 > 0.0 { tract.1 as f64 / tract.2 / 1e6 } else { 0.0 },
+        lat_avg_ms: if tract.4 > 0 { tract.2 / tract.4 as f64 * 1000.0 } else { 0.0 },
+        lat_max_ms: tract.3 * 1000.0,
+    }
 }
 
 /// Microsecondi rappresentati dal limite inferiore di un secchio dell'istogramma.
@@ -1526,10 +1538,12 @@ impl Engine {
         let block = SURFACE_BLOCK as u64;
         let at = |fraction: f64| (fraction.clamp(0.0, 1.0) * length as f64) as u64 / block * block;
         let from = at(self.cfg.surface_from);
+        // La fine si arrotonda in su: un tratto più corto di un blocco viene comunque letto.
         let to = if self.cfg.surface_to >= 1.0 {
             length
         } else {
-            at(self.cfg.surface_to).max(from)
+            let end = (self.cfg.surface_to.clamp(0.0, 1.0) * length as f64) as u64;
+            (end.div_ceil(block) * block).clamp(from, length)
         };
         {
             let mut sh = self.shared.lock().unwrap();
@@ -1554,8 +1568,8 @@ impl Engine {
         let mut buf = AlignedBuf::new(SURFACE_BLOCK);
         let mut off = from;
         let mut completed = true;
-        // Tratto di disco in corso: inizio, byte letti, tempo di lettura, latenza più alta.
-        let mut tract = (from, 0u64, 0.0f64, 0.0f64);
+        // Tratto di disco in corso: inizio, byte letti, tempo di lettura, latenza più alta, letture.
+        let mut tract = (from, 0u64, 0.0f64, 0.0f64, 0u32);
         let mut tract_every = Duration::from_millis(100);
         let mut tract_since = Instant::now();
         while off < to {
@@ -1575,6 +1589,7 @@ impl Engine {
                     tract.1 += n as u64;
                     tract.2 += dt;
                     tract.3 = tract.3.max(dt);
+                    tract.4 += 1;
                     off += n as u64;
                 }
                 Err(code) => {
@@ -1605,17 +1620,16 @@ impl Engine {
                     sh.surface = sh
                         .surface
                         .chunks(2)
-                        .map(|c| {
-                            [
-                                c[0][0],
-                                c.iter().map(|p| p[1]).sum::<f64>() / c.len() as f64,
-                                c.iter().map(|p| p[2]).fold(0.0, f64::max),
-                            ]
+                        .map(|c| Tract {
+                            start: c[0].start,
+                            mbps: c.iter().map(|p| p.mbps).sum::<f64>() / c.len() as f64,
+                            lat_avg_ms: c.iter().map(|p| p.lat_avg_ms).sum::<f64>() / c.len() as f64,
+                            lat_max_ms: c.iter().map(|p| p.lat_max_ms).fold(0.0, f64::max),
                         })
                         .collect();
                     tract_every *= 2;
                 }
-                tract = (off, 0, 0.0, 0.0);
+                tract = (off, 0, 0.0, 0.0, 0);
                 tract_since = Instant::now();
             }
             self.progress((off - from) as f64 / (to - from).max(1) as f64);

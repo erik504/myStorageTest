@@ -23,12 +23,15 @@ il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 - rilettura di verifica dei blocchi scritti dalla scrittura casuale e dal flush: è una fase a sé
   («Verifica»), visibile nello stato, nel registro delle attività e nei grafici;
 - lettura dei file già presenti sul volume, in sola lettura, per trovare settori illeggibili;
-- lettura grezza della superficie del volume (solo da amministratore), su un grafico a parte: velocità
-  lungo il disco, con i blocchi illeggibili segnati. Si può scandire tutta o solo un tratto («dal… al…»).
-  Ogni volume ricorda dove si è fermata l'ultima scansione rimasta a metà e lo ripropone come punto di
-  partenza, anche dopo aver chiuso il programma; ripartendo, i tratti già letti nella sessione restano
-  nel grafico. Il grafico si ingrandisce con la rotellina o con + e −, si sposta trascinando, e 0
-  rimostra tutto il disco, durante la scansione e dopo;
+- lettura grezza della superficie del volume (solo da amministratore), su due grafici a parte, uno sopra
+  l'altro e con lo stesso asse: velocità e latenza (media e lettura più lenta) lungo il disco, con i
+  blocchi illeggibili segnati, mentre la scansione gira e alla fine. Si può scandire tutta o solo un
+  tratto («dal… al…»). Ogni volume ricorda dove si è fermata l'ultima scansione rimasta a metà e lo
+  ripropone come punto di partenza, anche dopo aver chiuso il programma; ripartendo, i tratti già letti
+  nella sessione restano nel grafico. I grafici si ingrandiscono insieme con la rotellina o con + e −,
+  si spostano trascinando con il tasto destro, e 0 rimostra tutto il disco. Trascinando con il tasto
+  sinistro si sceglie un tratto: «Riscandisci» rilegge solo quello, lasciando nel grafico il resto e
+  senza toccare il punto ricordato per la ripresa; un clic toglie la scelta;
 - controllo degli errori di disco comparsi nel registro di sistema durante la prova.
 
 Ogni volume ha la sua pagina Test: i risultati restano lì dopo la fine della prova e quando si guarda un
@@ -155,7 +158,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
 - storico delle temperature degli SSD interni;
-- scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, zoom con rotellina e tasti;
+- scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
 - fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato;
 - «Riavvia come amministratore»: la sequenza di chiusura e riapertura, provata senza elevazione;
@@ -205,7 +208,8 @@ richiesta di elevazione.
 `MYSTORAGETEST_SURFACE_FILE` fa leggere alla scansione della superficie un file al posto del volume
 (adagio, per avere il tempo di fermarla), così si prova senza privilegi. Con `MYSTORAGETEST_AUTOTEST=superficie`
 la sequenza ferma la scansione, verifica il punto ricordato, la riprende, prova lo zoom e un tratto
-parziale, e scrive ciò che osserva in `superficie.txt`; `MYSTORAGETEST_SURFACE_PHASE=1` la chiude dopo
+parziale, sceglie un tratto trascinando sul grafico e lo fa rileggere, e scrive ciò che osserva in
+`superficie.txt`; `MYSTORAGETEST_SURFACE_PHASE=1` la chiude dopo
 l'arresto, per verificare al lancio successivo che la memoria sia rimasta.
 
 ## Licenza
