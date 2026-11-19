@@ -1,0 +1,568 @@
+//! Lettura degli errori di disco e file system dal registro eventi "Sistema" di Windows.
+//! Non richiede privilegi di amministratore.
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr::{null, null_mut};
+
+use std::sync::Mutex;
+use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+
+use windows_sys::Win32::System::EventLog::{
+    EVT_HANDLE, EvtClose, EvtFormatMessage, EvtNext, EvtOpenPublisherMetadata, EvtQuery, EvtRender, EvtSubscribe,
+};
+use windows_sys::Win32::System::Time::SystemTimeToFileTime;
+
+use crate::win;
+
+const EVT_QUERY_CHANNEL_PATH: u32 = 0x1;
+const EVT_QUERY_REVERSE: u32 = 0x200;
+const EVT_QUERY_FORWARD: u32 = 0x100;
+const EVT_RENDER_XML: u32 = 1;
+const EVT_FORMAT_MESSAGE_EVENT: u32 = 1;
+
+/// Sorgenti del registro che riguardano dischi, controller e file system.
+const PROVIDERS: &[&str] = &[
+    "disk",
+    "Disk",
+    "Ntfs",
+    "Microsoft-Windows-Ntfs",
+    "volmgr",
+    "volsnap",
+    "partmgr",
+    "stornvme",
+    "storahci",
+    "storport",
+    "UASPStor",
+    "USBSTOR",
+    "iaStorA",
+    "iaStorAC",
+    "iaStorAVC",
+    "iaStorV",
+    "iaStorVD",
+    "amdsata",
+    "atapi",
+    "nvme",
+    "secnvme",
+    "exfat",
+    "fastfat",
+    "Fastfat",
+    "ReFS",
+    "Microsoft-Windows-ReFS",
+    "Microsoft-Windows-WHEA-Logger",
+];
+
+#[derive(Clone, Debug)]
+pub struct StorEvent {
+    pub record_id: u64,
+    #[allow(dead_code)]
+    pub filetime: u64,
+    pub time: String,
+    pub provider: String,
+    pub id: u32,
+    /// 1 = critico, 2 = errore, 3 = avviso.
+    pub level: u8,
+    pub message: String,
+    pub disk: Option<u32>,
+    pub letter: Option<char>,
+    pub explain: &'static str,
+    /// Evento precedente all'ultimo avvio di Windows: il numero del disco può riferirsi a un altro
+    /// disco, perché la numerazione cambia dopo un riavvio o un ricollegamento.
+    pub stale: bool,
+}
+
+/// Istante dell'ultimo avvio di Windows, come FILETIME UTC.
+pub fn boot_filetime() -> u64 {
+    let uptime_ms = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    win::now_filetime().saturating_sub(uptime_ms * 10_000)
+}
+
+impl StorEvent {
+    /// Vero se l'evento riguarda uno dei dischi indicati o il volume indicato.
+    /// Il numero del disco vale solo per gli eventi successivi all'ultimo avvio.
+    pub fn concerns(&self, disks: &[u32], letter: char) -> bool {
+        self.disk.is_some_and(|d| !self.stale && disks.contains(&d)) || self.letter == Some(letter)
+    }
+
+    pub fn level_label(&self) -> &'static str {
+        match self.level {
+            1 => "Critico",
+            2 => "Errore",
+            3 => "Avviso",
+            _ => "Info",
+        }
+    }
+
+    /// Dove punta l'evento: "Disco 8", "H:" oppure vuoto.
+    pub fn target(&self) -> String {
+        let name = if self.stale { "Ex disco" } else { "Disco" };
+        match (self.disk, self.letter) {
+            (Some(d), Some(l)) => format!("{name} {d} · {l}:"),
+            (Some(d), None) => format!("{name} {d}"),
+            (None, Some(l)) => format!("{l}:"),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// Spiegazione in italiano per gli eventi più comuni.
+fn explain(provider: &str, id: u32) -> &'static str {
+    let p = provider.to_ascii_lowercase();
+    match (p.as_str(), id) {
+        ("disk", 7) => "Blocco danneggiato sul disco",
+        ("disk", 11) => "Errore del controller del disco",
+        ("disk", 15) => "Il disco non è pronto",
+        ("disk", 51) => "Errore durante un'operazione di paging",
+        ("disk", 52) => "Lo SMART del disco prevede un guasto",
+        ("disk", 153) => "Operazione di I/O ritentata: errore transitorio, spesso cavo o collegamento",
+        ("disk", 154) => "Operazione di I/O fallita per un errore hardware",
+        ("disk", 157) => "Disco rimosso senza preavviso",
+        ("disk", 158) => "Due dischi hanno lo stesso identificatore",
+        ("ntfs", 55) | ("microsoft-windows-ntfs", 55) => "Struttura del file system danneggiata",
+        ("ntfs", 50) | ("microsoft-windows-ntfs", 50) => "Scrittura ritardata fallita: dati persi",
+        ("ntfs", 57) | ("microsoft-windows-ntfs", 57) => "Impossibile scrivere i dati nel registro delle transazioni",
+        ("ntfs", 130) | ("microsoft-windows-ntfs", 130) => "Riparazione del file system in corso o fallita",
+        ("ntfs", 137) | ("microsoft-windows-ntfs", 137) => "Errore del registro delle transazioni del volume",
+        ("ntfs", 140) | ("microsoft-windows-ntfs", 140) => {
+            "Impossibile scrivere il registro delle transazioni: i dati sul volume sono a rischio"
+        }
+        ("volmgr", 46) => "Inizializzazione del dump di arresto anomalo non riuscita",
+        ("volsnap", _) => "Problema con le copie shadow del volume",
+        ("microsoft-windows-whea-logger", _) => "Errore hardware segnalato dal processore o dal bus",
+        (_, 129) => "Reset del dispositivo: non ha risposto in tempo",
+        (_, 11) => "Errore del controller",
+        _ => "",
+    }
+}
+
+/// Codice dell'ultimo errore restituito da una query al registro (0 = nessuno).
+pub static LAST_QUERY_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Query strutturata: il registro eventi accetta poche condizioni per espressione,
+/// quindi le sorgenti sono distribuite su più elementi `Select`.
+fn xpath(extra: &str) -> Vec<u16> {
+    let extra = extra.replace('<', "&lt;").replace('>', "&gt;");
+    let mut q = String::from("<QueryList><Query Id=\"0\" Path=\"System\">");
+    for group in PROVIDERS.chunks(8) {
+        let names: Vec<String> = group.iter().map(|p| format!("@Name='{p}'")).collect();
+        q.push_str(&format!(
+            "<Select Path=\"System\">*[System[Provider[{}] and (Level=1 or Level=2 or Level=3){}]]</Select>",
+            names.join(" or "),
+            if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" and {extra}")
+            }
+        ));
+    }
+    q.push_str("</Query></QueryList>");
+    win::wide(&q)
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#13;", "")
+        .replace("&#10;", " ")
+        .replace("&amp;", "&")
+}
+
+/// Testo di `<tag ...>testo</tag>`.
+fn tag_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open) {
+        let start = from + i + open.len();
+        let next = xml[start..].chars().next()?;
+        if next == '>' || next == ' ' {
+            let gt = start + xml[start..].find('>')?;
+            if xml[..gt].ends_with('/') {
+                return Some("");
+            }
+            let end = gt + 1 + xml[gt + 1..].find(&format!("</{tag}>"))?;
+            return Some(&xml[gt + 1..end]);
+        }
+        from = start;
+    }
+    None
+}
+
+/// Valore dell'attributo `attr` del primo elemento `tag`.
+fn attr_value<'a>(xml: &'a str, tag: &str, attr: &str) -> Option<&'a str> {
+    let i = xml.find(&format!("<{tag} "))?;
+    let end = i + xml[i..].find('>')?;
+    let el = &xml[i..end];
+    let a = el.find(&format!("{attr}="))? + attr.len() + 1;
+    let quote = el[a..].chars().next()?;
+    let rest = &el[a + 1..];
+    Some(&rest[..rest.find(quote)?])
+}
+
+/// Tutti i valori `<Data>` dell'evento.
+fn data_values(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find("<Data") {
+        let start = from + i;
+        let Some(gt) = xml[start..].find('>') else { break };
+        let gt = start + gt;
+        if xml[..gt].ends_with('/') {
+            from = gt + 1;
+            continue;
+        }
+        let Some(end) = xml[gt + 1..].find("</Data>") else {
+            break;
+        };
+        out.push(unescape(&xml[gt + 1..gt + 1 + end]));
+        from = gt + 1 + end;
+    }
+    out
+}
+
+/// "2026-11-18T06:21:20.1234567Z" → FILETIME UTC.
+fn parse_time(s: &str) -> u64 {
+    let num = |a: usize, b: usize| -> u16 { s.get(a..b).and_then(|x| x.parse().ok()).unwrap_or(0) };
+    let st = SYSTEMTIME {
+        wYear: num(0, 4),
+        wMonth: num(5, 7),
+        wDayOfWeek: 0,
+        wDay: num(8, 10),
+        wHour: num(11, 13),
+        wMinute: num(14, 16),
+        wSecond: num(17, 19),
+        wMilliseconds: 0,
+    };
+    let mut ft = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    unsafe {
+        if SystemTimeToFileTime(&st, &mut ft) == 0 {
+            return 0;
+        }
+    }
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
+/// Numero del disco fisico citato nel testo come `\Device\Harddisk8\...`.
+fn find_disk(text: &str) -> Option<u32> {
+    let mut from = 0;
+    while let Some(i) = text[from..].find("Harddisk") {
+        let start = from + i + "Harddisk".len();
+        let digits: String = text[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+        from = start;
+    }
+    None
+}
+
+/// Lettera di volume citata nei dati dell'evento ("H:").
+fn find_letter(values: &[String]) -> Option<char> {
+    for v in values {
+        let t = v.trim();
+        let b = t.as_bytes();
+        if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'\\') {
+            return Some(b[0].to_ascii_uppercase() as char);
+        }
+    }
+    None
+}
+
+unsafe fn render_xml(ev: EVT_HANDLE) -> Option<String> {
+    unsafe {
+        let mut used = 0u32;
+        let mut props = 0u32;
+        EvtRender(
+            0 as EVT_HANDLE,
+            ev,
+            EVT_RENDER_XML,
+            0,
+            null_mut(),
+            &mut used,
+            &mut props,
+        );
+        if used == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; used as usize / 2 + 2];
+        if EvtRender(
+            0 as EVT_HANDLE,
+            ev,
+            EVT_RENDER_XML,
+            (buf.len() * 2) as u32,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut used,
+            &mut props,
+        ) == 0
+        {
+            return None;
+        }
+        Some(win::from_wide(&buf))
+    }
+}
+
+unsafe fn format_message(meta: EVT_HANDLE, ev: EVT_HANDLE) -> Option<String> {
+    unsafe {
+        if meta == 0 as EVT_HANDLE {
+            return None;
+        }
+        let mut used = 0u32;
+        EvtFormatMessage(
+            meta,
+            ev,
+            0,
+            0,
+            null(),
+            EVT_FORMAT_MESSAGE_EVENT,
+            0,
+            null_mut(),
+            &mut used,
+        );
+        if used == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; used as usize + 2];
+        if EvtFormatMessage(
+            meta,
+            ev,
+            0,
+            0,
+            null(),
+            EVT_FORMAT_MESSAGE_EVENT,
+            buf.len() as u32,
+            buf.as_mut_ptr(),
+            &mut used,
+        ) == 0
+        {
+            return None;
+        }
+        let s = win::from_wide(&buf);
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+/// Costruisce la descrizione di un evento a partire dal suo handle.
+unsafe fn build_event(ev: EVT_HANDLE, metas: &mut HashMap<String, EVT_HANDLE>, boot: u64) -> Option<StorEvent> {
+    unsafe {
+        let xml = render_xml(ev)?;
+        let provider = attr_value(&xml, "Provider", "Name").unwrap_or("").to_string();
+        let meta = *metas.entry(provider.clone()).or_insert_with(|| {
+            let w = win::wide(&provider);
+            EvtOpenPublisherMetadata(0 as EVT_HANDLE, w.as_ptr(), null(), 0, 0)
+        });
+        let values = data_values(&xml);
+        let message = format_message(meta, ev).unwrap_or_else(|| values.join(" · "));
+        let id = tag_text(&xml, "EventID")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let filetime = attr_value(&xml, "TimeCreated", "SystemTime")
+            .map(parse_time)
+            .unwrap_or(0);
+        let joined = values.join(" ");
+        Some(StorEvent {
+            record_id: tag_text(&xml, "EventRecordID")
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0),
+            filetime,
+            time: win::local_time_string(filetime),
+            explain: explain(&provider, id),
+            id,
+            level: tag_text(&xml, "Level").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+            disk: find_disk(&joined).or_else(|| find_disk(&message)),
+            letter: find_letter(&values),
+            stale: filetime != 0 && filetime < boot,
+            provider,
+            message,
+        })
+    }
+}
+
+struct SubState {
+    events: Mutex<Vec<StorEvent>>,
+    metas: Mutex<HashMap<String, EVT_HANDLE>>,
+}
+
+/// Sottoscrizione agli errori di disco: Windows consegna i nuovi eventi appena vengono scritti,
+/// senza rileggere il registro a intervalli.
+pub struct Subscription {
+    handle: EVT_HANDLE,
+    state: *mut SubState,
+}
+
+unsafe impl Send for Subscription {}
+
+unsafe extern "system" fn on_event(action: i32, context: *const c_void, event: EVT_HANDLE) -> u32 {
+    // Azione 1 = consegna di un evento; 0 = errore della sottoscrizione.
+    if action == 1 && !context.is_null() {
+        unsafe {
+            let state = &*(context as *const SubState);
+            if let Ok(mut metas) = state.metas.lock() {
+                if let Some(e) = build_event(event, &mut metas, boot_filetime()) {
+                    if let Ok(mut list) = state.events.lock() {
+                        list.push(e);
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+impl Subscription {
+    pub fn start() -> Option<Subscription> {
+        let state = Box::into_raw(Box::new(SubState {
+            events: Mutex::new(Vec::new()),
+            metas: Mutex::new(HashMap::new()),
+        }));
+        let channel = win::wide("System");
+        let query = xpath("");
+        const TO_FUTURE_EVENTS: u32 = 1;
+        let handle = unsafe {
+            EvtSubscribe(
+                0 as EVT_HANDLE,
+                null_mut(),
+                channel.as_ptr(),
+                query.as_ptr(),
+                0 as EVT_HANDLE,
+                state as *const c_void,
+                Some(on_event),
+                TO_FUTURE_EVENTS,
+            )
+        };
+        if handle == 0 as EVT_HANDLE {
+            LAST_QUERY_ERROR.store(win::last_error(), std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                drop(Box::from_raw(state));
+            }
+            return None;
+        }
+        Some(Subscription { handle, state })
+    }
+
+    /// Eventi arrivati dall'ultima chiamata.
+    pub fn drain(&self) -> Vec<StorEvent> {
+        let state = unsafe { &*self.state };
+        state
+            .events
+            .lock()
+            .map(|mut l| std::mem::take(&mut *l))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        unsafe {
+            // La chiusura annulla la sottoscrizione e attende la fine delle consegne in corso.
+            EvtClose(self.handle);
+            let state = Box::from_raw(self.state);
+            if let Ok(metas) = state.metas.lock() {
+                for m in metas.values() {
+                    if *m != 0 as EVT_HANDLE {
+                        EvtClose(*m);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_query(query: &[u16], reverse: bool, max: usize) -> Vec<StorEvent> {
+    let mut out = Vec::new();
+    let channel = win::wide("System");
+    let flags = EVT_QUERY_CHANNEL_PATH | if reverse { EVT_QUERY_REVERSE } else { EVT_QUERY_FORWARD };
+    unsafe {
+        let hq = EvtQuery(0 as EVT_HANDLE, channel.as_ptr(), query.as_ptr(), flags);
+        if hq == 0 as EVT_HANDLE {
+            LAST_QUERY_ERROR.store(win::last_error(), std::sync::atomic::Ordering::Relaxed);
+            return out;
+        }
+        LAST_QUERY_ERROR.store(0, std::sync::atomic::Ordering::Relaxed);
+        let boot = boot_filetime();
+        let mut metas: HashMap<String, EVT_HANDLE> = HashMap::new();
+        'outer: loop {
+            let mut handles = [0 as EVT_HANDLE; 32];
+            let mut got = 0u32;
+            if EvtNext(hq, handles.len() as u32, handles.as_mut_ptr(), 2000, 0, &mut got) == 0 || got == 0 {
+                break;
+            }
+            for &ev in &handles[..got as usize] {
+                if out.len() < max {
+                    if let Some(e) = build_event(ev, &mut metas, boot) {
+                        out.push(e);
+                    }
+                }
+                EvtClose(ev);
+            }
+            if out.len() >= max {
+                break 'outer;
+            }
+        }
+        for (_, m) in metas {
+            if m != 0 as EVT_HANDLE {
+                EvtClose(m);
+            }
+        }
+        EvtClose(hq);
+    }
+    out
+}
+
+/// Eventi dall'istante indicato (FILETIME UTC) in poi, dal più recente.
+pub fn query_since(filetime_utc: u64, max: usize) -> Vec<StorEvent> {
+    let ms = win::now_filetime().saturating_sub(filetime_utc) / 10_000 + 1500;
+    run_query(
+        &xpath(&format!("TimeCreated[timediff(@SystemTime) <= {ms}]")),
+        true,
+        max,
+    )
+}
+
+/// Eventi delle ultime `hours` ore, dal più recente.
+pub fn query_hours(hours: u64, max: usize) -> Vec<StorEvent> {
+    run_query(
+        &xpath(&format!("TimeCreated[timediff(@SystemTime) <= {}]", hours * 3_600_000)),
+        true,
+        max,
+    )
+}
+
+/// Eventi con numero di record successivo a quello indicato, in ordine cronologico.
+pub fn query_after(record_id: u64, max: usize) -> Vec<StorEvent> {
+    run_query(&xpath(&format!("EventRecordID > {record_id}")), false, max)
+}
+
+/// Numero di record dell'evento più recente del registro "Sistema" (di qualunque sorgente).
+pub fn newest_record_id() -> u64 {
+    let channel = win::wide("System");
+    let query = win::wide("*");
+    unsafe {
+        let hq = EvtQuery(
+            0 as EVT_HANDLE,
+            channel.as_ptr(),
+            query.as_ptr(),
+            EVT_QUERY_CHANNEL_PATH | EVT_QUERY_REVERSE,
+        );
+        if hq == 0 as EVT_HANDLE {
+            return 0;
+        }
+        let mut ev = [0 as EVT_HANDLE; 1];
+        let mut got = 0u32;
+        let mut id = 0u64;
+        if EvtNext(hq, 1, ev.as_mut_ptr(), 2000, 0, &mut got) != 0 && got == 1 {
+            if let Some(xml) = render_xml(ev[0]) {
+                id = tag_text(&xml, "EventRecordID")
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+            EvtClose(ev[0]);
+        }
+        EvtClose(hq);
+        id
+    }
+}
