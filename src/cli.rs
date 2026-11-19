@@ -23,13 +23,16 @@ Uso:
   mystoragetest --selftest N breve|estesa|stop
                                     avvia o interrompe l'autodiagnosi del disco N (da amministratore)
   mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
+  mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
   mystoragetest --test X: [opzioni] esegue le prove sul volume X:
 
 Opzioni di --test:
   --size MB      dimensione del file di prova (predefinito 256)
   --secs N       durata delle prove casuali (predefinito 5)
   --scan MB      legge anche i file esistenti fino a MB (0 = tutti)
-  --surface      scansione dell'intera superficie (solo da amministratore)
+  --surface      scansione della superficie (solo da amministratore)
+  --from P       inizio della scansione della superficie, in percentuale (predefinito 0)
+  --to P         fine della scansione della superficie, in percentuale (predefinito 100)
   --no-write     salta le prove in scrittura
 
 Codice di uscita di --test: 0 nessun errore, 1 avvisi, 2 errori, 3 interrotto.
@@ -40,7 +43,17 @@ pub fn run(args: &[String]) -> Option<i32> {
     let first = args.first()?.as_str();
     if !matches!(
         first,
-        "--list" | "--smart" | "--events" | "--test" | "--quit" | "--help" | "-h" | "/?" | "--check-events" | "--selftest"
+        "--list"
+            | "--smart"
+            | "--events"
+            | "--test"
+            | "--quit"
+            | "--help"
+            | "-h"
+            | "/?"
+            | "--check-events"
+            | "--selftest"
+            | "--export-icon"
     ) {
         return None;
     }
@@ -71,6 +84,7 @@ pub fn run(args: &[String]) -> Option<i32> {
             if eventlog::check(720, max) { 0 } else { 2 }
         }
         "--selftest" => selftest_cmd(&args[1..]),
+        "--export-icon" => export_icon(args.get(1).map(String::as_str).unwrap_or("icona.png")),
         "--list" => list(),
         "--smart" => smart_cmd(args.get(1).and_then(|s| s.parse().ok())),
         "--events" => events(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(24)),
@@ -192,7 +206,16 @@ fn test(args: &[String]) -> i32 {
             .and_then(|s| s.parse().ok())
     };
     let flag = |name: &str| args.iter().any(|a| a == name);
-    let size = (opt("--size").unwrap_or(256) << 20).min(TestConfig::max_file_size(vol.free, &vol.fs));
+    // Percentuale con la virgola o con il punto, fra 0 e 100.
+    let percent = |name: &str, default: f64| -> f64 {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.replace(',', ".").trim_end_matches('%').parse::<f64>().ok())
+            .unwrap_or(default)
+            .clamp(0.0, 100.0)
+    };
+    let size =(opt("--size").unwrap_or(256) << 20).min(TestConfig::max_file_size(vol.free, &vol.fs));
     let scan = opt("--scan");
     let cfg = TestConfig {
         letter,
@@ -210,6 +233,8 @@ fn test(args: &[String]) -> i32 {
         file_scan: scan.is_some(),
         file_scan_limit: scan.unwrap_or(0) << 20,
         surface: flag("--surface"),
+        surface_from: percent("--from", 0.0) / 100.0,
+        surface_to: percent("--to", 100.0) / 100.0,
     };
     println!(
         "Prova di {letter}: ({}, {} liberi), file di prova {}",
@@ -359,4 +384,39 @@ fn selftest_cmd(args: &[String]) -> i32 {
         println!();
     }
     0
+}
+/// `--export-icon FILE.png`: salva l'icona del programma così com'è disegnata, in tutte le
+/// dimensioni e nei tre stati, su uno sfondo scuro come quello della barra delle applicazioni.
+fn export_icon(path: &str) -> i32 {
+    use crate::icon::{self, Tone};
+    const SIZES: [u32; 7] = [256, 64, 48, 32, 24, 20, 16];
+    const GAP: u32 = 24;
+    let width = GAP + SIZES.iter().map(|s| s + GAP).sum::<u32>();
+    let height = GAP + 3 * (256 + GAP);
+    let mut sheet = image::RgbaImage::from_pixel(width, height, image::Rgba([27, 33, 48, 255]));
+    for (row, tone) in [Tone::Ok, Tone::Warn, Tone::Error].into_iter().enumerate() {
+        let mut x = GAP;
+        for size in SIZES {
+            let rgba = icon::rgba(size, tone);
+            let y = GAP + row as u32 * (256 + GAP) + (256 - size) / 2;
+            for (i, px) in rgba.chunks_exact(4).enumerate() {
+                let alpha = px[3] as f32 / 255.0;
+                let target = sheet.get_pixel_mut(x + i as u32 % size, y + i as u32 / size);
+                for k in 0..3 {
+                    target.0[k] = (px[k] as f32 * alpha + target.0[k] as f32 * (1.0 - alpha)) as u8;
+                }
+            }
+            x += size + GAP;
+        }
+    }
+    match sheet.save(path) {
+        Ok(()) => {
+            println!("Icona salvata in {path}");
+            0
+        }
+        Err(e) => {
+            println!("Impossibile salvare {path}: {e}");
+            2
+        }
+    }
 }

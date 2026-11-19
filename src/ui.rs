@@ -311,6 +311,8 @@ struct TestOptions {
     surface: bool,
     log_speed: bool,
     log_latency: bool,
+    /// Asse logaritmico per la distribuzione della latenza; spento, l'asse è lineare.
+    log_hist: bool,
 }
 
 /// Sequenza automatica usata per verificare l'interfaccia: salva le schermate e chiude.
@@ -324,6 +326,25 @@ struct Script {
     home: Option<Sel>,
     /// Secondo volume provato insieme al primo, se richiesto.
     second: Option<Sel>,
+    /// Sequenza dedicata alla scansione della superficie (`MYSTORAGETEST_AUTOTEST=superficie`).
+    surface: bool,
+    /// Quello che la sequenza della superficie osserva, scritto in `superficie.txt`.
+    report: Vec<String>,
+}
+
+/// Chiede una schermata e tiene ferma la sequenza di verifica finché non è stata salvata.
+fn script_shot(ctx: &egui::Context, script: &mut Script, name: &str) {
+    let path = script.dir.join(name);
+    let busy = script.busy.clone();
+    busy.store(true, Ordering::Relaxed);
+    ctx.request_screenshot(move |img| {
+        let [w, h] = img.size;
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, img.as_raw().to_vec()) {
+            let _ = buf.save(&path);
+        }
+        busy.store(false, Ordering::Relaxed);
+    });
 }
 
 pub struct App {
@@ -388,6 +409,16 @@ pub struct App {
     fake_pointer_gone: bool,
     /// Al prossimo disegno porta in vista il grafico della superficie.
     scroll_to_surface: bool,
+    /// La scansione della superficie è disponibile: da amministratore (o nelle verifiche automatiche,
+    /// quando al posto del volume si legge un file).
+    can_surface: bool,
+    /// Tratto di superficie da scandire per ogni volume (vedi `volume_key`), in percentuale: da, a.
+    surface_range: HashMap<String, (f64, f64)>,
+    /// Ultimo stato annotato della scansione di ogni volume: in corso o no, percentuale raggiunta.
+    surface_noted: HashMap<char, (bool, f64)>,
+    surface_saved: Instant,
+    /// Solo per le verifiche automatiche: eventi da immettere nel prossimo fotogramma (rotellina, tasti).
+    fake_events: Vec<egui::Event>,
 }
 
 impl App {
@@ -414,6 +445,8 @@ impl App {
             autotest: std::env::var_os("MYSTORAGETEST_AUTOTEST").is_some(),
             home: None,
             second: None,
+            surface: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("superficie"),
+            report: Vec::new(),
         });
         let scripted = script.is_some();
 
@@ -459,6 +492,7 @@ impl App {
                 surface: false,
                 log_speed: false,
                 log_latency: true,
+                log_hist: true,
             },
             runs: HashMap::new(),
             smart: HashMap::new(),
@@ -484,6 +518,11 @@ impl App {
             fake_pointer: None,
             fake_pointer_gone: false,
             scroll_to_surface: false,
+            can_surface: win::is_elevated() || std::env::var_os("MYSTORAGETEST_SURFACE_FILE").is_some(),
+            surface_range: HashMap::new(),
+            surface_noted: HashMap::new(),
+            surface_saved: Instant::now(),
+            fake_events: Vec::new(),
         };
         if app.settings.monitor_enabled {
             app.start_monitor(&cc.egui_ctx);
@@ -652,8 +691,77 @@ impl App {
         }
     }
 
+    /// Identità di un volume che non dipende dalla lettera, che per un disco esterno può cambiare:
+    /// il disco (modello e numero di serie) e la dimensione del volume.
+    fn volume_key(&self, vol: &Volume) -> String {
+        match vol.disks.first().and_then(|n| self.inventory.disk(*n)) {
+            Some(d) => format!("{}|{}", disk_key(d), vol.total),
+            None => format!("{}:|{}", vol.letter, vol.total),
+        }
+    }
+
+    /// Tratto di superficie da scandire per il volume. La prima volta propone di ripartire da dove
+    /// si è fermata l'ultima scansione, se era rimasta a metà.
+    fn surface_range_for(&mut self, key: &str) -> (f64, f64) {
+        *self.surface_range.entry(key.to_string()).or_insert_with(|| {
+            let resume = self.settings.surface_reached.get(key).copied().unwrap_or(0.0);
+            (if resume > 0.0 && resume < 100.0 { resume } else { 0.0 }, 100.0)
+        })
+    }
+
+    /// Annota, volume per volume, dove è arrivata la scansione della superficie: ogni pochi secondi
+    /// mentre gira (così resta anche se il computer si spegne) e quando finisce o viene fermata.
+    fn note_surface_progress(&mut self) {
+        let due = self.surface_saved.elapsed() >= Duration::from_secs(5);
+        let mut changes = Vec::new();
+        for (letter, run) in &self.runs {
+            let (running, percent) = {
+                let sh = run.shared.lock().unwrap();
+                // Conta solo la scansione davvero cominciata: una prova fermata prima non deve
+                // cancellare il punto ricordato.
+                if !sh.surface_started || sh.surface_len == 0 {
+                    continue;
+                }
+                (sh.running, sh.surface_reached as f64 * 100.0 / sh.surface_len as f64)
+            };
+            if self.surface_noted.get(letter) != Some(&(running, percent)) && (!running || due) {
+                changes.push((*letter, running, percent));
+            }
+        }
+        if due {
+            self.surface_saved = Instant::now();
+        }
+        for (letter, running, percent) in changes {
+            self.surface_noted.insert(letter, (running, percent));
+            let Some(vol) = self.inventory.volume(letter).cloned() else { continue };
+            let key = self.volume_key(&vol);
+            // Arrotondato per difetto: alla ripresa si rilegge un pezzetto, non se ne salta uno.
+            let reached = (percent * 100.0).floor() / 100.0;
+            let halfway = reached > 0.0 && reached < 100.0 && percent < 99.995;
+            if halfway {
+                self.settings.surface_reached.insert(key.clone(), reached);
+            } else {
+                self.settings.surface_reached.remove(&key);
+            }
+            if !running {
+                // Scansione finita o fermata: è il punto proposto per la prossima.
+                let range = self.surface_range.entry(key).or_insert((0.0, 100.0));
+                if halfway {
+                    range.0 = reached;
+                    if range.1 <= reached {
+                        range.1 = 100.0;
+                    }
+                } else {
+                    *range = (0.0, 100.0);
+                }
+            }
+        }
+    }
+
     fn start_test(&mut self) {
         let Some(vol) = self.sel_volume().cloned() else { return };
+        let key = self.volume_key(&vol);
+        let (surface_from, surface_to) = self.surface_range_for(&key);
         let max = TestConfig::max_file_size(vol.free, &vol.fs);
         let config = TestConfig {
             letter: vol.letter,
@@ -670,9 +778,39 @@ impl App {
             rand_secs: self.settings.rand_secs as f64,
             file_scan: self.opt.file_scan,
             file_scan_limit: (self.settings.scan_limit_gb as u64) << 30,
-            surface: self.opt.surface && self.elevated,
+            surface: self.opt.surface && self.can_surface,
+            surface_from: surface_from / 100.0,
+            surface_to: surface_to / 100.0,
         };
-        self.runs.insert(vol.letter, TestRun::start(config));
+        // Ripresa: i tratti di superficie già letti in questa sessione restano nel grafico, tranne
+        // quelli che la nuova scansione sta per rileggere.
+        let earlier = self.runs.get(&vol.letter).filter(|_| config.surface).and_then(|run| {
+            let sh = run.shared.lock().unwrap();
+            if sh.surface_len == 0 {
+                return None;
+            }
+            let length = sh.surface_len as f64;
+            let (from, to) = (config.surface_from * length, config.surface_to * length);
+            let outside = |position: f64| position < from || position >= to;
+            let mut tracts: Vec<[f64; 3]> = sh
+                .surface_before
+                .iter()
+                .chain(sh.surface.iter())
+                .filter(|q| outside(q[0]))
+                .copied()
+                .collect();
+            tracts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            let bad: Vec<u64> = sh.surface_bad.iter().filter(|b| outside(**b as f64)).copied().collect();
+            Some((sh.surface_len, tracts, bad))
+        });
+        let run = TestRun::start(config);
+        if let Some((length, tracts, bad)) = earlier {
+            let mut sh = run.shared.lock().unwrap();
+            sh.surface_len = length;
+            sh.surface_before = tracts;
+            sh.surface_bad = bad;
+        }
+        self.runs.insert(vol.letter, run);
     }
 
     fn restart_elevated(&mut self, ctx: &egui::Context) {
@@ -1054,6 +1192,7 @@ impl App {
         // Ogni volume ha la sua prova: quelle sugli altri dischi continuano senza bloccare questa pagina.
         let testing = self.runs.get(&vol.letter).is_some_and(|r| r.running());
         let scroll_to_surface = std::mem::take(&mut self.scroll_to_surface);
+        let vol_key = self.volume_key(&vol);
         let max = TestConfig::max_file_size(vol.free, &vol.fs);
 
         card().show(ui, |ui| {
@@ -1097,7 +1236,7 @@ impl App {
                                 ui.checkbox(&mut self.opt.flush, "Flush su disco");
                             });
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.opt.file_scan, "Leggi i file esistenti (sola lettura)");
                             let label = |gb: u32| {
                                 if gb == 0 {
@@ -1114,10 +1253,50 @@ impl App {
                                         ui.selectable_value(&mut self.settings.scan_limit_gb, gb, label(gb));
                                     }
                                 });
-                            ui.add_enabled_ui(self.elevated, |ui| {
-                                ui.checkbox(&mut self.opt.surface, "Superficie completa")
-                                    .on_disabled_hover_text("Richiede l'avvio come amministratore");
+                            // Scansione della superficie: tutta o solo un tratto. Ogni volume ricorda dove
+                            // si era fermata l'ultima volta e lo ripropone come punto di partenza.
+                            ui.add_space(8.0);
+                            ui.add_enabled_ui(self.can_surface, |ui| {
+                                ui.checkbox(&mut self.opt.surface, "Superficie")
+                                    .on_hover_text("Scansione della superficie: lettura grezza di tutto il volume o di un suo tratto")
+                                    .on_disabled_hover_text("La scansione della superficie richiede l'avvio come amministratore");
                             });
+                            let stored = self.settings.surface_reached.get(&vol_key).copied();
+                            let (mut from, mut to) = self.surface_range_for(&vol_key);
+                            ui.add_enabled_ui(self.can_surface && self.opt.surface, |ui| {
+                                let field = |ui: &mut Ui, value: &mut f64, range: std::ops::RangeInclusive<f64>| {
+                                    ui.add(
+                                        egui::DragValue::new(value)
+                                            .range(range)
+                                            .speed(0.1)
+                                            .suffix(" %")
+                                            .custom_formatter(|v, _| num(v, 2))
+                                            .custom_parser(|s| s.trim().replace(',', ".").parse().ok()),
+                                    )
+                                };
+                                ui.label(dim("dal"));
+                                field(ui, &mut from, 0.0..=99.99);
+                                ui.label(dim("al"));
+                                field(ui, &mut to, 0.01..=100.0);
+                                if to <= from {
+                                    to = (from + 0.01).min(100.0);
+                                }
+                                if from > 0.0 || to < 100.0 {
+                                    if ui.small_button("Tutta").on_hover_text("Scandisce tutta la superficie").clicked() {
+                                        (from, to) = (0.0, 100.0);
+                                    }
+                                }
+                            });
+                            match stored {
+                                Some(p) if (p - from).abs() < 0.005 => {
+                                    ui.label(dim("riparte da dove si era fermata"));
+                                }
+                                Some(p) => {
+                                    ui.label(dim(format!("l'ultima si era fermata al {} %", num(p, 2))));
+                                }
+                                None => {}
+                            }
+                            self.surface_range.insert(vol_key.clone(), (from, to));
                         });
                     });
                 });
@@ -1133,7 +1312,7 @@ impl App {
                             }
                         }
                     } else {
-                        let any = self.opt.file_tests || self.opt.file_scan || (self.opt.surface && self.elevated);
+                        let any = self.opt.file_tests || self.opt.file_scan || (self.opt.surface && self.can_surface);
                         let b = egui::Button::new(RichText::new("Avvia test").size(15.0).color(Color32::WHITE))
                             .fill(ACCENT)
                             .min_size(vec2(132.0, 40.0))
@@ -1303,12 +1482,16 @@ impl App {
 
         // Grafici. La scansione della superficie ha un grafico suo, lungo il disco e non nel tempo:
         // dura ore e schiaccerebbe tutte le altre prove in un angolo.
-        let surface = sh.surface_len > 0 || !sh.surface.is_empty();
+        let surface = sh.surface_len > 0 || !sh.surface.is_empty() || !sh.surface_before.is_empty();
+        // Se si è scandita solo la superficie, il suo grafico prende il posto di quelli vuoti.
+        let only_surface = surface && !timed_series(&sh).any(|(_, s)| !s.lat_avg.is_empty());
         let rows = if surface { 3.0 } else { 2.0 };
         let avail = ui.available_height();
         let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 120.0 });
-        let (log_speed, log_latency) = (self.opt.log_speed, self.opt.log_latency);
-        let (mut toggle_speed, mut toggle_latency) = (false, false);
+        let log_h = if only_surface { (avail * 0.3).max(130.0) } else { chart_h };
+        let surface_h = if only_surface { (avail - log_h - 10.0).max(220.0) } else { chart_h };
+        let (log_speed, log_latency, log_hist) = (self.opt.log_speed, self.opt.log_latency, self.opt.log_hist);
+        let (mut toggle_speed, mut toggle_latency, mut toggle_hist) = (false, false, false);
         let mut rects = [egui::Rect::NOTHING; 4];
         // Le prove che stanno sui grafici nel tempo: tutte tranne la scansione della superficie.
         let timed = |has_data: fn(&tester::PhaseSeries) -> bool| {
@@ -1321,61 +1504,72 @@ impl App {
             .id_salt("grafici")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.columns(2, |cols| {
-                    chart_frame(
-                        &mut cols[0],
-                        "Velocità (MB/s)",
-                        chart_h,
-                        |ui| toggle_speed = log_toggle(ui, log_speed),
-                        |ui| {
-                            legend_row(ui, timed(|s| !s.speed.is_empty()), "");
-                            rects[0] = speed_chart(ui, &sh, log_speed);
-                        },
-                    );
-                    chart_frame(
-                        &mut cols[1],
-                        "Latenza (linea tenue = massimo)",
-                        chart_h,
-                        |ui| toggle_latency = log_toggle(ui, log_latency),
-                        |ui| {
-                            legend_row(ui, timed(|s| !s.lat_avg.is_empty()), "");
-                            rects[1] = latency_chart(ui, &sh, log_latency);
-                        },
-                    );
-                });
-                ui.columns(2, |cols| {
-                    chart_frame(
-                        &mut cols[0],
-                        "Distribuzione della latenza (% delle operazioni)",
-                        chart_h,
-                        |_| {},
-                        |ui| {
-                            legend_row(ui, timed(|s| s.hist.iter().any(|c| *c > 0)), "");
-                            rects[2] = histogram_chart(ui, &sh);
-                        },
-                    );
-                    chart_frame(
-                        &mut cols[1],
-                        "Attività ed errori",
-                        chart_h,
-                        |_| {},
-                        |ui| log_list(ui, &sh),
-                    );
-                });
+                if !only_surface {
+                    ui.columns(2, |cols| {
+                        chart_frame(
+                            &mut cols[0],
+                            "Velocità (MB/s)",
+                            chart_h,
+                            |ui| toggle_speed = log_toggle(ui, log_speed),
+                            |ui| {
+                                legend_row(ui, timed(|s| !s.speed.is_empty()), "");
+                                rects[0] = speed_chart(ui, &sh, log_speed);
+                            },
+                        );
+                        chart_frame(
+                            &mut cols[1],
+                            "Latenza (linea tenue = massimo)",
+                            chart_h,
+                            |ui| toggle_latency = log_toggle(ui, log_latency),
+                            |ui| {
+                                legend_row(ui, timed(|s| !s.lat_avg.is_empty()), "");
+                                rects[1] = latency_chart(ui, &sh, log_latency);
+                            },
+                        );
+                    });
+                    ui.columns(2, |cols| {
+                        chart_frame(
+                            &mut cols[0],
+                            "Distribuzione della latenza (% delle operazioni)",
+                            chart_h,
+                            |ui| toggle_hist = log_toggle(ui, log_hist),
+                            |ui| {
+                                let view = hist_view(&sh, log_hist);
+                                let note = if view.beyond >= 0.05 {
+                                    format!("· oltre il bordo destro: {} % delle più lente", num(view.beyond, 1))
+                                } else {
+                                    String::new()
+                                };
+                                legend_row(ui, timed(|s| s.hist.iter().any(|c| *c > 0)), &note);
+                                rects[2] = histogram_chart(ui, &view);
+                            },
+                        );
+                        chart_frame(
+                            &mut cols[1],
+                            "Attività ed errori",
+                            chart_h,
+                            |_| {},
+                            |ui| log_list(ui, &sh),
+                        );
+                    });
+                }
                 if surface {
                     chart_frame(
                         ui,
                         "Scansione della superficie (MB/s lungo il disco)",
-                        chart_h,
+                        surface_h,
                         |_| {},
                         |ui| {
-                            surface_legend(ui, &sh);
-                            rects[3] = surface_chart(ui, &sh);
+                            surface_legend(ui, &sh, vol.letter);
+                            rects[3] = surface_chart(ui, &sh, vol.letter);
                         },
                     );
                     if scroll_to_surface {
                         ui.scroll_to_cursor(Some(Align::BOTTOM));
                     }
+                }
+                if only_surface {
+                    chart_frame(ui, "Attività ed errori", log_h, |_| {}, |ui| log_list(ui, &sh));
                 }
             });
         drop(sh);
@@ -1385,6 +1579,9 @@ impl App {
         }
         if toggle_latency {
             self.opt.log_latency = !self.opt.log_latency;
+        }
+        if toggle_hist {
+            self.opt.log_hist = !self.opt.log_hist;
         }
     }
 
@@ -1872,10 +2069,189 @@ impl App {
     // Sequenza automatica di verifica
     // -----------------------------------------------------------------------------------------
 
+    /// Sequenza di verifica della scansione della superficie (`MYSTORAGETEST_AUTOTEST=superficie`
+    /// con `MYSTORAGETEST_SURFACE_FILE`): arresto a metà, memoria del punto raggiunto, ripresa,
+    /// zoom con rotellina e tasti, tratto parziale. Scrive in `superficie.txt` quello che osserva.
+    fn drive_surface_script(&mut self, ctx: &egui::Context) {
+        let Some(Sel::Volume(letter)) = self.selected else { return };
+        let Some(vol) = self.inventory.volume(letter).cloned() else { return };
+        let key = self.volume_key(&vol);
+        let step = {
+            let script = self.script.as_mut().unwrap();
+            script.step += 1;
+            script.step - 1
+        };
+        let wait = |app: &mut App, ms: u64| {
+            app.script.as_mut().unwrap().next_at = Instant::now() + Duration::from_millis(ms);
+        };
+        let shot = |app: &mut App, name: &str| script_shot(ctx, app.script.as_mut().unwrap(), name);
+        let again = |app: &mut App, step: u32| {
+            let script = app.script.as_mut().unwrap();
+            script.step = step;
+            script.next_at = Instant::now() + Duration::from_millis(100);
+        };
+        // Dove è arrivata la scansione, che cosa propone il programma e che cosa ricorda.
+        let state = |app: &mut App| -> String {
+            let scan = app.runs.get(&letter).map(|r| {
+                let sh = r.shared.lock().unwrap();
+                let percent = |bytes: u64| bytes as f64 * 100.0 / sh.surface_len.max(1) as f64;
+                format!(
+                    "letto dal {:.2} % al {:.2} % (richiesto fino al {:.2} %), {} tratti nel grafico",
+                    percent(sh.surface_from),
+                    percent(sh.surface_reached),
+                    percent(sh.surface_to),
+                    sh.surface.len()
+                )
+            });
+            let (from, to) = app.surface_range_for(&key);
+            format!(
+                "{} · proposta: dal {from:.2} % al {to:.2} % · memoria: {:?}",
+                scan.unwrap_or_else(|| "nessuna scansione".into()),
+                app.settings.surface_reached.get(&key)
+            )
+        };
+        let note = |app: &mut App, text: String| {
+            let script = app.script.as_mut().unwrap();
+            script.report.push(text);
+            let _ = std::fs::create_dir_all(&script.dir);
+            let _ = std::fs::write(script.dir.join("superficie.txt"), script.report.join("\n") + "\n");
+        };
+        let view = || {
+            ctx.data(|d| d.get_temp::<Option<(f64, f64)>>(surface_zoom_id(letter)))
+                .flatten()
+                .map(|(lo, hi)| format!("da {lo:.3} a {hi:.3} GB"))
+                .unwrap_or_else(|| "tutto il disco".into())
+        };
+        let press = |key: egui::Key| {
+            [true, false].map(|pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+        };
+        let isolated = std::env::var_os("MYSTORAGETEST_INSTANCE").is_some();
+        match step {
+            0 => {
+                let text = format!("all'avvio — {}", state(self));
+                note(self, text);
+                self.opt.file_tests = false;
+                self.opt.file_scan = false;
+                self.opt.surface = true;
+                self.start_test();
+                wait(self, 1500);
+            }
+            1 => {
+                self.scroll_to_surface = true;
+                wait(self, 200);
+            }
+            2 => shot(self, "s1-in-corso.png"),
+            3 => {
+                if let Some(run) = self.runs.get(&letter) {
+                    run.stop();
+                }
+                wait(self, 100);
+            }
+            4 if self.testing() => again(self, 4),
+            4 => wait(self, 400),
+            5 => {
+                let text = format!("dopo l'arresto — {}", state(self));
+                note(self, text);
+                // Solo nelle istanze di prova: salva, per verificare che la memoria resti al riavvio.
+                if isolated {
+                    self.settings.save();
+                }
+                shot(self, "s2-fermata.png");
+            }
+            6 if std::env::var("MYSTORAGETEST_SURFACE_PHASE").as_deref() == Ok("1") => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            6 => {
+                self.start_test();
+                wait(self, 300);
+            }
+            7 if self.testing() => again(self, 7),
+            7 => wait(self, 400),
+            8 => {
+                let text = format!("dopo la ripresa — {}", state(self));
+                note(self, text);
+                self.scroll_to_surface = true;
+                shot(self, "s3-ripresa-finita.png");
+            }
+            9 => {
+                let rect = self.chart_rects[3];
+                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.6, rect.height() * 0.5));
+                wait(self, 300);
+            }
+            10 => {
+                for _ in 0..5 {
+                    self.fake_events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: vec2(0.0, 1.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                wait(self, 900);
+            }
+            11 => {
+                note(self, format!("dopo cinque scatti di rotellina — vista {}", view()));
+                shot(self, "s4-ingrandito.png");
+            }
+            12 => {
+                self.fake_events.extend(press(egui::Key::Plus));
+                wait(self, 300);
+            }
+            13 => {
+                note(self, format!("dopo il tasto + — vista {}", view()));
+                self.fake_events.extend(press(egui::Key::Minus));
+                wait(self, 300);
+            }
+            14 => {
+                note(self, format!("dopo il tasto − — vista {}", view()));
+                self.fake_events.extend(press(egui::Key::Num0));
+                wait(self, 300);
+            }
+            15 => {
+                note(self, format!("dopo il tasto 0 — vista {}", view()));
+                shot(self, "s5-azzerato.png");
+            }
+            16 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.surface_range.insert(key.clone(), (25.0, 50.0));
+                self.start_test();
+                wait(self, 300);
+            }
+            17 if self.testing() => again(self, 17),
+            17 => wait(self, 400),
+            18 => {
+                let text = format!("dopo il tratto dal 25 al 50 % — {}", state(self));
+                note(self, text);
+                self.scroll_to_surface = true;
+                shot(self, "s6-tratto.png");
+            }
+            19 => {
+                if isolated {
+                    self.settings.save();
+                }
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            _ => {}
+        }
+    }
+
     fn drive_script(&mut self, ctx: &egui::Context) {
         let Some(script) = &mut self.script else { return };
         ctx.request_repaint_after(Duration::from_millis(40));
         if script.busy.load(Ordering::Relaxed) || Instant::now() < script.next_at {
+            return;
+        }
+        if script.surface {
+            self.drive_surface_script(ctx);
             return;
         }
         let shot = |script: &mut Script, name: &str| {
@@ -1946,9 +2322,16 @@ impl App {
             5 if autotest => shot(script, "2a-fumetto-velocita.png"),
             7 if autotest => shot(script, "2b-fumetto-latenza.png"),
             9 if autotest => shot(script, "2c-fumetto-istogramma.png"),
+            // La stessa distribuzione sulla scala lineare.
+            10 if autotest => {
+                self.opt.log_hist = false;
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            11 if autotest => shot(script, "2c2-istogramma-lineare.png"),
             // Grafico della superficie: la scansione vera richiede l'amministratore, quindi qui si
             // prova solo il disegno, con dati inventati.
-            10 if autotest => {
+            12 if autotest => {
+                self.opt.log_hist = true;
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 if let Some(Sel::Volume(l)) = self.selected {
                     if let Some(run) = self.runs.get(&l) {
@@ -1958,14 +2341,14 @@ impl App {
                 self.scroll_to_surface = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            11 if autotest => {
+            13 if autotest => {
                 let rect = self.chart_rects[3];
                 self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.755, rect.height() * 0.4));
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            12 if autotest => shot(script, "2d-superficie.png"),
+            14 if autotest => shot(script, "2d-superficie.png"),
             // Una pagina Test per disco: si guarda un altro volume e poi si torna.
-            13 if autotest => {
+            15 if autotest => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 let home = script.home;
                 self.selected = script.second.or_else(|| {
@@ -1978,44 +2361,44 @@ impl App {
                 });
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            14 if autotest => shot(script, "2e-altro-disco.png"),
-            15 if autotest => {
+            16 if autotest => shot(script, "2e-altro-disco.png"),
+            17 if autotest => {
                 self.selected = script.home;
                 self.scroll_to_selected = true;
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            16 if autotest => shot(script, "2f-ritorno.png"),
-            17 => {
+            18 if autotest => shot(script, "2f-ritorno.png"),
+            19 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            18 => shot(script, "3-smart.png"),
-            19 => {
+            20 => shot(script, "3-smart.png"),
+            21 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            20 => {
+            22 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 20;
+                    script.step = 22;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            21 => {
+            23 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            22 => {
+            24 => {
                 let rect = self.chart_rects[4];
                 self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.6, rect.height() * 0.5));
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            23 => shot(script, "5-temperatura.png"),
-            24 => {
+            25 => shot(script, "5-temperatura.png"),
+            26 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -2027,8 +2410,8 @@ impl App {
                 self.monitor_view = true;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            25 => shot(script, "6-monitoraggio.png"),
-            26 => {
+            27 => shot(script, "6-monitoraggio.png"),
+            28 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2063,10 +2446,13 @@ fn tile(ui: &mut Ui, title: &str, value: &str, unit: &str, sub: &str, color: Col
     Frame::new()
         .fill(CARD)
         .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::symmetric(12, 9))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.set_min_height(74.0);
+            // Riquadri bassi: lo spazio in altezza serve ai grafici.
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.spacing_mut().interact_size.y = 18.0;
+            ui.set_min_height(64.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("●").color(color).size(10.0));
                 ui.label(dim(title));
@@ -2087,6 +2473,9 @@ fn chart_frame(ui: &mut Ui, title: &str, height: f32, extra: impl FnOnce(&mut Ui
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_height(height - 24.0);
+            // Titolo e legenda stretti: l'altezza serve al grafico.
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.spacing_mut().interact_size.y = 20.0;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).size(13.5));
                 ui.with_layout(Layout::right_to_left(Align::Center), extra);
@@ -2462,8 +2851,8 @@ fn timed_series(sh: &tester::Shared) -> impl Iterator<Item = &(Phase, tester::Ph
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// Legenda del grafico della superficie: quanto è stato letto e quanti blocchi non si leggono.
-fn surface_legend(ui: &mut Ui, sh: &tester::Shared) {
+/// Legenda del grafico della superficie: quanto è stato letto, quanti blocchi non si leggono e lo zoom.
+fn surface_legend(ui: &mut Ui, sh: &tester::Shared, letter: char) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
         ui.label(RichText::new("●").color(phase_color(Phase::Surface)).size(10.0));
@@ -2479,32 +2868,79 @@ fn surface_legend(ui: &mut Ui, sh: &tester::Shared) {
             .color(DIM)
             .size(12.0),
         );
-        if let Some(last) = sh.surface.last() {
-            ui.label(
-                RichText::new(format!(
-                    "letti {} di {}",
-                    human_bytes(last[0] as u64),
-                    human_bytes(sh.surface_len)
-                ))
-                .color(Color32::from_rgb(96, 106, 124))
-                .size(12.0),
-            );
+        let faint = Color32::from_rgb(96, 106, 124);
+        if sh.surface.is_empty() {
+            ui.label(RichText::new("in attesa dei dati…  ").color(DIM).size(12.0));
         } else {
-            ui.label(RichText::new("in attesa dei dati…").color(DIM).size(12.0));
+            let text = if sh.surface_from > 0 || sh.surface_to < sh.surface_len {
+                format!(
+                    "letto da {} a {} (su {})  ",
+                    human_bytes(sh.surface_from),
+                    human_bytes(sh.surface_reached),
+                    human_bytes(sh.surface_len)
+                )
+            } else {
+                format!("letti {} di {}  ", human_bytes(sh.surface_reached), human_bytes(sh.surface_len))
+            };
+            ui.label(RichText::new(text).color(faint).size(12.0));
         }
+        if !sh.surface_before.is_empty() {
+            ui.label(RichText::new("· più tenui i tratti delle scansioni precedenti  ").color(faint).size(12.0));
+        }
+        // Stato dello zoom all'ultimo disegno del grafico.
+        let view: Option<(f64, f64)> = ui.data(|d| d.get_temp(surface_zoom_id(letter))).flatten();
+        let text = match view {
+            Some((lo, hi)) => format!(
+                "· ingrandito da {} a {} GB: trascina per spostarti, 0 per rivedere tutto",
+                num(lo, 1),
+                num(hi, 1)
+            ),
+            None => "· rotellina o + e − per ingrandire".to_string(),
+        };
+        ui.label(RichText::new(text).color(faint).size(12.0));
     });
 }
 
+/// Dove il grafico della superficie di un volume ricorda il tratto ingrandito, per la legenda.
+fn surface_zoom_id(letter: char) -> egui::Id {
+    egui::Id::unique(("zoom della superficie", letter))
+}
+
 /// Scansione della superficie: velocità di lettura lungo il disco, con i blocchi illeggibili segnati.
-fn surface_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
+/// Si ingrandisce con la rotellina o con + e −, ci si sposta trascinando, 0 rimostra tutto il disco;
+/// ogni volume tiene il suo ingrandimento, durante la scansione e dopo.
+fn surface_chart(ui: &mut Ui, sh: &tester::Shared, letter: char) -> egui::Rect {
     let color = phase_color(Phase::Surface);
-    let out = base_plot("superficie", ui.available_height())
+    let total = sh.surface_len as f64 / GIB;
+    let was_zoomed = ui
+        .data(|d| d.get_temp::<Option<(f64, f64)>>(surface_zoom_id(letter)))
+        .flatten()
+        .is_some();
+    // I tasti valgono solo se non si sta scrivendo in una casella.
+    let keys = !ui.ctx().egui_wants_keyboard_input();
+    let out = base_plot(("superficie", letter), ui.available_height())
+        .allow_drag([was_zoomed, false])
         .include_y(0.0)
         .include_x(0.0)
-        .include_x(sh.surface_len as f64 / GIB)
-        .x_axis_formatter(|m, _| format!("{} GB", num(m.value.max(0.0), 0)))
+        .include_x(total)
+        .x_axis_formatter(|m, range| {
+            // Da vicino servono i decimali.
+            let decimals = if range.end() - range.start() < 20.0 { 1 } else { 0 };
+            format!("{} GB", num(m.value.max(0.0), decimals))
+        })
         .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
-        .show(ui, |p| -> Option<[f64; 3]> {
+        .show(ui, |p| -> (Option<[f64; 3]>, Option<(f64, f64)>) {
+            // Tratti delle scansioni precedenti, prima e dopo quello in corso, più tenui.
+            let (before, after): (Vec<[f64; 2]>, Vec<[f64; 2]>) = sh
+                .surface_before
+                .iter()
+                .map(|q| [q[0] / GIB, q[1]])
+                .partition(|q| q[0] * GIB < sh.surface_from as f64);
+            for (name, pts) in [("superficie, prima", before), ("superficie, dopo", after)] {
+                if !pts.is_empty() {
+                    draw_series(p, name, pts, color.gamma_multiply(0.5), 2.0);
+                }
+            }
             let pts: Vec<[f64; 2]> = sh.surface.iter().map(|q| [q[0] / GIB, q[1]]).collect();
             if !pts.is_empty() {
                 draw_series(p, "superficie", pts, color, 2.0);
@@ -2516,17 +2952,71 @@ fn surface_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
                         .width(1.0),
                 );
             }
-            // Sotto il puntatore: il tratto di disco più vicino.
-            let x = hover_x(p)? * GIB;
-            let i = sh.surface.partition_point(|q| q[0] < x);
-            let q = [i.wrapping_sub(1), i]
-                .into_iter()
-                .filter_map(|j| sh.surface.get(j))
-                .min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs()))?;
-            hover_marks(p, q[0] / GIB, &[(q[1], color)]);
-            Some(*q)
+
+            // Zoom. La rotellina sopra il grafico ingrandisce attorno al puntatore invece di far
+            // scorrere la pagina; i tasti ingrandiscono attorno al centro (o al puntatore, se è sopra).
+            let hovered = p.response().hovered();
+            let (wheel, nearer, farther, reset) = p.ctx().input_mut(|i| {
+                let wheel = if hovered {
+                    std::mem::take(&mut i.smooth_scroll_delta).y
+                } else {
+                    0.0
+                };
+                let key = |k: egui::Key| keys && i.key_pressed(k);
+                (
+                    wheel,
+                    key(egui::Key::Plus) || key(egui::Key::Equals),
+                    key(egui::Key::Minus),
+                    key(egui::Key::Num0),
+                )
+            });
+            let bounds = p.plot_bounds();
+            let (lo, hi) = (bounds.min()[0], bounds.max()[0]);
+            let mut view = (!p.auto_bounds().x).then_some((lo.max(0.0), hi.min(total)));
+            let mut factor = (-(wheel as f64) * 0.004).exp();
+            if nearer {
+                factor *= 0.6;
+            }
+            if farther {
+                factor /= 0.6;
+            }
+            if reset || (factor > 1.0 && (hi - lo) * factor >= total) {
+                p.set_auto_bounds([true, true]);
+                view = None;
+            } else if total > 0.0 && hi > lo && (factor != 1.0 || view.is_some()) {
+                let width = ((hi - lo) * factor).clamp((total / 20_000.0).max(0.01), total);
+                let pivot = p
+                    .pointer_coordinate()
+                    .filter(|_| hovered)
+                    .map(|c| c.x)
+                    .unwrap_or((lo + hi) / 2.0)
+                    .clamp(lo, hi);
+                // Il punto sotto il puntatore resta fermo, e la vista non esce dal disco.
+                let start = (pivot - (pivot - lo) / (hi - lo) * width).clamp(0.0, (total - width).max(0.0));
+                if factor != 1.0 || (start - lo).abs() > width * 1e-6 {
+                    p.set_plot_bounds_x(start..=start + width);
+                }
+                view = Some((start, start + width));
+            }
+            // Sotto il puntatore: il tratto di disco più vicino, di questa scansione o delle precedenti.
+            let nearest = hover_x(p).and_then(|x| {
+                let x = x * GIB;
+                [&sh.surface, &sh.surface_before]
+                    .into_iter()
+                    .flat_map(|tracts| {
+                        let i = tracts.partition_point(|q| q[0] < x);
+                        [i.wrapping_sub(1), i].into_iter().filter_map(|j| tracts.get(j))
+                    })
+                    .min_by(|a, b| (a[0] - x).abs().total_cmp(&(b[0] - x).abs()))
+                    .copied()
+            });
+            if let Some(q) = nearest {
+                hover_marks(p, q[0] / GIB, &[(q[1], color)]);
+            }
+            (nearest, view)
         });
-    if let Some(q) = out.inner {
+    ui.data_mut(|d| d.insert_temp(surface_zoom_id(letter), out.inner.1));
+    if let Some(q) = out.inner.0 {
         chart_tip(&out.response, out.transform.position_from_point_x(q[0] / GIB), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -2702,61 +3192,158 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
     out.response.rect
 }
 
-/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
-fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
-    let per_decade = tester::HIST_PER_DECADE as f64;
-    let out = base_plot("istogramma", ui.available_height())
-        .include_y(0.0)
-        .x_grid_spacer(decade_marks(per_decade))
-        .x_axis_formatter(|m, _| {
-            let i = m.value;
-            if i < 0.0 || i > HIST_BUCKETS as f64 {
-                String::new()
-            } else {
-                fmt_decade(tester::bucket_micros(i.round() as usize) / 1000.0)
+/// La distribuzione della latenza pronta da disegnare, con l'asse logaritmico o lineare.
+struct HistView {
+    /// Limiti delle colonne nell'unità dell'asse: indice dell'intervallo (scala logaritmica)
+    /// oppure microsecondi (scala lineare).
+    edges: Vec<f64>,
+    /// Gli stessi limiti in microsecondi.
+    micros: Vec<f64>,
+    /// Per ogni prova: operazioni in ciascuna colonna e totale della prova.
+    phases: Vec<(Phase, Vec<f64>, u64)>,
+    /// Scala lineare: la quota più alta di operazioni di una prova rimasta oltre il bordo destro.
+    beyond: f64,
+    log: bool,
+}
+
+/// Colonne della scala lineare.
+const LINEAR_BINS: usize = 80;
+
+/// Arrotonda per eccesso a un numero tondo, perché l'asse lineare finisca su un valore leggibile.
+fn round_up(value: f64) -> f64 {
+    let magnitude = 10f64.powf(value.max(1e-9).log10().floor());
+    let steps = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0];
+    let step = steps.into_iter().find(|s| value / magnitude <= *s + 1e-9).unwrap_or(10.0);
+    step * magnitude
+}
+
+fn hist_view(sh: &tester::Shared, log: bool) -> HistView {
+    let series: Vec<(Phase, &Vec<u64>, u64)> = timed_series(sh)
+        .map(|(phase, s)| (*phase, &s.hist, s.hist.iter().sum::<u64>()))
+        .filter(|(_, _, total)| *total > 0)
+        .collect();
+    if log {
+        let micros: Vec<f64> = (0..=HIST_BUCKETS).map(tester::bucket_micros).collect();
+        return HistView {
+            edges: (0..=HIST_BUCKETS).map(|i| i as f64).collect(),
+            micros,
+            phases: series
+                .into_iter()
+                .map(|(phase, hist, total)| (phase, hist.iter().map(|c| *c as f64).collect(), total))
+                .collect(),
+            beyond: 0.0,
+            log,
+        };
+    }
+    // Scala lineare: da zero fino a comprendere il 99,5 % delle operazioni di ogni prova. I pochi
+    // casi lentissimi restano fuori, altrimenti schiaccerebbero tutto il resto contro lo zero.
+    let mut limit = 0.0f64;
+    for (_, hist, total) in &series {
+        let mut seen = 0u64;
+        for (i, count) in hist.iter().enumerate() {
+            seen += count;
+            if seen as f64 >= *total as f64 * 0.995 {
+                limit = limit.max(tester::bucket_micros(i + 1));
+                break;
             }
-        })
-        .y_axis_formatter(|m, _| format!("{} %", num(m.value, 0)))
-        .show(ui, |p| -> Option<usize> {
-            let mut any = false;
-            for (phase, s) in timed_series(sh) {
-                let total: u64 = s.hist.iter().sum();
-                if total == 0 {
-                    continue;
+        }
+    }
+    let limit = round_up(limit.max(1.0));
+    let width = limit / LINEAR_BINS as f64;
+    let micros: Vec<f64> = (0..=LINEAR_BINS).map(|k| k as f64 * width).collect();
+    let mut beyond = 0.0f64;
+    let phases = series
+        .into_iter()
+        .map(|(phase, hist, total)| {
+            // Gli intervalli raccolti sono logaritmici: ognuno viene ripartito sulle colonne
+            // lineari che attraversa, in proporzione.
+            let mut columns = vec![0.0f64; LINEAR_BINS];
+            let mut outside = 0.0f64;
+            for (i, count) in hist.iter().enumerate().filter(|(_, c)| **c > 0) {
+                let from = if i == 0 { 0.0 } else { tester::bucket_micros(i) };
+                let to = tester::bucket_micros(i + 1);
+                let count = *count as f64;
+                let mut inside = 0.0;
+                let first = (from / width) as usize;
+                for (k, column) in columns.iter_mut().enumerate().skip(first) {
+                    let (lo, hi) = (k as f64 * width, (k + 1) as f64 * width);
+                    if lo >= to {
+                        break;
+                    }
+                    let share = (to.min(hi) - from.max(lo)).max(0.0) / (to - from);
+                    *column += count * share;
+                    inside += share;
                 }
-                any = true;
-                let color = phase_color(*phase);
-                let bars: Vec<Bar> = s
-                    .hist
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| **c > 0)
-                    .map(|(i, c)| {
-                        Bar::new(i as f64 + 0.5, *c as f64 * 100.0 / total as f64)
-                            .width(0.92)
-                            .fill(color.gamma_multiply(0.45))
-                            .stroke(Stroke::new(1.0, color))
-                    })
-                    .collect();
-                p.bar_chart(BarChart::new(phase.short(), bars).color(color));
+                outside += count * (1.0 - inside).max(0.0);
             }
-            // Sotto il puntatore: l'intervallo di latenza (la colonna) su cui si trova.
-            let x = hover_x(p)?;
-            if !any || x < 0.0 || x >= HIST_BUCKETS as f64 {
-                return None;
-            }
-            let bucket = x.floor() as usize;
-            hover_line(p, bucket as f64 + 0.5);
-            Some(bucket)
-        });
-    if let Some(bucket) = out.inner {
-        chart_tip(&out.response, out.transform.position_from_point_x(bucket as f64 + 0.5), |ui| {
-            let edge =|i: usize| fmt_ms(tester::bucket_micros(i) / 1000.0);
-            ui.label(bold(format!("Risposte tra {} e {}", edge(bucket), edge(bucket + 1)), 14.0).color(TEXT));
+            beyond = beyond.max(outside * 100.0 / total as f64);
+            (phase, columns, total)
+        })
+        .collect();
+    HistView {
+        edges: micros.clone(),
+        micros,
+        phases,
+        beyond,
+        log,
+    }
+}
+
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
+fn histogram_chart(ui: &mut Ui, view: &HistView) -> egui::Rect {
+    let plot = base_plot(("istogramma", view.log), ui.available_height())
+        .include_y(0.0)
+        .y_axis_formatter(|m, _| format!("{} %", num(m.value, 0)));
+    let plot = if view.log {
+        plot.x_grid_spacer(decade_marks(tester::HIST_PER_DECADE as f64))
+            .x_axis_formatter(|m, _| {
+                let i = m.value;
+                if i < 0.0 || i > HIST_BUCKETS as f64 {
+                    String::new()
+                } else {
+                    fmt_decade(tester::bucket_micros(i.round() as usize) / 1000.0)
+                }
+            })
+    } else {
+        plot.include_x(0.0)
+            .x_axis_formatter(|m, _| fmt_ms(m.value.max(0.0) / 1000.0))
+    };
+    let center = |k: usize| (view.edges[k] + view.edges[k + 1]) / 2.0;
+    let out = plot.show(ui, |p| -> Option<usize> {
+        for (phase, columns, total) in &view.phases {
+            let color = phase_color(*phase);
+            let bars: Vec<Bar> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0.0)
+                .map(|(k, c)| {
+                    Bar::new(center(k), *c * 100.0 / *total as f64)
+                        .width((view.edges[k + 1] - view.edges[k]) * 0.92)
+                        .fill(color.gamma_multiply(0.45))
+                        .stroke(Stroke::new(1.0, color))
+                })
+                .collect();
+            p.bar_chart(BarChart::new(phase.short(), bars).color(color));
+        }
+        // Sotto il puntatore: l'intervallo di latenza (la colonna) su cui si trova.
+        let x = hover_x(p)?;
+        if view.phases.is_empty() || x < view.edges[0] || x >= *view.edges.last()? {
+            return None;
+        }
+        let column = view.edges.partition_point(|e| *e <= x).checked_sub(1)?;
+        hover_line(p, center(column));
+        Some(column)
+    });
+    if let Some(column) = out.inner {
+        chart_tip(&out.response, out.transform.position_from_point_x(center(column)), |ui| {
+            let edge = |i: usize| fmt_ms(view.micros[i] / 1000.0);
+            ui.label(bold(format!("Risposte tra {} e {}", edge(column), edge(column + 1)), 14.0).color(TEXT));
             // Una riga per ogni prova che ha risposte in questo intervallo: nome, quota, numero.
-            let rows: Vec<(Phase, u64, u64)> = timed_series(sh)
-                .map(|(phase, s)| (*phase, s.hist.get(bucket).copied().unwrap_or(0), s.hist.iter().sum()))
-                .filter(|(_, n, _)| *n > 0)
+            let rows: Vec<(Phase, f64, u64)> = view
+                .phases
+                .iter()
+                .map(|(phase, columns, total)| (*phase, columns[column], *total))
+                .filter(|(_, n, _)| *n >= 0.5)
                 .collect();
             let any = !rows.is_empty();
             egui::Grid::new("fumetto-istogramma")
@@ -2769,11 +3356,13 @@ fn histogram_chart(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
                             ui.label(RichText::new("●").color(phase_color(phase)).size(11.0));
                             ui.label(RichText::new(phase.label()).color(TEXT).size(13.0));
                         });
-                        ui.label(bold(format!("{} %", num(n as f64 * 100.0 / total as f64, 1)), 13.0).color(TEXT));
-                        ui.label(dim(if n == 1 {
-                            "1 operazione".to_string()
-                        } else {
-                            format!("{} operazioni", int(n))
+                        ui.label(bold(format!("{} %", num(n * 100.0 / total as f64, 1)), 13.0).color(TEXT));
+                        let count = n.round() as u64;
+                        // Sulla scala lineare il numero è una stima: gli intervalli vengono ripartiti.
+                        ui.label(dim(match (count, view.log) {
+                            (1, true) => "1 operazione".to_string(),
+                            (_, true) => format!("{} operazioni", int(count)),
+                            (_, false) => format!("circa {}", int(count)),
                         }));
                         ui.end_row();
                     }
@@ -2944,6 +3533,7 @@ impl eframe::App for App {
                 self.next_sample = Instant::now() + Duration::from_secs(5);
             }
         }
+        self.note_surface_progress();
         // Rilettura periodica di temperature e autodiagnosi, anche con la finestra nascosta.
         if self.smart_rx.is_none() && Instant::now() >= self.next_sample {
             self.sample_smart(ctx);
@@ -2977,6 +3567,7 @@ impl eframe::App for App {
         } else if std::mem::take(&mut self.fake_pointer_gone) {
             raw_input.events.push(egui::Event::PointerGone);
         }
+        raw_input.events.append(&mut self.fake_events);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {

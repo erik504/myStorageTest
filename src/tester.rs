@@ -27,8 +27,8 @@ pub const BLOCK: usize = 4096;
 pub const SEQ_BLOCK: usize = 1 << 20;
 const SURFACE_BLOCK: usize = 4 << 20;
 /// Istogramma delle latenze: secchi logaritmici, sei per decade, da 1 µs a 100 s.
-pub const HIST_PER_DECADE: usize = 6;
-pub const HIST_BUCKETS: usize = 48;
+pub const HIST_PER_DECADE: usize = 24;
+pub const HIST_BUCKETS: usize = 192;
 const MAX_PHASE_ERRORS: u32 = 200;
 const MAX_FILE_ERRORS: u32 = 8;
 const MAX_STORED_ERRORS: usize = 2000;
@@ -93,8 +93,11 @@ pub struct TestConfig {
     pub file_scan: bool,
     /// Limite in byte della scansione dei file; 0 = tutto il volume.
     pub file_scan_limit: u64,
-    /// Lettura grezza dell'intero volume (solo da amministratore).
+    /// Lettura grezza del volume (solo da amministratore).
     pub surface: bool,
+    /// Tratto del volume da leggere, come frazioni da 0 a 1: da dove a dove.
+    pub surface_from: f64,
+    pub surface_to: f64,
 }
 
 impl TestConfig {
@@ -207,8 +210,17 @@ pub struct Shared {
     pub surface: Vec<[f64; 3]>,
     /// Posizioni in byte dei blocchi che non si sono lasciati leggere.
     pub surface_bad: Vec<u64>,
-    /// Dimensione in byte dell'area da scandire (0 = scansione non richiesta).
+    /// Dimensione in byte del volume da scandire (0 = scansione non richiesta).
     pub surface_len: u64,
+    /// Tratto richiesto, in byte, e posizione a cui la scansione è arrivata.
+    pub surface_from: u64,
+    pub surface_to: u64,
+    pub surface_reached: u64,
+    /// Vero da quando la scansione della superficie di questa prova è cominciata.
+    pub surface_started: bool,
+    /// Tratti letti dalle scansioni precedenti della sessione, fuori da quello in corso: restano
+    /// nel grafico quando una scansione viene ripresa. Li prepara chi avvia la prova.
+    pub surface_before: Vec<[f64; 3]>,
 }
 
 impl Shared {
@@ -1414,11 +1426,15 @@ impl Engine {
         Some(true)
     }
 
-    /// Lettura grezza di tutto il volume, settore per settore (richiede privilegi di amministratore).
+    /// Lettura grezza del volume, settore per settore, sul tratto richiesto (richiede privilegi di
+    /// amministratore).
     fn surface(&self) {
         self.begin(Phase::Surface);
         let mut s = Sampler::new(Phase::Surface);
-        let path = format!(r"\\.\{}:", self.cfg.letter);
+        // Solo per le verifiche automatiche: al posto del volume si legge un file, adagio, così
+        // tratto parziale, arresto, ripresa e grafico si provano anche senza privilegi.
+        let stand_in = std::env::var("MYSTORAGETEST_SURFACE_FILE").ok().filter(|p| !p.is_empty());
+        let path = stand_in.clone().unwrap_or_else(|| format!(r"\\.\{}:", self.cfg.letter));
         let h = match win::open(
             &path,
             win::GENERIC_READ,
@@ -1439,25 +1455,59 @@ impl Engine {
                 return;
             }
         };
-        let mut len_buf = [0u8; 8];
-        let length = match win::ioctl(&h, IOCTL_DISK_GET_LENGTH_INFO, &[], &mut len_buf) {
-            Ok(_) => u64::from_le_bytes(len_buf),
-            Err(_) => self.cfg.total,
+        let length = if stand_in.is_some() {
+            let mut size = 0i64;
+            unsafe { windows_sys::Win32::Storage::FileSystem::GetFileSizeEx(h.raw(), &mut size) };
+            size.max(0) as u64
+        } else {
+            let mut len_buf = [0u8; 8];
+            match win::ioctl(&h, IOCTL_DISK_GET_LENGTH_INFO, &[], &mut len_buf) {
+                Ok(_) => u64::from_le_bytes(len_buf),
+                Err(_) => self.cfg.total,
+            }
         };
-        self.shared.lock().unwrap().surface_len = length;
+        // Tratto da leggere: le frazioni richieste, riportate ai blocchi di lettura.
+        let block = SURFACE_BLOCK as u64;
+        let at = |fraction: f64| (fraction.clamp(0.0, 1.0) * length as f64) as u64 / block * block;
+        let from = at(self.cfg.surface_from);
+        let to = if self.cfg.surface_to >= 1.0 {
+            length
+        } else {
+            at(self.cfg.surface_to).max(from)
+        };
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.surface_len = length;
+            sh.surface_from = from;
+            sh.surface_to = to;
+            sh.surface_reached = from;
+            sh.surface_started = true;
+        }
+        let partial = from > 0 || to < length;
+        if partial {
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "Scansione della superficie da {} a {} (su {})",
+                    win::human_bytes(from),
+                    win::human_bytes(to),
+                    win::human_bytes(length)
+                ),
+            );
+        }
         let mut buf = AlignedBuf::new(SURFACE_BLOCK);
-        let mut off = 0u64;
+        let mut off = from;
         let mut completed = true;
         // Tratto di disco in corso: inizio, byte letti, tempo di lettura, latenza più alta.
-        let mut tract = (0u64, 0u64, 0.0f64, 0.0f64);
+        let mut tract = (from, 0u64, 0.0f64, 0.0f64);
         let mut tract_every = Duration::from_millis(100);
         let mut tract_since = Instant::now();
-        while off < length {
+        while off < to {
             if self.halted() {
                 completed = false;
                 break;
             }
-            let want = ((length - off).min(SURFACE_BLOCK as u64) / 512 * 512) as usize;
+            let want = ((to - off).min(block) / 512 * 512) as usize;
             if want == 0 {
                 break;
             }
@@ -1487,31 +1537,54 @@ impl Engine {
                     off += want as u64;
                 }
             }
-            if tract.1 > 0 && (tract_since.elapsed() >= tract_every || off >= length) {
+            if stand_in.is_some() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if tract.1 > 0 && (tract_since.elapsed() >= tract_every || off >= to) {
                 let mut sh = self.shared.lock().unwrap();
                 sh.surface.push(surface_point(tract));
+                sh.surface_reached = off.min(to);
                 // Oltre il limite i tratti si fondono a due a due e da lì in poi durano il doppio.
                 if sh.surface.len() > SURFACE_MAX_POINTS {
                     sh.surface = sh
                         .surface
                         .chunks(2)
-                        .map(|c| [c[0][0], c.iter().map(|p| p[1]).sum::<f64>() / c.len() as f64, c.iter().map(|p| p[2]).fold(0.0, f64::max)])
+                        .map(|c| {
+                            [
+                                c[0][0],
+                                c.iter().map(|p| p[1]).sum::<f64>() / c.len() as f64,
+                                c.iter().map(|p| p[2]).fold(0.0, f64::max),
+                            ]
+                        })
                         .collect();
                     tract_every *= 2;
                 }
                 tract = (off, 0, 0.0, 0.0);
                 tract_since = Instant::now();
             }
-            self.progress(off as f64 / length as f64);
+            self.progress((off - from) as f64 / (to - from).max(1) as f64);
         }
-        if tract.1 > 0 {
-            self.shared.lock().unwrap().surface.push(surface_point(tract));
+        {
+            let mut sh = self.shared.lock().unwrap();
+            if tract.1 > 0 {
+                sh.surface.push(surface_point(tract));
+            }
+            sh.surface_reached = off.min(to);
         }
-        let note = format!(
-            "{} letti su {}",
-            win::human_bytes(off.min(length)),
-            win::human_bytes(length)
-        );
+        let note = if partial {
+            format!(
+                "tratto da {} a {} (su {})",
+                win::human_bytes(from),
+                win::human_bytes(off.min(to)),
+                win::human_bytes(length)
+            )
+        } else {
+            format!(
+                "{} letti su {}",
+                win::human_bytes(off.min(length)),
+                win::human_bytes(length)
+            )
+        };
         s.finish(self, completed, note);
     }
 }

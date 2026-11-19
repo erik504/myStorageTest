@@ -13,14 +13,20 @@ c'è la voce **Monitoraggio**, con la casella che lo accende e lo spegne. Ogni d
 
 **Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze
 (passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore e che cosa
-significa):
+significa). La distribuzione raccoglie le latenze in intervalli larghi circa il 10 % l'uno e si può
+guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure lineare, che allarga
+il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
 - flush su disco, misurato operazione per operazione;
 - lettura dei file già presenti sul volume, in sola lettura, per trovare settori illeggibili;
-- lettura grezza dell'intera superficie del volume (solo da amministratore), su un grafico a parte:
-  velocità lungo il disco, con i blocchi illeggibili segnati;
+- lettura grezza della superficie del volume (solo da amministratore), su un grafico a parte: velocità
+  lungo il disco, con i blocchi illeggibili segnati. Si può scandire tutta o solo un tratto («dal… al…»).
+  Ogni volume ricorda dove si è fermata l'ultima scansione rimasta a metà e lo ripropone come punto di
+  partenza, anche dopo aver chiuso il programma; ripartendo, i tratti già letti nella sessione restano
+  nel grafico. Il grafico si ingrandisce con la rotellina o con + e −, si sposta trascinando, e 0
+  rimostra tutto il disco, durante la scansione e dopo;
 - controllo degli errori di disco comparsi nel registro di sistema durante la prova.
 
 Ogni volume ha la sua pagina Test: i risultati restano lì dopo la fine della prova e quando si guarda un
@@ -99,11 +105,14 @@ mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registr
 mystoragetest --selftest N breve|estesa|stop
                                   avvia o interrompe l'autodiagnosi del disco N (da amministratore)
 mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
+mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
 mystoragetest --test X: [opzioni] esegue le prove sul volume X:
     --size MB    dimensione del file di prova (predefinito 256)
     --secs N     durata delle prove casuali (predefinito 5)
     --scan MB    legge anche i file esistenti fino a MB (0 = tutti)
-    --surface    scansione dell'intera superficie (solo da amministratore)
+    --surface    scansione della superficie (solo da amministratore)
+    --from P     inizio della scansione della superficie, in percentuale (predefinito 0)
+    --to P       fine della scansione della superficie, in percentuale (predefinito 100)
     --no-write   salta le prove in scrittura
 ```
 
@@ -144,6 +153,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
 - storico delle temperature degli SSD interni;
+- scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, zoom con rotellina e tasti;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
 - fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato;
 - «Riavvia come amministratore»: la sequenza di chiusura e riapertura, provata senza elevazione;
@@ -154,7 +164,7 @@ Non ancora verificato:
 - **avvio e interruzione dell'autodiagnosi**, su qualunque disco: richiedono l'amministratore; i comandi sono scritti secondo le specifiche NVMe e ATA e la documentazione di Windows, ma non sono stati eseguiti;
 - **registro completo delle autodiagnosi dei dischi SATA** e **autodiagnosi dei dischi USB**: richiedono l'amministratore;
 - **SMART dei dischi USB con bridge SAT, Realtek e ASMedia** e **SMART SATA con soglie**: richiedono l'amministratore; i comandi sono scritti secondo i protocolli documentati ma non sono stati eseguiti su hardware reale;
-- **scansione della superficie**: richiede l'amministratore; il suo grafico è stato provato solo con dati inventati;
+- **scansione della superficie di un volume vero**: richiede l'amministratore; tutto il resto della scansione è stato provato leggendo un file al posto del volume;
 - avviso del monitoraggio per un'autodiagnosi fallita: non c'era un disco con una prova fallita;
 - storico delle temperature dei dischi USB;
 - riapertura della finestra dall'icona e chiusura nell'area di notifica;
@@ -176,6 +186,8 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 | `src/eventlog.rs` | registro eventi di Windows: query, sottoscrizione, testi veloci |
 | `src/monitor.rs` | monitoraggio continuo e avvisi |
 | `src/tray.rs` | icona nell'area di notifica e notifiche |
+| `src/icon.rs` | disegno dell'icona: pila di dischi a strati, colorata secondo lo stato |
+| `build.rs` | mette la stessa icona nel file eseguibile, senza file .ico né compilatore di risorse |
 | `src/ui.rs` | interfaccia (egui) e grafici |
 | `src/cli.rs` | modalità a riga di comando |
 
@@ -187,6 +199,12 @@ puntatore simulato, e quella del grafico della superficie, con dati inventati) e
 `MYSTORAGETEST_INSTANCE` dà alle istanze di prova un nome, impostazioni e registro separati, così non
 interferiscono con quella in uso; `MYSTORAGETEST_RESTART_TEST` prova il riavvio del programma senza la
 richiesta di elevazione.
+
+`MYSTORAGETEST_SURFACE_FILE` fa leggere alla scansione della superficie un file al posto del volume
+(adagio, per avere il tempo di fermarla), così si prova senza privilegi. Con `MYSTORAGETEST_AUTOTEST=superficie`
+la sequenza ferma la scansione, verifica il punto ricordato, la riprende, prova lo zoom e un tratto
+parziale, e scrive ciò che osserva in `superficie.txt`; `MYSTORAGETEST_SURFACE_PHASE=1` la chiude dopo
+l'arresto, per verificare al lancio successivo che la memoria sia rimasta.
 
 ## Licenza
 

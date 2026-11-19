@@ -25,6 +25,9 @@ pub struct Settings {
     pub rand_secs: u32,
     /// Limite della scansione dei file esistenti in GB; 0 = tutto il volume.
     pub scan_limit_gb: u32,
+    /// Per ogni volume, la percentuale a cui si è fermata l'ultima scansione della superficie
+    /// rimasta a metà: è il punto da cui proporre la prossima.
+    pub surface_reached: std::collections::BTreeMap<String, f64>,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
             test_size_mb: 1024,
             rand_secs: 10,
             scan_limit_gb: 8,
+            surface_reached: std::collections::BTreeMap::new(),
         }
     }
 }
