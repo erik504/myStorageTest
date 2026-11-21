@@ -12,16 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, FILETIME, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, DeleteFileW, FlushFileBuffers, GetFileAttributesW, ReadFile, RemoveDirectoryW, SetEndOfFile,
     SetFileAttributesW, SetFilePointerEx, SetFileTime, WriteFile,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, CancelSynchronousIo, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatusEx,
+    OVERLAPPED, OVERLAPPED_ENTRY,
+};
 use windows_sys::Win32::System::Power::SetThreadExecutionState;
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
 use crate::errors::{ErrClass, classify};
 use crate::eventlog::{self, StorEvent};
@@ -39,31 +39,75 @@ const MAX_STORED_ERRORS: usize = 2000;
 /// Un'operazione più lenta di così viene segnalata come stallo.
 const STALL_SECS: f64 = 2.0;
 const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
-/// Passi della prova di velocità massima: dimensione dei blocchi e letture tenute in volo insieme.
-/// I dischi veloci (NVMe, RAID) arrivano al massimo solo con molte letture in volo, spesso con
-/// blocchi grandi; quelli lenti ci arrivano già ai primi passi, e alcuni bridge USB vanno più
-/// piano con più letture insieme: per questo c'è anche il passo con una sola.
-const PEAK_STEPS: [(usize, usize); 8] = [
-    (1 << 20, 1),
-    (1 << 20, 4),
-    (1 << 20, 8),
-    (1 << 20, 16),
-    (1 << 20, 32),
-    (4 << 20, 4),
-    (4 << 20, 8),
-    (4 << 20, 16),
+/// Una riga della tabella «velocità per blocco e profondità della coda».
+pub struct QueueRow {
+    pub name: &'static str,
+    pub block: usize,
+    /// In punti a caso del file; altrimenti in sequenza.
+    pub random: bool,
+}
+
+impl QueueRow {
+    /// I blocchi piccoli si leggono in operazioni al secondo, gli altri in MB/s.
+    pub fn in_iops(&self) -> bool {
+        self.block <= 64 << 10
+    }
+
+    /// Valore di una misura con la sua unità: «4.672 MB/s» oppure «15.725 IOPS».
+    pub fn value(&self, cell: &QueueCell) -> String {
+        if self.in_iops() {
+            format!("{} IOPS", win::thousands(cell.iops.round() as u64))
+        } else {
+            format!("{} MB/s", win::thousands(cell.mbps.round() as u64))
+        }
+    }
+}
+
+/// Le prove della tabella: blocchi da 1M e 256K in sequenza e in punti a caso, e 4K a caso.
+pub const QUEUE_ROWS: [QueueRow; 5] = [
+    QueueRow { name: "Sequenziale 1M", block: 1 << 20, random: false },
+    QueueRow { name: "Sequenziale 256K", block: 256 << 10, random: false },
+    QueueRow { name: "Casuale 1M", block: 1 << 20, random: true },
+    QueueRow { name: "Casuale 256K", block: 256 << 10, random: true },
+    QueueRow { name: "Casuale 4K", block: 4 << 10, random: true },
 ];
-/// Durata di ciascun passo della prova di velocità massima.
-const PEAK_STEP_SECS: f64 = 1.0;
-/// Dopo l'annullamento, attesa massima per le letture ancora in volo.
-const PEAK_CANCEL_SECS: f64 = 30.0;
+/// Profondità della coda provate: quante richieste in volo insieme, tutte da un solo thread. I
+/// dischi veloci (NVMe, RAID) arrivano al massimo solo con molte richieste in volo; quelli lenti ci
+/// arrivano subito, e alcuni bridge USB vanno più piano con più richieste insieme.
+pub const QUEUE_DEPTHS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+/// Durata di ciascuna misura della tabella.
+const QUEUE_STEP_SECS: f64 = 0.5;
+/// Tetto dei dati scritti da una misura in scrittura: sui dischi veloci mezzo secondo vorrebbe dire
+/// diversi GB, e con trenta misure decine di GB scritti a ogni prova. Così sono al più circa 15 GB.
+const QUEUE_WRITE_STEP_BYTES: u64 = 512 << 20;
+/// Dopo l'annullamento, attesa massima per le richieste ancora in volo.
+const QUEUE_CANCEL_SECS: f64 = 30.0;
+
+/// Una misura della tabella: riga (indice in `QUEUE_ROWS`), lettura o scrittura, profondità.
+#[derive(Clone, Copy, Debug)]
+pub struct QueueCell {
+    pub row: usize,
+    pub write: bool,
+    pub depth: usize,
+    pub mbps: f64,
+    pub iops: f64,
+    /// Latenza media di una richiesta, attesa in coda compresa.
+    pub lat_ms: f64,
+}
+
+/// Nome breve di una dimensione di blocco: «1M», «256K», «4K».
+pub fn block_name(block: usize) -> String {
+    if block >= 1 << 20 { format!("{}M", block >> 20) } else { format!("{}K", block >> 10) }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Phase {
     SeqWrite,
     SeqRead,
-    /// Lettura sequenziale con più letture in volo insieme: la velocità massima del disco.
-    SeqPeak,
+    /// Letture della tabella per blocco e profondità della coda (da 1 a 32 richieste in volo).
+    QueueRead,
+    /// Scritture della stessa tabella.
+    QueueWrite,
     RandRead,
     RandWrite,
     Flush,
@@ -78,7 +122,8 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura sequenziale",
             Phase::SeqRead => "Lettura sequenziale e verifica",
-            Phase::SeqPeak => "Lettura sequenziale, velocità massima",
+            Phase::QueueRead => "Lettura con coda da 1 a 32 (1M, 256K, 4K)",
+            Phase::QueueWrite => "Scrittura con coda da 1 a 32 (1M, 256K, 4K)",
             Phase::RandRead => "Lettura casuale 4K",
             Phase::RandWrite => "Scrittura casuale 4K",
             Phase::Flush => "Flush su disco",
@@ -92,7 +137,8 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura seq.",
             Phase::SeqRead => "Lettura seq.",
-            Phase::SeqPeak => "Lettura max",
+            Phase::QueueRead => "Lettura Q1–32",
+            Phase::QueueWrite => "Scrittura Q1–32",
             Phase::RandRead => "Lettura 4K",
             Phase::RandWrite => "Scrittura 4K",
             Phase::Flush => "Flush",
@@ -115,8 +161,8 @@ pub struct TestConfig {
     pub file_tests: bool,
     pub file_size: u64,
     pub seq_read: bool,
-    /// Rilettura con più letture in volo, per la velocità massima.
-    pub seq_peak: bool,
+    /// Tabella per blocco e profondità della coda, in lettura e in scrittura.
+    pub queue: bool,
     pub rand_read: bool,
     pub rand_write: bool,
     pub flush: bool,
@@ -196,7 +242,7 @@ pub struct PhaseResult {
     pub errors: u32,
     pub stalls: u32,
     pub note: String,
-    /// Prova di velocità massima: letture in volo e dimensione dei blocchi (byte) del passo più veloce.
+    /// Prove con coda: profondità e dimensione dei blocchi (byte) della misura in sequenza più veloce.
     pub peak: Option<(u32, u32)>,
 }
 
@@ -235,6 +281,10 @@ pub struct Shared {
     pub skipped: u64,
     /// Le prove sul file temporaneo erano richieste ma non sono partite (spazio, permessi).
     pub file_tests_skipped: bool,
+    /// Misure della tabella per blocco e profondità della coda, nell'ordine in cui sono state fatte.
+    pub queue: Vec<QueueCell>,
+    /// Riga della tabella in misura (indice in `QUEUE_ROWS`, scrittura).
+    pub queue_live: Option<(usize, bool)>,
     pub log: Vec<(f64, LogLevel, String)>,
     pub outcome: Option<Outcome>,
     /// `Some(true)` quando il file temporaneo non è più sul disco.
@@ -515,45 +565,53 @@ fn delete_on_close_dir(dir: &str, files: &[&Handle]) -> Option<Handle> {
 }
 
 /// Apre (creandolo) il file di prova: senza cache, eliminato da Windows alla chiusura, nascosto e
-/// fuori dall'indicizzazione. Condiviso in lettura: la prova di velocità massima lo riapre con un
-/// secondo handle, per le letture asincrone.
+/// fuori dall'indicizzazione. Condiviso in lettura e scrittura: le prove con coda lo riaprono con
+/// un secondo handle, per le richieste asincrone.
 fn open_test_file(path: &str) -> Result<Handle, u32> {
     win::open(
         path,
         win::GENERIC_READ | win::GENERIC_WRITE | win::ACCESS_DELETE,
-        win::SHARE_READ,
+        win::SHARE_READ | win::SHARE_WRITE,
         win::CREATE_NEW,
         win::FLAG_NO_BUFFERING | win::FLAG_DELETE_ON_CLOSE | win::ATTR_HIDDEN | ATTR_NOT_INDEXED,
     )
 }
 
-/// Una lettura della prova di velocità massima: la struttura e il buffer restano fermi in memoria
-/// finché la lettura è in volo.
-struct PeakSlot {
+/// Una richiesta in volo delle prove con coda: la struttura e il buffer restano fermi in memoria
+/// finché la richiesta non è conclusa. `ov` è il primo campo: la completion port restituisce il
+/// suo indirizzo, che è anche quello della struttura.
+#[repr(C)]
+struct IoSlot {
     ov: OVERLAPPED,
     buf: AlignedBuf,
     at: u64,
     started: Instant,
     busy: bool,
+    write: bool,
 }
 
-impl PeakSlot {
-    fn new(block: usize) -> Option<Self> {
-        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-        ov.hEvent = unsafe { CreateEventW(null(), 1, 0, null()) };
-        if ov.hEvent.is_null() {
-            return None;
+impl IoSlot {
+    /// Per le scritture il buffer si riempie una volta sola di dati pseudo-casuali: alcuni
+    /// controller comprimono, e con blocchi di zeri scriverebbero meno di quanto sembra.
+    fn new(block: usize, write: bool, seed: u64) -> Self {
+        let mut buf = AlignedBuf::new(block);
+        if write {
+            let mut s = seed;
+            for w in buf.as_mut_slice().chunks_exact_mut(8) {
+                w.copy_from_slice(&splitmix(&mut s).to_le_bytes());
+            }
         }
-        Some(PeakSlot {
-            ov,
-            buf: AlignedBuf::new(block),
+        IoSlot {
+            ov: unsafe { std::mem::zeroed() },
+            buf,
             at: 0,
             started: Instant::now(),
             busy: false,
-        })
+            write,
+        }
     }
 
-    /// Lancia la lettura asincrona del blocco che comincia a `at`.
+    /// Lancia la richiesta asincrona (lettura o scrittura) del blocco che comincia a `at`.
     fn issue(&mut self, h: &Handle, at: u64) -> Result<(), u32> {
         self.ov.Internal = 0;
         self.ov.InternalHigh = 0;
@@ -562,7 +620,13 @@ impl PeakSlot {
         self.at = at;
         self.started = Instant::now();
         let len = self.buf.layout.size() as u32;
-        let ok = unsafe { ReadFile(h.raw(), self.buf.ptr, len, null_mut(), &mut self.ov) };
+        let ok = unsafe {
+            if self.write {
+                WriteFile(h.raw(), self.buf.ptr, len, null_mut(), &mut self.ov)
+            } else {
+                ReadFile(h.raw(), self.buf.ptr, len, null_mut(), &mut self.ov)
+            }
+        };
         if ok == 0 {
             let code = win::last_error();
             if code != ERROR_IO_PENDING {
@@ -574,15 +638,7 @@ impl PeakSlot {
     }
 }
 
-impl Drop for PeakSlot {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.ov.hEvent);
-        }
-    }
-}
-
-/// Posizione del prossimo blocco da leggere: il file si rilegge da capo quando finisce.
+/// Posizione del prossimo blocco in sequenza: il file si riprende da capo quando finisce.
 fn next_block(off: &mut u64, block: u64, size: u64) -> u64 {
     if *off + block > size {
         *off = 0;
@@ -592,12 +648,23 @@ fn next_block(off: &mut u64, block: u64, size: u64) -> u64 {
     at
 }
 
-/// Esito di un passo della prova di velocità massima.
-struct PeakStep {
+/// Che cosa misura una casella della tabella con coda.
+#[derive(Clone, Copy)]
+struct StepSpec {
+    block: usize,
+    depth: usize,
+    random: bool,
+    write: bool,
+}
+
+/// Esito di una misura della tabella con coda.
+struct StepResult {
     bytes: u64,
     ops: u64,
-    /// Dal lancio delle prime letture alla conclusione dell'ultima.
+    /// Dal lancio delle prime richieste alla conclusione dell'ultima.
     secs: f64,
+    /// Somma delle durate delle richieste, per la latenza media.
+    lat: f64,
     /// La fase deve fermarsi: arresto chiesto, errore grave o troppi errori.
     stop: bool,
 }
@@ -1117,8 +1184,8 @@ impl Engine {
         if self.cfg.seq_read && !self.halted() {
             self.seq_read(&h, &path, size, &map);
         }
-        if self.cfg.seq_peak && !self.halted() {
-            self.seq_peak(&h, &path, size, folder.as_mut());
+        if self.cfg.queue && !self.halted() {
+            self.queue_tests(&h, &path, size, folder.as_mut(), false);
         }
         if self.cfg.rand_read && !self.halted() {
             self.rand_read(&h, &path, &map);
@@ -1141,6 +1208,11 @@ impl Engine {
                 format!("{} blocchi riletti, {different} diversi o illeggibili", verify.ops)
             };
             verify.finish(self, !self.halted(), note);
+        }
+        // Per ultime le scritture con coda: scrivono senza verificare, quindi dopo tutte le prove
+        // che controllano il contenuto del file.
+        if self.cfg.queue && !self.halted() {
+            self.queue_tests(&h, &path, size, folder.as_mut(), true);
         }
 
         // Chiudendo l'handle Windows elimina il file; si controlla che sia sparito davvero.
@@ -1314,28 +1386,44 @@ impl Engine {
         s.finish(self, completed, note);
     }
 
-    /// Rilegge il file di prova tenendo più letture in volo insieme, come i programmi di benchmark:
-    /// a passi (`PEAK_STEPS`), con blocchi da 1 e 4 MB e da 1 a 32 letture insieme. Il risultato è
-    /// il passo più veloce. La lettura sequenziale normale ne fa una alla volta e su NVMe e RAID resta
-    /// molto sotto il massimo. Qui i dati non si controllano (lo fa già la lettura sequenziale): il
-    /// controllo costerebbe più della lettura e abbasserebbe la misura.
-    fn seq_peak(&self, main: &Handle, path: &str, size: u64, folder: Option<&mut TempDir>) {
-        self.begin(Phase::SeqPeak);
-        let mut s = Sampler::new(Phase::SeqPeak);
+    /// Tabella «velocità per blocco e profondità della coda», in lettura o in scrittura: per
+    /// ciascuna riga di `QUEUE_ROWS` (blocchi da 1M e 256K in sequenza e a caso, 4K a caso) e per
+    /// ciascuna profondità di `QUEUE_DEPTHS` (richieste tenute in volo insieme, da un solo thread)
+    /// mezzo secondo di richieste. I dati letti non si controllano e quelli scritti non si
+    /// verificano: generarli e confrontarli costerebbe più dell'I/O e abbasserebbe la misura. Le
+    /// letture girano subito dopo la rilettura sequenziale, sul file appena scritto in ordine (come
+    /// nei programmi di benchmark: dopo le scritture casuali i blocchi sono sparpagliati dentro
+    /// l'SSD e le letture rallentano); le scritture per ultime, dopo tutte le verifiche.
+    fn queue_tests(&self, main: &Handle, path: &str, size: u64, folder: Option<&mut TempDir>, write: bool) {
+        let phase = if write { Phase::QueueWrite } else { Phase::QueueRead };
+        let verb = if write { "Scrittura" } else { "Lettura" };
+        self.begin(phase);
+        let mut s = Sampler::new(phase);
         s.wall = true;
-        // Un secondo handle, asincrono, sullo stesso file: quello delle altre prove è sincrono e
-        // Windows lo serializza.
-        let h = match win::open(
+        // Un secondo handle, asincrono, sullo stesso file (quello delle altre prove è sincrono e
+        // Windows lo serializza), legato a una completion port: raccoglie molte richieste concluse
+        // con una sola chiamata, e un thread solo regge code lunghe di blocchi piccoli.
+        let access = if write { win::GENERIC_READ | win::GENERIC_WRITE } else { win::GENERIC_READ };
+        let opened = win::open(
             path,
-            win::GENERIC_READ,
+            access,
             win::SHARE_ALL,
             win::OPEN_EXISTING,
             win::FLAG_NO_BUFFERING | win::FLAG_OVERLAPPED,
-        ) {
-            Ok(h) => h,
+        )
+        .and_then(|h| {
+            let port = unsafe { CreateIoCompletionPort(h.raw(), null_mut(), 0, 1) };
+            if port.is_null() {
+                Err(win::last_error())
+            } else {
+                Ok((h, Handle(port)))
+            }
+        });
+        let (h, port) = match opened {
+            Ok(x) => x,
             Err(code) => {
                 s.errors += 1;
-                self.error(Phase::SeqPeak, "apertura", path, 0, 0, code);
+                self.error(phase, "apertura", path, 0, 0, code);
                 s.finish(self, false, String::new());
                 return;
             }
@@ -1347,194 +1435,217 @@ impl Engine {
                 dir.handle = Some(newer);
             }
         }
-        let mut off = 0u64;
+        let mut rng = self.seed ^ if write { 0x7E57_C0DA_51DE_0002 } else { 0x7E57_C0DA_51DE_0001 };
         let mut completed = true;
-        let mut steps: Vec<(usize, usize, f64)> = Vec::new();
-        for (i, &(block, depth)) in PEAK_STEPS.iter().enumerate() {
-            if self.halted() {
-                completed = false;
-                break;
-            }
-            let Some(step) = self.peak_step(&h, path, size, block, depth, &mut off, &mut s, i) else {
-                // Letture rimaste in sospeso dopo l'annullamento: i loro buffer non si possono
-                // liberare, e nemmeno l'handle si può chiudere.
-                std::mem::forget(h);
-                self.op_started.store(0, Ordering::Relaxed);
-                s.finish(self, false, "letture rimaste in sospeso".into());
-                return;
-            };
-            if step.ops > 0 && step.secs > 0.0 {
-                let mbps = step.bytes as f64 / step.secs / 1e6;
-                let iops = step.ops as f64 / step.secs;
-                // Un passo interrotto a metà conta solo se è l'unico misurato.
-                if !step.stop || steps.is_empty() {
-                    self.log(
-                        LogLevel::Info,
-                        format!(
-                            "{depth} letture da {} MB in volo: {} MB/s",
-                            block >> 20,
-                            win::thousands(mbps.round() as u64)
-                        ),
-                    );
-                    steps.push((block, depth, mbps));
-                    if s.peak.is_none_or(|p| mbps > p.0) {
-                        s.peak = Some((mbps, iops, depth as u32, block as u32));
+        'rows: for (r, row) in QUEUE_ROWS.iter().enumerate() {
+            let mut off = 0u64;
+            let mut parts: Vec<String> = Vec::new();
+            for (d, &depth) in QUEUE_DEPTHS.iter().enumerate() {
+                if self.halted() {
+                    completed = false;
+                    break 'rows;
+                }
+                self.shared.lock().unwrap().queue_live = Some((r, write));
+                let spec = StepSpec {
+                    block: row.block,
+                    depth,
+                    random: row.random,
+                    write,
+                };
+                let index = r * QUEUE_DEPTHS.len() + d;
+                let Some(step) = self.queue_step(&h, &port, path, size, spec, &mut off, &mut rng, &mut s, index) else {
+                    // Richieste rimaste in sospeso dopo l'annullamento: i loro buffer non si
+                    // possono liberare, e nemmeno gli handle si possono chiudere.
+                    std::mem::forget(h);
+                    std::mem::forget(port);
+                    self.op_started.store(0, Ordering::Relaxed);
+                    self.shared.lock().unwrap().queue_live = None;
+                    s.finish(self, false, "richieste rimaste in sospeso".into());
+                    return;
+                };
+                // Una misura interrotta a metà non va in tabella.
+                if step.ops > 0 && step.secs > 0.0 && !step.stop {
+                    let cell = QueueCell {
+                        row: r,
+                        write,
+                        depth,
+                        mbps: step.bytes as f64 / step.secs / 1e6,
+                        iops: step.ops as f64 / step.secs,
+                        lat_ms: step.lat / step.ops as f64 * 1000.0,
+                    };
+                    parts.push(format!("Q{depth} {}", row.value(&cell)));
+                    if !row.random && s.peak.is_none_or(|p| cell.mbps > p.0) {
+                        s.peak = Some((cell.mbps, cell.iops, depth as u32, row.block as u32));
                     }
+                    self.shared.lock().unwrap().queue.push(cell);
+                }
+                if step.stop {
+                    completed = false;
+                    break 'rows;
                 }
             }
-            if step.stop {
-                completed = false;
-                break;
+            if !parts.is_empty() {
+                self.log(
+                    LogLevel::Info,
+                    format!("{verb} {}: {}", row.name.to_lowercase(), parts.join(" · ")),
+                );
             }
         }
-        drop(h);
-        self.op_started.store(0, Ordering::Relaxed);
         let note = match s.peak {
-            Some((mbps, _, depth, block)) => {
-                let mut note = format!(
-                    "massimo {} MB/s con {depth} letture da {} MB in volo",
-                    win::thousands(mbps.round() as u64),
-                    block >> 20
-                );
-                for mb in [1usize, 4] {
-                    let row: Vec<String> = steps
-                        .iter()
-                        .filter(|(b, _, _)| *b == mb << 20)
-                        .map(|(_, d, v)| format!("{d} → {}", win::thousands(v.round() as u64)))
-                        .collect();
-                    if !row.is_empty() {
-                        note.push_str(&format!(" · da {mb} MB: {}", row.join(", ")));
-                    }
-                }
-                note
-            }
+            Some((mbps, _, depth, block)) => format!(
+                "migliore in sequenza: {} MB/s con Q{depth} e blocchi da {}",
+                win::thousands(mbps.round() as u64),
+                block_name(block as usize)
+            ),
             None => String::new(),
         };
-        if let Some((mbps, _, depth, block)) = s.peak {
-            self.log(
-                LogLevel::Good,
-                format!(
-                    "Velocità massima in lettura: {} MB/s, con {depth} letture da {} MB in volo",
-                    win::thousands(mbps.round() as u64),
-                    block >> 20
-                ),
-            );
+        if !note.is_empty() {
+            self.log(LogLevel::Good, format!("{verb} con coda da 1 a 32, {note}"));
         }
         s.finish(self, completed, note);
+        self.shared.lock().unwrap().queue_live = None;
+        drop(h);
+        drop(port);
+        self.op_started.store(0, Ordering::Relaxed);
     }
 
-    /// Un passo della prova di velocità massima: per `PEAK_STEP_SECS` tiene `depth` letture da
-    /// `block` byte sempre in volo, poi aspetta che finiscano. `None` se dopo l'annullamento alcune
-    /// non si concludono: allora i buffer restano allocati (lo fa sapere il chiamante).
+    /// Una casella della tabella con coda: per `QUEUE_STEP_SECS` tiene `depth` richieste da `block`
+    /// byte sempre in volo (in sequenza o in punti a caso), poi aspetta che finiscano. In scrittura
+    /// si ferma prima se ha già scritto `QUEUE_WRITE_STEP_BYTES`. `None` se dopo l'annullamento
+    /// alcune richieste non si concludono: allora i buffer restano allocati (lo fa sapere il
+    /// chiamante).
     #[allow(clippy::too_many_arguments)]
-    fn peak_step(
+    fn queue_step(
         &self,
         h: &Handle,
+        port: &Handle,
         path: &str,
         size: u64,
-        block: usize,
-        depth: usize,
+        spec: StepSpec,
         off: &mut u64,
+        rng: &mut u64,
         s: &mut Sampler,
         index: usize,
-    ) -> Option<PeakStep> {
-        let mut out = PeakStep {
+    ) -> Option<StepResult> {
+        let StepSpec {
+            block,
+            depth,
+            random,
+            write,
+        } = spec;
+        let phase = s.phase;
+        let op = if write { "scrittura" } else { "lettura" };
+        let positions = (size / block as u64).max(1);
+        let mut next = || {
+            if random {
+                (splitmix(rng) % positions) * block as u64
+            } else {
+                next_block(off, block as u64, size)
+            }
+        };
+        let byte_limit = if write { QUEUE_WRITE_STEP_BYTES } else { u64::MAX };
+        let cells = (QUEUE_ROWS.len() * QUEUE_DEPTHS.len()) as f64;
+        let mut out = StepResult {
             bytes: 0,
             ops: 0,
             secs: 0.0,
+            lat: 0.0,
             stop: false,
         };
-        let mut slots: Vec<PeakSlot> = Vec::with_capacity(depth);
-        for _ in 0..depth {
-            match PeakSlot::new(block) {
-                Some(slot) => slots.push(slot),
-                None => {
-                    s.errors += 1;
-                    self.error(Phase::SeqPeak, "preparazione", path, 0, 0, win::last_error());
-                    out.stop = true;
-                    return Some(out);
-                }
-            }
-        }
         // Da qui le strutture non si spostano più: il vettore non cresce né si accorcia. Se una
-        // lettura non si conclude il vettore viene abbandonato senza liberarlo (`mem::forget`).
+        // richiesta non si conclude il vettore viene abbandonato senza liberarlo (`mem::forget`).
+        let mut slots: Vec<IoSlot> = (0..depth)
+            .map(|i| IoSlot::new(block, write, self.seed ^ ((i as u64) << 40)))
+            .collect();
+        let base = slots.as_ptr() as usize;
+        let slot_size = std::mem::size_of::<IoSlot>();
         let step_start = Instant::now();
         let mut last_done = step_start;
         let mut stalled = false;
         let mut cancelled_at: Option<Instant> = None;
         let mut ui_tick = Instant::now();
+        let mut in_flight = 0usize;
+        let mut issued = 0u64;
         let waiting_since = |t: Instant| t.duration_since(self.t0).as_micros() as u64 + 1;
         self.op_started.store(waiting_since(step_start), Ordering::Relaxed);
 
         for slot in slots.iter_mut() {
-            if let Err(code) = slot.issue(h, next_block(off, block as u64, size)) {
-                s.errors += 1;
-                if self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code).is_fatal() {
-                    out.stop = true;
-                    break;
+            match slot.issue(h, next()) {
+                Ok(()) => {
+                    in_flight += 1;
+                    issued += block as u64;
+                }
+                Err(code) => {
+                    s.errors += 1;
+                    if self.error(phase, op, path, slot.at, block as u32, code).is_fatal() {
+                        out.stop = true;
+                        break;
+                    }
                 }
             }
         }
-        let mut busy: Vec<usize> = Vec::with_capacity(depth);
-        let mut events: Vec<HANDLE> = Vec::with_capacity(depth);
-        loop {
-            busy.clear();
-            busy.extend((0..slots.len()).filter(|&i| slots[i].busy));
-            if busy.is_empty() {
-                break;
-            }
+        let mut entries: Vec<OVERLAPPED_ENTRY> = vec![unsafe { std::mem::zeroed() }; 64];
+        while in_flight > 0 {
             if (out.stop || self.halted()) && cancelled_at.is_none() {
                 unsafe {
                     CancelIoEx(h.raw(), null());
                 }
                 cancelled_at = Some(Instant::now());
             }
-            if cancelled_at.is_some_and(|t| t.elapsed().as_secs_f64() > PEAK_CANCEL_SECS) {
+            if cancelled_at.is_some_and(|t| t.elapsed().as_secs_f64() > QUEUE_CANCEL_SECS) {
                 self.log(
                     LogLevel::Error,
-                    format!("{} letture non si sono concluse nemmeno dopo l'annullamento", busy.len()),
+                    format!("{in_flight} richieste non si sono concluse nemmeno dopo l'annullamento"),
                 );
                 std::mem::forget(slots);
                 return None;
             }
-            events.clear();
-            events.extend(busy.iter().map(|&i| slots[i].ov.hEvent));
-            let r = unsafe { WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, 100) };
-            if r != WAIT_TIMEOUT && r.wrapping_sub(WAIT_OBJECT_0) as usize >= events.len() {
-                // Attesa fallita: senza sapere quali letture sono finite non si possono liberare i buffer.
-                s.errors += 1;
-                self.error(Phase::SeqPeak, "attesa delle letture", path, 0, 0, win::last_error());
-                unsafe {
-                    CancelIoEx(h.raw(), null());
+            let mut got = 0u32;
+            let ok = unsafe {
+                GetQueuedCompletionStatusEx(port.raw(), entries.as_mut_ptr(), entries.len() as u32, &mut got, 100, 0)
+            };
+            if ok == 0 {
+                let code = win::last_error();
+                if code != WAIT_TIMEOUT {
+                    // Attesa fallita: senza sapere quali richieste sono finite non si possono
+                    // liberare i buffer.
+                    s.errors += 1;
+                    self.error(phase, "attesa delle richieste", path, 0, 0, code);
+                    unsafe {
+                        CancelIoEx(h.raw(), null());
+                    }
+                    std::mem::forget(slots);
+                    return None;
                 }
-                std::mem::forget(slots);
-                return None;
+                got = 0;
             }
-            // L'attesa indica solo la prima lettura conclusa, sempre quella con l'indice più basso:
-            // raccogliendo solo quella, le altre restano indietro (fino a tutto il passo, sui dischi
-            // più veloci). Si raccolgono tutte quelle concluse, anche quando l'attesa scade.
-            for &i in &busy {
+            for entry in &entries[..got as usize] {
+                let at = (entry.lpOverlapped as usize).wrapping_sub(base);
+                let i = at / slot_size;
+                if at % slot_size != 0 || i >= slots.len() || !slots[i].busy {
+                    continue;
+                }
                 let slot = &mut slots[i];
                 let mut n = 0u32;
                 let ok = unsafe { GetOverlappedResult(h.raw(), &slot.ov, &mut n, 0) };
                 let code = if ok == 0 { win::last_error() } else { 0 };
-                if code == ERROR_IO_INCOMPLETE {
-                    continue;
-                }
                 let dt = slot.started.elapsed().as_secs_f64();
                 slot.busy = false;
+                in_flight -= 1;
                 if ok != 0 && n as usize == block {
                     s.record(self, n as u64, dt);
                     out.bytes += n as u64;
                     out.ops += 1;
+                    out.lat += dt;
                     last_done = Instant::now();
                     stalled = false;
                 } else if ok != 0 {
                     s.errors += 1;
-                    self.log(LogLevel::Error, format!("Lettura parziale: {n} byte su {block}"));
-                    self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, 30);
+                    let what = if write { "Scrittura" } else { "Lettura" };
+                    self.log(LogLevel::Error, format!("{what} parziale: {n} byte su {block}"));
+                    self.error(phase, op, path, slot.at, block as u32, if write { 29 } else { 30 });
                 } else {
-                    let class = self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code);
+                    let class = self.error(phase, op, path, slot.at, block as u32, code);
                     if class != ErrClass::Cancelled {
                         s.errors += 1;
                         if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
@@ -1542,13 +1653,19 @@ impl Engine {
                         }
                     }
                 }
-                let in_time = step_start.elapsed().as_secs_f64() < PEAK_STEP_SECS;
+                let in_time = step_start.elapsed().as_secs_f64() < QUEUE_STEP_SECS && issued < byte_limit;
                 if in_time && !out.stop && !self.halted() {
-                    if let Err(code) = slot.issue(h, next_block(off, block as u64, size)) {
-                        s.errors += 1;
-                        let class = self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code);
-                        if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
-                            out.stop = true;
+                    match slot.issue(h, next()) {
+                        Ok(()) => {
+                            in_flight += 1;
+                            issued += block as u64;
+                        }
+                        Err(code) => {
+                            s.errors += 1;
+                            let class = self.error(phase, op, path, slot.at, block as u32, code);
+                            if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
+                                out.stop = true;
+                            }
                         }
                     }
                 }
@@ -1560,13 +1677,13 @@ impl Engine {
                 self.shared.lock().unwrap().stall_count += 1;
                 self.log(
                     LogLevel::Warn,
-                    format!("Stallo: nessuna lettura conclusa da {idle:.1} s ({} in volo)", busy.len()),
+                    format!("Stallo: nessuna {op} conclusa da {idle:.1} s ({in_flight} in volo)"),
                 );
             }
             if ui_tick.elapsed() >= Duration::from_millis(100) {
                 ui_tick = Instant::now();
-                let within = (step_start.elapsed().as_secs_f64() / PEAK_STEP_SECS).min(1.0);
-                self.progress((index as f64 + within) / PEAK_STEPS.len() as f64);
+                let within = (step_start.elapsed().as_secs_f64() / QUEUE_STEP_SECS).min(1.0);
+                self.progress((index as f64 + within) / cells);
                 self.op_started.store(waiting_since(last_done), Ordering::Relaxed);
             }
         }
@@ -1574,7 +1691,7 @@ impl Engine {
             out.stop = true;
         }
         out.secs = last_done.duration_since(step_start).as_secs_f64();
-        self.progress((index + 1) as f64 / PEAK_STEPS.len() as f64);
+        self.progress((index + 1) as f64 / cells);
         Some(out)
     }
 

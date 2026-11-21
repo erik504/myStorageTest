@@ -27,6 +27,7 @@ pub const FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
 pub const FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 pub const FLAG_OVERLAPPED: u32 = 0x4000_0000;
 pub const SHARE_READ: u32 = 0x1;
+pub const SHARE_WRITE: u32 = 0x2;
 pub const ATTR_HIDDEN: u32 = 0x2;
 pub const ATTR_DIRECTORY: u32 = 0x10;
 pub const ATTR_REPARSE_POINT: u32 = 0x400;

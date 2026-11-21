@@ -5,7 +5,7 @@ use std::time::Duration;
 use windows_sys::Win32::System::Console::AttachConsole;
 
 use crate::disks::{self, bus_name};
-use crate::tester::{LogLevel, Outcome, Phase, TestConfig, TestRun};
+use crate::tester::{LogLevel, Outcome, Phase, QUEUE_DEPTHS, QUEUE_ROWS, TestConfig, TestRun};
 use crate::win::human_bytes;
 use crate::{eventlog, info, smart};
 
@@ -38,7 +38,7 @@ Opzioni di --test:
   --from P       inizio della scansione della superficie, in percentuale (predefinito 0)
   --to P         fine della scansione della superficie, in percentuale (predefinito 100)
   --no-write     salta le prove in scrittura
-  --no-peak      salta la velocità massima in lettura (più letture in volo)
+  --no-queue     salta la tabella per blocco (1M, 256K, 4K) e profondità della coda (Q1-Q32)
 
 Codice di uscita di --test: 0 nessun errore, 1 avvisi, 2 errori, 3 interrotto.
 ";
@@ -320,7 +320,8 @@ fn test(args: &[String]) -> i32 {
         file_tests: !flag("--no-write"),
         file_size: size,
         seq_read: true,
-        seq_peak: !flag("--no-peak"),
+        // `--no-peak` è il nome della 0.1.8, quando c'era solo la lettura con coda.
+        queue: !flag("--no-queue") && !flag("--no-peak"),
         rand_read: true,
         rand_write: true,
         flush: true,
@@ -377,7 +378,7 @@ fn test(args: &[String]) -> i32 {
             _ => format!("{:>9.1} MB/s", r.mbps),
         };
         println!(
-            "  {:<32} {}  latenza media {:>8.3} ms · p99 {:>8.3} ms · max {:>8.2} ms  errori {}{}",
+            "  {:<42} {}  latenza media {:>8.3} ms · p99 {:>8.3} ms · max {:>8.2} ms  errori {}{}",
             r.phase.label(),
             speed,
             r.lat_avg_ms,
@@ -390,6 +391,33 @@ fn test(args: &[String]) -> i32 {
                 format!("  ({})", r.note)
             }
         );
+    }
+    if !sh.queue.is_empty() {
+        println!("\nVelocità per blocco e profondità della coda (Q = richieste in volo insieme, da un solo thread):");
+        let head: String = QUEUE_DEPTHS.iter().map(|d| format!("{:>14}", format!("Q{d}"))).collect();
+        for write in [false, true] {
+            if !sh.queue.iter().any(|c| c.write == write) {
+                continue;
+            }
+            println!("  {:<18}{head}", if write { "Scrittura" } else { "Lettura" });
+            for (r, row) in QUEUE_ROWS.iter().enumerate() {
+                let cells: Vec<String> = QUEUE_DEPTHS
+                    .iter()
+                    .map(|&d| {
+                        sh.queue
+                            .iter()
+                            .find(|c| c.row == r && c.write == write && c.depth == d)
+                            .map(|c| row.value(c))
+                            .unwrap_or_else(|| "—".into())
+                    })
+                    .collect();
+                if cells.iter().all(|c| c == "—") {
+                    continue;
+                }
+                let line: String = cells.iter().map(|c| format!("{c:>14}")).collect();
+                println!("    {:<16}{line}", row.name);
+            }
+        }
     }
     for e in &sh.sys_events {
         println!("  EVENTO {} {} {} {}", e.time, e.provider, e.id, e.message);

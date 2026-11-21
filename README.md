@@ -40,12 +40,20 @@ guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure
 il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
-- velocità massima in lettura («Lettura max»): il file di prova riletto tenendo più letture in volo
-  insieme, come fanno i programmi di benchmark, a passi di un secondo (1, 4, 8, 16 e 32 letture da 1 MB,
-  4, 8 e 16 da 4 MB). Il riquadro mostra il passo più veloce e, passandoci sopra con il mouse, tutti i
-  passi. La lettura sequenziale normale fa una lettura alla volta: su un NVMe o su un RAID di NVMe resta
-  a metà o meno di quello che il disco fa davvero. Qui i dati non vengono controllati, lo fa già la
-  lettura sequenziale;
+- lettura e scrittura con coda da 1 a 32, in una tabella «velocità per blocco e profondità della
+  coda»: blocchi da 1M e 256K in sequenza e in punti a caso, e da 4K a caso, ciascuno con 1, 2, 4, 8, 16
+  e 32 richieste in volo insieme (la profondità della coda, Q), tutte da un solo thread, come nei
+  programmi di benchmark; mezzo secondo per misura, circa 30 secondi in tutto. Per ogni riga la tabella
+  mostra il valore a Q1 e il migliore fra Q1 e Q32 con la Q a cui è arrivato; passando sopra a un
+  valore si vedono tutte le Q, con la latenza media. Il riquadro «Lettura Q1–32» riporta la lettura in
+  sequenza più veloce. Le prove con una richiesta alla volta su NVMe e RAID restano a metà o meno di
+  quello che il disco fa con più richieste insieme. Le letture girano subito dopo la rilettura
+  sequenziale, sul file appena scritto in ordine (dopo le scritture casuali i blocchi sono sparpagliati
+  dentro l'SSD e le letture rallentano); le scritture per ultime. I dati letti non vengono controllati
+  e quelli scritti non vengono verificati, e ogni misura in scrittura si ferma a 512 MB: sui dischi più
+  veloci la prova scrive al più circa 15 GB. Con blocchi da 4K e code lunghe un solo thread arriva a
+  circa 100.000 operazioni al secondo su un NVMe PCIe 4.0: sui dischi più veloci quel limite può
+  essere il programma;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
 - flush su disco, misurato operazione per operazione;
 - rilettura di verifica dei blocchi scritti dalla scrittura casuale e dal flush: è una fase a sé
@@ -193,7 +201,7 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
     --from P     inizio della scansione della superficie, in percentuale (predefinito 0)
     --to P       fine della scansione della superficie, in percentuale (predefinito 100)
     --no-write   salta le prove in scrittura
-    --no-peak    salta la velocità massima in lettura (più letture in volo)
+    --no-queue   salta la tabella per blocco (1M, 256K, 4K) e profondità della coda (Q1-Q32)
 ```
 
 `--test` esce con 0 se non ci sono errori, 1 con avvisi, 2 con errori, 3 se interrotto.
@@ -230,8 +238,8 @@ L'eseguibile è `target\release\mystoragetest.exe`, senza altre dipendenze da in
 Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 
 - test completi su un NVMe interno e su un SSD NVMe in contenitore USB, con controllo che il file di prova sparisca;
-- test completo su una chiavetta USB la cui radice accetta solo cartelle: il file di prova va in una cartella nascosta creata per la prova, e alla fine non restano né il file né la cartella, anche chiudendo a forza il programma durante la scrittura e durante la velocità massima; su un volume senza spazio per il file la prova finisce «Completato con avvisi»;
-- velocità massima in lettura su un NVMe PCIe 4.0 (circa 7,4 GB/s, come da specifica, contro 4,7 con una lettura alla volta), su un volume distribuito su due NVMe (circa 9,5 GB/s contro 4,7), su un volume cifrato VeraCrypt (2,2 GB/s), su un disco a piatti USB e su un SSD USB: nessuno stallo falso con le code lunghe sui dischi lenti, file di prova eliminato; il riquadro e il suo fumetto con la finestra alla dimensione normale e a quella minima (dove i riquadri vanno su due righe);
+- test completo su una chiavetta USB la cui radice accetta solo cartelle: il file di prova va in una cartella nascosta creata per la prova, e alla fine non restano né il file né la cartella, anche chiudendo a forza il programma durante la scrittura e durante le letture con coda; su un volume senza spazio per il file la prova finisce «Completato con avvisi»;
+- tabella per blocco e profondità della coda su un NVMe PCIe 4.0 (lettura in sequenza 7,35 GB/s e scrittura 6,4 GB/s, come da specifica, contro 4,7 e 4,9 a Q1), su un volume distribuito su due NVMe (8,9 GB/s in lettura), su un volume cifrato VeraCrypt (circa 2 GB/s a ogni Q), su un disco a piatti USB (4K casuale da 174 operazioni al secondo a Q1 a 663 a Q32) e su una chiavetta USB: nessuno stallo falso con le code lunghe sui dischi lenti, file di prova eliminato; riquadri, tabella e fumetti con la finestra alla dimensione normale e a quella minima (dove i riquadri vanno su due righe);
 - due prove contemporanee su due volumi, ognuna con la sua pagina, che resta dopo aver cambiato disco;
 - SMART senza privilegi su sei NVMe e due SATA interni;
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;

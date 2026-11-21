@@ -45,7 +45,8 @@ fn phase_color(p: Phase) -> Color32 {
     match p {
         Phase::SeqWrite => Color32::from_rgb(245, 158, 11),
         Phase::SeqRead => Color32::from_rgb(79, 140, 255),
-        Phase::SeqPeak => Color32::from_rgb(163, 230, 53),
+        Phase::QueueRead => Color32::from_rgb(163, 230, 53),
+        Phase::QueueWrite => Color32::from_rgb(217, 70, 239),
         Phase::RandRead => Color32::from_rgb(34, 211, 238),
         Phase::RandWrite => Color32::from_rgb(244, 114, 182),
         Phase::Flush => Color32::from_rgb(167, 139, 250),
@@ -371,7 +372,7 @@ impl Startup {
 struct TestOptions {
     file_tests: bool,
     seq_read: bool,
-    seq_peak: bool,
+    queue: bool,
     rand_read: bool,
     rand_write: bool,
     flush: bool,
@@ -486,8 +487,9 @@ pub struct App {
     /// Solo per le verifiche automatiche: istante in cui provare da sé il riavvio.
     restart_test: Option<Instant>,
     /// Rettangoli dei grafici nell'ultimo fotogramma: velocità, latenza, distribuzione, superficie,
-    /// temperatura; e del riquadro «Lettura max», che ha anche lui un fumetto.
-    chart_rects: [egui::Rect; 6],
+    /// temperatura; del riquadro «Lettura Q1–32» e della prima casella «migliore» della tabella con
+    /// coda, che hanno anche loro un fumetto.
+    chart_rects: [egui::Rect; 7],
     /// Solo per le verifiche automatiche: puntatore simulato, per provare i fumetti dei grafici
     /// senza toccare il mouse vero.
     fake_pointer: Option<egui::Pos2>,
@@ -591,7 +593,7 @@ impl App {
             opt: TestOptions {
                 file_tests: true,
                 seq_read: true,
-                seq_peak: true,
+                queue: true,
                 rand_read: true,
                 rand_write: true,
                 flush: true,
@@ -622,7 +624,7 @@ impl App {
             script,
             restart_test: (std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() && startup.after.is_none())
                 .then(|| Instant::now() + Duration::from_millis(1500)),
-            chart_rects: [egui::Rect::NOTHING; 6],
+            chart_rects: [egui::Rect::NOTHING; 7],
             fake_pointer: None,
             fake_pointer_gone: false,
             fake_pointer_sent: None,
@@ -996,7 +998,7 @@ impl App {
             file_tests: whole && self.opt.file_tests,
             file_size: (self.settings.test_size_mb << 20).min(max),
             seq_read: self.opt.seq_read,
-            seq_peak: self.opt.seq_peak,
+            queue: self.opt.queue,
             rand_read: self.opt.rand_read,
             rand_write: self.opt.rand_write,
             flush: self.opt.flush,
@@ -1660,16 +1662,18 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_space(22.0);
                                 ui.checkbox(&mut self.opt.seq_read, "Rilettura e verifica");
-                                ui.checkbox(&mut self.opt.seq_peak, "Velocità massima")
-                                    .on_hover_text(
-                                        "Rilegge il file di prova tenendo più letture in volo insieme (da 1 a 32, \
-                                         blocchi da 1 e 4 MB), come i programmi di benchmark: mostra la velocità \
-                                         massima del disco. La rilettura normale ne fa una alla volta e su NVMe e \
-                                         RAID resta molto più bassa. Dura circa 8 secondi.",
-                                    );
                                 ui.checkbox(&mut self.opt.rand_read, "Lettura casuale 4K");
                                 ui.checkbox(&mut self.opt.rand_write, "Scrittura casuale 4K");
                                 ui.checkbox(&mut self.opt.flush, "Flush su disco");
+                                ui.checkbox(&mut self.opt.queue, "Lettura e scrittura con coda 1–32")
+                                    .on_hover_text(
+                                        "Lettura e scrittura a blocchi da 1M e 256K, in sequenza e in punti a caso, e \
+                                         da 4K a caso, con da 1 a 32 richieste in volo insieme (profondità della coda, \
+                                         Q1–Q32, da un solo thread), come nei programmi di benchmark. Le prove qui \
+                                         accanto fanno una richiesta alla volta: su NVMe e RAID restano molto sotto \
+                                         quello che il disco fa con più richieste insieme. Mezzo secondo per misura, \
+                                         circa 35 secondi in tutto. I dati scritti qui non vengono verificati.",
+                                    );
                             });
                         });
                         ui.horizontal_wrapped(|ui| {
@@ -1768,7 +1772,7 @@ impl App {
                 ui.label(bold("Cosa viene controllato", 15.0));
                 for line in [
                     "Velocità di scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti.",
-                    "Velocità massima in lettura, con più letture in volo insieme come nei programmi di benchmark: è quella che NVMe e RAID raggiungono davvero.",
+                    "Lettura e scrittura con coda da 1 a 32 (richieste in volo insieme), a blocchi da 1M e 256K in sequenza e a caso e da 4K a caso, come nei programmi di benchmark: è con più richieste insieme che NVMe e RAID mostrano quello che fanno davvero.",
                     "Lettura e scrittura casuale a blocchi da 4 KiB: operazioni al secondo e latenza (media, percentili, massimo).",
                     "Flush su disco: l'operazione che fallisce per prima quando un disco o un bridge USB smette di rispondere.",
                     "Lettura dei file già presenti, per trovare settori illeggibili senza modificare nulla.",
@@ -1862,15 +1866,16 @@ impl App {
                 };
                 tiles.push(TileData::new(p.short(), value, "MB/s", sub, phase_color(p)));
             }
-            // Velocità massima: il passo più veloce, e nel fumetto tutti i passi.
-            let p = Phase::SeqPeak;
+            // Lettura con coda: la misura in sequenza più veloce della tabella; tutte le altre sono
+            // nella tabella sotto i riquadri.
+            let p = Phase::QueueRead;
             let (value, sub, note) = match (r(p), last_speed(p)) {
                 (Some(res), _) if res.peak.is_some() => {
                     let (depth, block) = res.peak.unwrap_or_default();
                     (
                         num(res.mbps, 0),
                         // Corto, per stare nel riquadro: il fumetto lo dice per esteso.
-                        format!("{depth} × {} MB in volo", block >> 20),
+                        format!("seq. {} · Q{depth}", tester::block_name(block as usize)),
                         res.note.clone(),
                     )
                 }
@@ -1936,14 +1941,13 @@ impl App {
                     resp.on_hover_ui(|ui| {
                         ui.set_max_width(360.0);
                         ui.label(
-                            "Velocità massima in lettura: il file di prova riletto con più letture in volo \
-                             insieme, come fanno i programmi di benchmark. Il riquadro mostra il passo più veloce.",
+                            "Lettura in sequenza con coda da 1 a 32: la più veloce fra le misure con blocchi \
+                             da 1M e 256K e da 1 a 32 richieste in volo insieme (profondità della coda, Q). \
+                             Tutte le misure, anche in scrittura e in punti a caso, sono nella tabella sotto.",
                         );
                         if !note.is_empty() {
                             ui.add_space(4.0);
-                            // Spazi che non vanno a capo: ogni passo resta intero sulla sua riga.
-                            let steps = note.replace(" · ", "\n").replace(" → ", "\u{a0}→\u{a0}");
-                            ui.label(RichText::new(steps).color(DIM));
+                            ui.label(RichText::new(note).color(DIM));
                         }
                     });
                 }
@@ -1975,7 +1979,18 @@ impl App {
         // Se si è scandita solo la superficie, il suo grafico prende il posto di quelli vuoti.
         let only_surface = surface && !timed_series(&sh).any(|(_, s)| !s.lat_avg.is_empty());
         let rows = if surface { 3.0 } else { 2.0 };
-        let avail = ui.available_height();
+        // La tabella per blocco e coda sta in cima all'area che scorre, sopra i grafici: i grafici si
+        // stringono per lasciarle posto finché possono, poi si scorre. La sua altezza è quella del
+        // fotogramma precedente.
+        let show_queue = !sh.queue.is_empty() || sh.queue_live.is_some();
+        let queue_h_id = egui::Id::unique("altezza della tabella con coda");
+        let queue_h = if show_queue {
+            ui.ctx().data(|d| d.get_temp::<f32>(queue_h_id)).unwrap_or(190.0) + 10.0
+        } else {
+            0.0
+        };
+        let mut queue_rect = egui::Rect::NOTHING;
+        let avail = ui.available_height() - queue_h;
         let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 120.0 });
         let log_h = if only_surface { (avail * 0.24).max(100.0) } else { chart_h };
         // La superficie ha due grafici uno sopra l'altro: le serve più altezza che agli altri riquadri.
@@ -2001,6 +2016,13 @@ impl App {
             .id_salt("grafici")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if show_queue {
+                    let top = ui.cursor().top();
+                    queue_rect = queue_table(ui, &sh);
+                    let h = ui.cursor().top() - top;
+                    ui.ctx().data_mut(|d| d.insert_temp(queue_h_id, h));
+                    ui.add_space(10.0);
+                }
                 if !only_surface {
                     ui.columns(2, |cols| {
                         chart_frame(
@@ -2100,6 +2122,7 @@ impl App {
         drop(sh);
         self.chart_rects[..4].copy_from_slice(&rects);
         self.chart_rects[5] = peak_rect;
+        self.chart_rects[6] = queue_rect;
         if toggle_speed {
             self.opt.log_speed = !self.opt.log_speed;
         }
@@ -2989,10 +3012,20 @@ impl App {
                 self.fake_pointer = Some(self.chart_rects[5].center());
                 wait(self.script.as_mut().unwrap(), 1200);
             }
-            14 if autotest => shot(script, "2c3-lettura-max.png"),
+            14 if autotest => shot(script, "2c3-riquadro-lettura-coda.png"),
+            // Fumetto di una casella della tabella per blocco e profondità della coda.
+            15 if autotest => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                wait(self.script.as_mut().unwrap(), 300);
+            }
+            16 if autotest => {
+                self.fake_pointer = Some(self.chart_rects[6].center());
+                wait(self.script.as_mut().unwrap(), 1200);
+            }
+            17 if autotest => shot(script, "2c4-tabella-coda.png"),
             // Grafico della superficie: la scansione vera richiede l'amministratore, quindi qui si
             // prova solo il disegno, con dati inventati.
-            15 if autotest => {
+            18 if autotest => {
                 self.opt.log_hist = true;
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 if let Some(Sel::Volume(l)) = self.selected {
@@ -3003,14 +3036,14 @@ impl App {
                 self.scroll_to_surface = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            16 if autotest => {
+            19 if autotest => {
                 let rect = self.chart_rects[3];
                 self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.755, rect.height() * 0.4));
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            17 if autotest => shot(script, "2d-superficie.png"),
+            20 if autotest => shot(script, "2d-superficie.png"),
             // Una pagina Test per disco: si guarda un altro volume e poi si torna.
-            18 if autotest => {
+            21 if autotest => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 let home = script.home;
                 self.selected = script.second.or_else(|| {
@@ -3023,58 +3056,58 @@ impl App {
                 });
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            19 if autotest => shot(script, "2e-altro-disco.png"),
-            20 if autotest => {
+            22 if autotest => shot(script, "2e-altro-disco.png"),
+            23 if autotest => {
                 self.selected = script.home;
                 self.scroll_to_selected = true;
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            21 if autotest => shot(script, "2f-ritorno.png"),
+            24 if autotest => shot(script, "2f-ritorno.png"),
             // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
-            22 => {
+            25 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Info;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            23 => {
+            26 => {
                 // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
                 if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 23;
+                    script.step = 26;
                     wait(script, 200);
                 } else {
                     shot(script, "2g-info.png");
                 }
             }
-            24 => {
+            27 => {
                 self.scroll_to_diag = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            25 => shot(script, "2h-info-diagnosi.png"),
-            26 => {
+            28 => shot(script, "2h-info-diagnosi.png"),
+            29 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            27 => shot(script, "3-smart.png"),
-            28 => {
+            30 => shot(script, "3-smart.png"),
+            31 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            29 => {
+            32 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 29;
+                    script.step = 32;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            30 => {
+            33 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            31 => {
+            34 => {
                 // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
                 if rect.is_positive() {
@@ -3082,8 +3115,8 @@ impl App {
                 }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            32 => shot(script, "5-temperatura.png"),
-            33 => {
+            35 => shot(script, "5-temperatura.png"),
+            36 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -3095,8 +3128,8 @@ impl App {
                 self.monitor_view = true;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            34 => shot(script, "6-monitoraggio.png"),
-            35 => {
+            37 => shot(script, "6-monitoraggio.png"),
+            38 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -3131,6 +3164,109 @@ fn fake_surface(sh: &mut tester::Shared) {
         })
         .collect();
     sh.surface_bad = vec![(0.751 * len) as u64, (0.757 * len) as u64];
+}
+
+/// Tabella delle prove con coda: per ogni riga (dimensione del blocco, in sequenza o a caso) la
+/// misura con una richiesta alla volta (Q1) e la migliore fra Q1 e Q32, in lettura e in scrittura.
+/// Passando sopra a un valore si vedono tutte le profondità. Restituisce il rettangolo della
+/// casella «Lettura migliore» della prima riga, per le verifiche automatiche.
+fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
+    let mut target = egui::Rect::NOTHING;
+    card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Velocità per blocco e profondità della coda").size(13.5));
+            ui.label(dim(
+                "Q = richieste in volo insieme (un thread) · migliore = la più alta da Q1 a Q32 · \
+                 passa sopra per tutte le Q",
+            ));
+        });
+        egui::Grid::new("tabella-coda")
+            .num_columns(5)
+            .spacing([26.0, 2.0])
+            .min_col_width(96.0)
+            .show(ui, |ui| {
+                ui.label("");
+                for (write, title) in [
+                    (false, "Lettura Q1"),
+                    (false, "Lettura migliore"),
+                    (true, "Scrittura Q1"),
+                    (true, "Scrittura migliore"),
+                ] {
+                    let phase = if write { Phase::QueueWrite } else { Phase::QueueRead };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(phase_color(phase)).size(10.0));
+                        ui.label(dim(title));
+                    });
+                }
+                ui.end_row();
+                for (r, row) in tester::QUEUE_ROWS.iter().enumerate() {
+                    ui.label(row.name);
+                    for write in [false, true] {
+                        let cells: Vec<&tester::QueueCell> =
+                            sh.queue.iter().filter(|c| c.row == r && c.write == write).collect();
+                        let live = sh.queue_live == Some((r, write));
+                        let pending = if live { "in corso…" } else { "—" };
+                        let q1 = cells.iter().find(|c| c.depth == 1);
+                        let best = cells.iter().max_by(|a, b| a.mbps.total_cmp(&b.mbps));
+                        let first = ui.label(q1.map(|c| row.value(c)).unwrap_or_else(|| pending.into()));
+                        // Mentre la riga è in misura la migliore è provvisoria: lo dicono i puntini.
+                        let second = ui.label(
+                            best.map(|c| {
+                                format!("{} · Q{}{}", row.value(c), c.depth, if live { " …" } else { "" })
+                            })
+                            .unwrap_or_else(|| pending.into()),
+                        );
+                        if r == 0 && !write {
+                            target = second.rect;
+                        }
+                        if !cells.is_empty() {
+                            for resp in [first, second] {
+                                resp.on_hover_ui(|ui| queue_tip(ui, row, write, &cells));
+                            }
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+    target
+}
+
+/// Fumetto di una casella della tabella con coda: tutte le profondità misurate per quella riga.
+fn queue_tip(ui: &mut Ui, row: &tester::QueueRow, write: bool, cells: &[&tester::QueueCell]) {
+    ui.set_max_width(400.0);
+    ui.label(bold(
+        format!("{} — {}", row.name, if write { "scrittura" } else { "lettura" }),
+        14.0,
+    ));
+    for c in cells {
+        let extra = if row.in_iops() { format!(" · {} MB/s", num(c.mbps, 1)) } else { String::new() };
+        ui.label(format!(
+            "Q{}: {}{extra} · latenza media {}",
+            c.depth,
+            row.value(c),
+            fmt_ms(c.lat_ms)
+        ));
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Q è la profondità della coda: quante richieste il programma tiene in volo insieme verso il disco, \
+             tutte da un solo thread. La latenza comprende l'attesa in coda.",
+        )
+        .color(DIM),
+    );
+    if row.in_iops() {
+        ui.label(
+            RichText::new(
+                "Con blocchi piccoli e code lunghe un solo thread arriva a qualche centinaio di migliaia di \
+                 operazioni al secondo: sui dischi più veloci il limite può essere il programma, non il disco.",
+            )
+            .color(DIM),
+        );
+    }
 }
 
 /// Contenuto di un riquadro dei risultati della scheda Test.
@@ -3359,9 +3495,14 @@ fn phase_meaning(p: Phase) -> &'static str {
         Phase::SeqRead => {
             "La prova rilegge il file di prova dall'inizio alla fine e controlla che i dati siano quelli scritti."
         }
-        Phase::SeqPeak => {
-            "La prova rilegge il file di prova tenendo più letture in volo insieme, a passi: da 1 a 32 letture, \
-             blocchi da 1 e 4 MB, un secondo per passo. Il risultato è il passo più veloce."
+        Phase::QueueRead => {
+            "La prova legge il file di prova a blocchi da 1M e 256K, in sequenza e in punti a caso, e da 4K a caso, \
+             con da 1 a 32 richieste in volo insieme (profondità della coda): mezzo secondo per ogni combinazione."
+        }
+        Phase::QueueWrite => {
+            "La prova scrive sul file di prova a blocchi da 1M e 256K, in sequenza e in punti a caso, e da 4K a caso, \
+             con da 1 a 32 richieste in volo insieme (profondità della coda): mezzo secondo per ogni combinazione. \
+             I dati scritti qui non vengono verificati."
         }
         Phase::RandRead => "La prova legge blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
         Phase::RandWrite => "La prova scrive blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
