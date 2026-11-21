@@ -4,8 +4,8 @@ use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Device_IDW, CM_Get_Parent, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+    CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW, CM_Get_Parent, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
@@ -21,7 +21,6 @@ pub const IOCTL_DISK_GET_DRIVE_GEOMETRY_EX: u32 = 0x0007_00A0;
 
 pub const BUS_ATA: u32 = 3;
 pub const BUS_USB: u32 = 7;
-pub const BUS_RAID: u32 = 8;
 pub const BUS_SATA: u32 = 11;
 pub const BUS_NVME: u32 = 17;
 
@@ -44,11 +43,24 @@ pub struct PhysDisk {
     /// VID e PID del bridge USB, se il disco è collegato via USB.
     pub usb_id: Option<(u16, u16)>,
     pub letters: Vec<char>,
+    /// Posto del disco nell'albero dei dispositivi di Windows (ID dell'istanza).
+    pub instance_id: String,
+    /// Il dispositivo USB a cui appartiene il disco, nello stesso albero; vuoto se non è USB.
+    pub usb_node: String,
+    /// Lo stesso dispositivo, se Windows lo dichiara scollegabile: è quello a cui chiedere la
+    /// rimozione sicura.
+    pub eject_node: String,
 }
 
 impl PhysDisk {
     pub fn device_path(&self) -> String {
         format!(r"\\.\PhysicalDrive{}", self.number)
+    }
+
+    /// Collegato via USB: lo dice il bus, oppure il bridge trovato risalendo l'albero dei
+    /// dispositivi (certi driver dei produttori presentano il disco come SCSI).
+    pub fn is_usb(&self) -> bool {
+        self.bus == BUS_USB || self.usb_id.is_some()
     }
 
     pub fn title(&self) -> String {
@@ -77,6 +89,8 @@ pub struct Volume {
     pub fs: String,
     pub total: u64,
     pub free: u64,
+    /// Supporto rimovibile (chiavetta, scheda di memoria) secondo Windows.
+    pub removable: bool,
     /// Numeri dei dischi fisici su cui si estende il volume.
     pub disks: Vec<u32>,
 }
@@ -249,6 +263,7 @@ fn probe_volume(letter: char) -> Option<Volume> {
         fs: win::from_wide(&fs),
         total,
         free: avail,
+        removable: kind == DRIVE_REMOVABLE,
         disks: volume_disks(letter),
     })
 }
@@ -275,8 +290,42 @@ fn parse_usb_id(device_id: &str) -> Option<(u16, u16)> {
     Some((vid, pid))
 }
 
-/// Per ogni disco collegato via USB trova VID e PID del bridge risalendo l'albero dei dispositivi.
-fn usb_ids() -> Vec<(u32, (u16, u16))> {
+/// Posto di un disco nell'albero dei dispositivi di Windows.
+#[derive(Default)]
+struct DiskNode {
+    number: u32,
+    instance_id: String,
+    usb_id: Option<(u16, u16)>,
+    usb_node: String,
+    eject_node: String,
+}
+
+fn device_id(node: u32) -> Option<String> {
+    let mut id = [0u16; 400];
+    (unsafe { CM_Get_Device_IDW(node, id.as_mut_ptr(), id.len() as u32, 0) } == 0).then(|| win::from_wide(&id))
+}
+
+/// Vero se Windows dichiara scollegabile il dispositivo (lo decide l'hub a cui è attaccato).
+fn node_removable(node: u32) -> bool {
+    const CM_DRP_CAPABILITIES: u32 = 0x10;
+    const CM_DEVCAP_REMOVABLE: u32 = 0x4;
+    let (mut value, mut len) = (0u32, 4u32);
+    let rc = unsafe {
+        CM_Get_DevNode_Registry_PropertyW(
+            node,
+            CM_DRP_CAPABILITIES,
+            null_mut(),
+            &mut value as *mut u32 as *mut c_void,
+            &mut len,
+            0,
+        )
+    };
+    rc == 0 && value & CM_DEVCAP_REMOVABLE != 0
+}
+
+/// Per ogni disco trova il suo posto nell'albero dei dispositivi e, risalendolo, il bridge USB a
+/// cui è collegato (VID e PID) e il dispositivo da scollegare per la rimozione sicura.
+fn disk_nodes() -> Vec<DiskNode> {
     const DIGCF_PRESENT: u32 = 0x2;
     const DIGCF_DEVICEINTERFACE: u32 = 0x10;
     let mut out = Vec::new();
@@ -319,23 +368,35 @@ fn usb_ids() -> Vec<(u32, (u16, u16))> {
             if win::ioctl(&h, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut dn).is_err() {
                 continue;
             }
-            let number = rd_u32(&dn, 4);
-
-            let mut node = info.DevInst;
+            let mut node = DiskNode {
+                number: rd_u32(&dn, 4),
+                instance_id: device_id(info.DevInst).unwrap_or_default(),
+                ..Default::default()
+            };
+            let mut at = info.DevInst;
             for _ in 0..4 {
                 let mut parent = 0u32;
-                if CM_Get_Parent(&mut parent, node, 0) != 0 {
+                if CM_Get_Parent(&mut parent, at, 0) != 0 {
                     break;
                 }
-                let mut id = [0u16; 400];
-                if CM_Get_Device_IDW(parent, id.as_mut_ptr(), id.len() as u32, 0) == 0 {
-                    if let Some(ids) = parse_usb_id(&win::from_wide(&id)) {
-                        out.push((number, ids));
+                if let Some(id) = device_id(parent) {
+                    if node.usb_id.is_none() {
+                        node.usb_id = parse_usb_id(&id);
+                    }
+                    // Il dispositivo USB vero e proprio, non una delle interfacce di un dispositivo
+                    // composito (MI_xx): è lui che l'hub dichiara scollegabile.
+                    let up = id.to_ascii_uppercase();
+                    if up.starts_with("USB\\VID_") && !up.contains("&MI_") {
+                        if node_removable(parent) {
+                            node.eject_node = id.clone();
+                        }
+                        node.usb_node = id;
                         break;
                     }
                 }
-                node = parent;
+                at = parent;
             }
+            out.push(node);
         }
         SetupDiDestroyDeviceInfoList(set);
     }
@@ -350,9 +411,12 @@ pub fn scan() -> Inventory {
             inv.disks.push(d);
         }
     }
-    for (number, ids) in usb_ids() {
-        if let Some(d) = inv.disks.iter_mut().find(|d| d.number == number) {
-            d.usb_id = Some(ids);
+    for node in disk_nodes() {
+        if let Some(d) = inv.disks.iter_mut().find(|d| d.number == node.number) {
+            d.usb_id = node.usb_id;
+            d.instance_id = node.instance_id;
+            d.usb_node = node.usb_node;
+            d.eject_node = node.eject_node;
         }
     }
     let mask = unsafe { GetLogicalDrives() };

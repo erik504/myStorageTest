@@ -72,6 +72,7 @@ impl Monitor {
             wake,
             notified: HashMap::new(),
             previous: HashMap::new(),
+            latest: HashMap::new(),
         };
         let thread = std::thread::Builder::new()
             .name("monitoraggio".into())
@@ -122,7 +123,10 @@ struct Worker {
     tray: Tray,
     wake: Wake,
     notified: HashMap<String, Instant>,
+    /// Ultima lettura riuscita di ogni disco (modello e numero di serie): il termine di confronto.
     previous: HashMap<String, SmartReport>,
+    /// Ultima lettura di ogni disco, riuscita o no.
+    latest: HashMap<String, SmartReport>,
 }
 
 impl Worker {
@@ -219,7 +223,18 @@ impl Worker {
             if matches!(d.bus, 14 | 15 | 16) {
                 continue;
             }
-            let rep = smart::read(d);
+            let id = format!("{}|{}", d.model, d.serial);
+            // La prima lettura di ogni disco è completa. Le successive non svegliano i dischi
+            // fermi: per quelli resta buona la lettura di prima.
+            let mut rep = match self.latest.get(&id) {
+                None => smart::read(d),
+                Some(before) => match smart::sample(d) {
+                    smart::Sample::Report(r) => r,
+                    smart::Sample::Asleep | smart::Sample::Unchanged => before.clone(),
+                },
+            };
+            rep.disk = d.number;
+            self.latest.insert(id.clone(), rep.clone());
             let name = if d.letters.is_empty() {
                 format!("Disco {} ({})", d.number, d.title())
             } else {
@@ -227,7 +242,6 @@ impl Worker {
                 format!("{} ({})", letters.join(" "), d.title())
             };
             if rep.available {
-                let id = format!("{}|{}", d.model, d.serial);
                 self.compare(&id, &name, &rep);
                 self.previous.insert(id, rep.clone());
             }

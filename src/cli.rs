@@ -7,17 +7,21 @@ use windows_sys::Win32::System::Console::AttachConsole;
 use crate::disks::{self, bus_name};
 use crate::tester::{LogLevel, Outcome, Phase, TestConfig, TestRun};
 use crate::win::human_bytes;
-use crate::{eventlog, smart};
+use crate::{eventlog, info, smart};
 
 const HELP: &str = "\
 myStorageTest — test, diagnosi e monitoraggio dei dischi
 
 Uso:
   mystoragetest                     apre l'interfaccia
+  mystoragetest --admin             apre l'interfaccia chiedendo a Windows i privilegi di amministratore
   mystoragetest --monitor           avvia ridotto nell'area di notifica, con il monitoraggio attivo
   mystoragetest --quit              chiude l'istanza in esecuzione
   mystoragetest --list              elenca volumi e dischi
+  mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
   mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
+  mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
+                                    (da amministratore; senza FILE li stampa)
   mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
   mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
   mystoragetest --selftest N breve|estesa|stop
@@ -54,6 +58,8 @@ pub fn run(args: &[String]) -> Option<i32> {
             | "--check-events"
             | "--selftest"
             | "--export-icon"
+            | "--diagnosi"
+            | "--info"
     ) {
         return None;
     }
@@ -84,6 +90,32 @@ pub fn run(args: &[String]) -> Option<i32> {
             if eventlog::check(720, max) { 0 } else { 2 }
         }
         "--selftest" => selftest_cmd(&args[1..]),
+        "--info" => info_cmd(args.get(1).map(String::as_str)),
+        "--diagnosi" => {
+            // I dischi virtuali non hanno uno SMART proprio.
+            let list: Vec<disks::PhysDisk> = disks::scan()
+                .disks
+                .into_iter()
+                .filter(|d| !matches!(d.bus, 14 | 15 | 16))
+                .collect();
+            let text = smart::diagnosis_file(&smart::diagnose(&list));
+            match args.get(1) {
+                Some(path) => match std::fs::write(path, format!("\u{FEFF}{text}")) {
+                    Ok(()) => {
+                        println!("Rapporto salvato in {path}");
+                        0
+                    }
+                    Err(e) => {
+                        println!("Impossibile salvare {path}: {e}");
+                        2
+                    }
+                },
+                None => {
+                    print!("{text}");
+                    0
+                }
+            }
+        }
         "--export-icon" => export_icon(args.get(1).map(String::as_str).unwrap_or("icona.png")),
         "--list" => list(),
         "--smart" => smart_cmd(args.get(1).and_then(|s| s.parse().ok())),
@@ -124,6 +156,67 @@ fn list() -> i32 {
             human_bytes(v.free),
             v.disks
         );
+    }
+    0
+}
+
+/// `--info [X:|N]`: gli stessi dati della scheda Info, per un volume, per un disco o per tutti.
+fn info_cmd(which: Option<&str>) -> i32 {
+    let inv = disks::scan();
+    let letter = which
+        .and_then(|s| s.chars().next())
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| c.to_ascii_uppercase());
+    let number: Option<u32> = which.and_then(|s| s.parse().ok());
+    if which.is_some() && letter.is_none_or(|l| inv.volume(l).is_none()) && number.is_none_or(|n| inv.disk(n).is_none()) {
+        println!("Volume o disco non trovato: {}", which.unwrap_or_default());
+        return 2;
+    }
+    let print = |rows: &[info::Row]| {
+        for r in rows {
+            println!("    {:<30} {}{}", r.label, r.value, if r.warn { "  (!)" } else { "" });
+        }
+    };
+    let print_disk = |d: &disks::PhysDisk, det: &info::Details| {
+        println!("\n  Disco {} — {}", d.number, d.title());
+        let x = det.disk(d.number);
+        print(&info::disk_rows(d, x, None));
+        for p in x.map(|x| x.partitions.as_slice()).unwrap_or_default() {
+            println!(
+                "      partizione {:<3} {:<3} {:<24} inizio {:>9}  dimensione {:>9}  {}{}",
+                p.number,
+                p.letter.map(|l| format!("{l}:")).unwrap_or_default(),
+                p.kind,
+                human_bytes(p.offset),
+                human_bytes(p.length),
+                p.name,
+                if p.active { "  (attiva)" } else { "" }
+            );
+        }
+        match info::eject_plan(&inv, d) {
+            Some(plan) => println!("    {:<30} {}", "Espulsione", plan.describe()),
+            None if d.is_usb() || d.removable => println!("    {:<30} non disponibile", "Espulsione"),
+            None => {}
+        }
+    };
+    for v in inv.volumes.iter().filter(|v| which.is_none() || letter == Some(v.letter)) {
+        let list: Vec<disks::PhysDisk> = v.disks.iter().filter_map(|n| inv.disk(*n)).cloned().collect();
+        let det = info::details(Some(v.letter), &list);
+        println!("Volume {}:", v.letter);
+        print(&info::volume_rows(v, Some(&det)));
+        for d in &list {
+            print_disk(d, &det);
+        }
+        println!();
+    }
+    for d in inv
+        .disks
+        .iter()
+        .filter(|d| if which.is_some() { letter.is_none() && number == Some(d.number) } else { d.letters.is_empty() })
+    {
+        let det = info::details(None, std::slice::from_ref(d));
+        print_disk(d, &det);
+        println!();
     }
     0
 }

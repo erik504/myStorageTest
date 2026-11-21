@@ -230,6 +230,19 @@ pub fn ascii_at(b: &[u8], off: usize) -> String {
     String::from_utf8_lossy(&b[off..end]).trim().to_string()
 }
 
+/// Numero intero con il punto fra le migliaia: "1.000.202".
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Dimensione leggibile: "931,5 GB".
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];

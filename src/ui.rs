@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use crate::disks::{self, Inventory, PhysDisk, Volume, bus_name};
 use crate::eventlog::{self, StorEvent};
 use crate::icon::{self, Tone};
+use crate::info;
 use crate::monitor::Monitor;
 use crate::settings::{self, Settings};
 use crate::smart::{self, Health, SelfTestCmd, SmartReport};
@@ -68,15 +69,7 @@ fn num(v: f64, decimals: usize) -> String {
 }
 
 fn int(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
+    win::thousands(n)
 }
 
 /// Durata leggibile a partire dai millisecondi: "85 µs", "1,2 ms", "3,4 s".
@@ -118,8 +111,13 @@ fn pill(ui: &mut Ui, text: &str, color: Color32) {
 }
 
 fn usage_bar(ui: &mut Ui, fraction: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
-    let radius = CornerRadius::same(3);
+    space_bar(ui, fraction, 5.0);
+}
+
+/// Barra dello spazio occupato, dell'altezza data.
+fn space_bar(ui: &mut Ui, fraction: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let radius = CornerRadius::same((height / 2.0).ceil() as u8);
     ui.painter().rect_filled(rect, radius, LINE);
     let mut fill = rect;
     fill.set_width(rect.width() * fraction.clamp(0.0, 1.0));
@@ -215,6 +213,31 @@ fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// Tabella a due colonne di voci e valori; i valori si possono selezionare e copiare.
+fn info_grid(ui: &mut Ui, id: impl egui::AsIdSalt, rows: &[info::Row], value_width: f32) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([18.0, 4.0])
+        .min_row_height(22.0)
+        .max_col_width(value_width)
+        .show(ui, |ui| {
+            for r in rows {
+                ui.label(dim(r.label));
+                let text = RichText::new(&r.value).color(if r.warn { WARN } else { TEXT });
+                ui.add(egui::Label::new(text).selectable(true).wrap());
+                ui.end_row();
+            }
+        });
+}
+
+/// Apre il volume in una finestra di Esplora risorse.
+fn open_in_explorer(letter: char) {
+    let (verb, path) = (win::wide("open"), win::wide(&format!("{letter}:\\")));
+    unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), path.as_ptr(), null(), null(), 1);
+    }
+}
+
 /// Esegue `work` in un thread e ridisegna la finestra quando il risultato è pronto.
 fn background<T: Send + 'static>(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
     let (tx, rx) = channel();
@@ -228,6 +251,7 @@ fn background<T: Send + 'static>(ctx: &egui::Context, work: impl FnOnce() -> T +
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Info,
     Test,
     Smart,
     Events,
@@ -241,6 +265,7 @@ impl Tab {
     /// Nome usato sulla riga di comando per riaprire la stessa scheda dopo un riavvio.
     fn key(self) -> &'static str {
         match self {
+            Tab::Info => "info",
             Tab::Test => "test",
             Tab::Smart => "smart",
             Tab::Events => "eventi",
@@ -249,7 +274,7 @@ impl Tab {
     }
 
     fn from_key(s: &str) -> Option<Tab> {
-        [Tab::Test, Tab::Smart, Tab::Events, Tab::Temp]
+        [Tab::Info, Tab::Test, Tab::Smart, Tab::Events, Tab::Temp]
             .into_iter()
             .find(|t| t.key() == s)
     }
@@ -260,10 +285,50 @@ fn disk_key(d: &PhysDisk) -> String {
     format!("{}|{}", d.model, d.serial)
 }
 
-/// Ogni quanto si rileggono temperatura e SMART degli SSD interni mentre il programma è aperto.
-const SAMPLE_SECS: u64 = 30;
 /// Campioni di temperatura conservati per disco (a 30 secondi sono circa sette giorni).
 const TEMPS_MAX: usize = 20_000;
+
+/// Esito di una lettura SMART fatta in background.
+#[derive(Default)]
+struct SmartBatch {
+    reports: Vec<SmartReport>,
+    /// Dischi trovati fermi e lasciati stare.
+    asleep: Vec<u32>,
+    /// Rapporto di diagnosi delle letture complete: disco, ora, testo.
+    diagnoses: Vec<(u32, String, String)>,
+}
+
+/// Esito di un rapporto di diagnosi chiesto dall'utente.
+struct DiagDone {
+    list: Vec<smart::Diagnosis>,
+    /// Il file in cui è stato salvato, se era il rapporto di tutti i dischi.
+    saved: Option<Result<PathBuf, String>>,
+}
+
+/// Intervallo in parole: "30 secondi", "5 minuti".
+fn pace_label(secs: u32) -> String {
+    match secs {
+        s if s < 60 => format!("{s} secondi"),
+        60 => "1 minuto".to_string(),
+        s => format!("{} minuti", s / 60),
+    }
+}
+
+/// Rilancia il programma con i privilegi di amministratore: Windows chiede conferma. La nuova
+/// istanza aspetta la fine di questa (`--after`): altrimenti la troverebbe ancora viva, la
+/// scambierebbe per un'istanza già aperta e si chiuderebbe subito. Falso se la richiesta è stata
+/// rifiutata o non è riuscita.
+fn launch_elevated(params: &str) -> bool {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let params = format!("--after {} {params}", std::process::id());
+    // Solo per le verifiche automatiche: stesso percorso, senza la richiesta di elevazione.
+    let verb = if std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() { "open" } else { "runas" };
+    let (verb, file, params) = (win::wide(verb), win::wide(&exe), win::wide(&params));
+    let rc = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), null(), 1) };
+    rc as isize > 32
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sel {
@@ -366,7 +431,24 @@ pub struct App {
     /// Vero quando l'area principale mostra il monitoraggio invece di un disco.
     monitor_view: bool,
     smart: HashMap<u32, SmartReport>,
-    smart_rx: Option<Receiver<Vec<SmartReport>>>,
+    smart_rx: Option<Receiver<SmartBatch>>,
+    /// Dischi trovati fermi all'ultima lettura periodica e lasciati stare: da che ora.
+    asleep: HashMap<u32, String>,
+    /// Rapporto di diagnosi in preparazione, e l'esito dell'ultimo salvato in un file: riuscito o
+    /// no, testo.
+    diag_rx: Option<Receiver<DiagDone>>,
+    diag_note: Option<(bool, String)>,
+    /// Rapporto di diagnosi di ogni disco (vedi `disk_key`): quando è stato preparato e il testo.
+    diag: HashMap<String, (String, String)>,
+    /// Dati di dettaglio mostrati nella scheda Info: a quale selezione si riferiscono (vedi
+    /// `info_key`) e i dati.
+    info: Option<(String, info::Details)>,
+    info_rx: Option<Receiver<(String, info::Details)>>,
+    /// Espulsione in corso, e l'esito dell'ultima: riuscita o no, testo.
+    eject_rx: Option<Receiver<Result<String, String>>>,
+    eject_note: Option<(bool, String)>,
+    /// Al prossimo disegno porta in vista il rapporto di diagnosi nella scheda Info.
+    scroll_to_diag: bool,
     /// Storico delle temperature della sessione per disco (vedi `disk_key`): secondi dall'avvio
     /// del programma e gradi.
     temps: HashMap<String, Vec<[f64; 2]>>,
@@ -374,8 +456,6 @@ pub struct App {
     session_start_ft: u64,
     /// Prossima rilettura periodica dello SMART (temperature e autodiagnosi).
     next_sample: Instant,
-    /// Ultima rilettura dei dischi lenti da svegliare: USB e dischi a piatti.
-    slow_sampled: Instant,
     /// Comando di autodiagnosi in corso di invio: disco, comando, esito.
     selftest_rx: Option<Receiver<(u32, SelfTestCmd, Result<(), String>)>>,
     /// Ultimo messaggio sull'autodiagnosi di ogni disco: riuscito o no, testo.
@@ -483,13 +563,24 @@ impl App {
             inventory_rx: None,
             last_scan: Instant::now(),
             selected,
-            tab: startup.tab.unwrap_or(Tab::Test),
+            // Le verifiche automatiche delle prove partono dalla scheda Test.
+            tab: startup
+                .tab
+                .unwrap_or(if script.as_ref().is_some_and(|s| s.autotest) { Tab::Test } else { Tab::Info }),
             monitor_view: startup.monitor_view,
             temps: HashMap::new(),
             session_start: Instant::now(),
             session_start_ft: win::now_filetime(),
-            next_sample: Instant::now() + Duration::from_secs(if scripted { 2 } else { SAMPLE_SECS }),
-            slow_sampled: Instant::now(),
+            next_sample: Instant::now() + Duration::from_secs(if scripted { 2 } else { 10 }),
+            asleep: HashMap::new(),
+            diag_rx: None,
+            diag_note: None,
+            diag: HashMap::new(),
+            info: None,
+            info_rx: None,
+            eject_rx: None,
+            eject_note: None,
+            scroll_to_diag: false,
             selftest_rx: None,
             selftest_note: HashMap::new(),
             selftest_running: HashMap::new(),
@@ -576,13 +667,16 @@ impl App {
         self.runs.values().any(|r| r.running())
     }
 
-    /// Legge lo SMART in background: di tutti i dischi oppure solo di quelli selezionati.
+    /// Legge lo SMART in background: di tutti i dischi oppure solo di quelli selezionati. È una
+    /// lettura completa, che sveglia i dischi fermi.
     fn load_smart(&mut self, ctx: &egui::Context, all: bool) {
         let wanted = self.sel_disks();
-        self.read_smart(ctx, |d| all || wanted.contains(&d.number));
+        self.read_smart(ctx, true, |d| all || wanted.contains(&d.number));
     }
 
-    fn read_smart(&mut self, ctx: &egui::Context, which: impl Fn(&PhysDisk) -> bool) {
+    /// Con `full` la lettura è completa; senza è quella periodica, che lascia stare i dischi fermi
+    /// e non ripete i tentativi sui dispositivi che non hanno lo SMART.
+    fn read_smart(&mut self, ctx: &egui::Context, full: bool, which: impl Fn(&PhysDisk) -> bool) {
         if self.smart_rx.is_some() {
             return;
         }
@@ -596,42 +690,131 @@ impl App {
         if list.is_empty() {
             return;
         }
-        self.smart_rx = Some(background(ctx, move || list.iter().map(smart::read).collect()));
+        let seen: HashSet<String> = self.diag.keys().cloned().collect();
+        self.smart_rx = Some(background(ctx, move || {
+            let mut batch = SmartBatch::default();
+            for d in &list {
+                // Le letture complete — all'avvio, con «Rileggi» e al primo incontro con un disco
+                // appena collegato — tengono traccia dei comandi: è il rapporto di diagnosi che la
+                // scheda Info mostra senza dover interrogare il disco un'altra volta.
+                if full || !seen.contains(&disk_key(d)) {
+                    let done = smart::read_traced(d);
+                    batch.diagnoses.push((d.number, done.at, done.text));
+                    batch.reports.extend(done.report);
+                    continue;
+                }
+                match smart::sample(d) {
+                    smart::Sample::Report(r) => batch.reports.push(r),
+                    smart::Sample::Asleep => batch.asleep.push(d.number),
+                    smart::Sample::Unchanged => {}
+                }
+            }
+            batch
+        }));
     }
 
-    /// Ogni quanto si rileggono i dischi che una lettura potrebbe svegliare (USB e a piatti):
-    /// l'intervallo SMART scelto per il monitoraggio.
-    fn slow_interval(&self) -> Duration {
-        Duration::from_secs(self.settings.smart_interval_min.clamp(1, 1440) as u64 * 60)
+    /// Ogni quanti secondi si rilegge la temperatura di tutti i dischi.
+    fn sample_secs(&self) -> u64 {
+        self.settings.temp_sample_secs.clamp(5, 3600) as u64
     }
 
-    /// Rilettura periodica: aggiorna temperature e autodiagnosi. Gli SSD interni ogni
-    /// `SAMPLE_SECS`, più spesso se è in corso un'autodiagnosi; gli altri dischi di rado.
+    /// Rilettura periodica di tutti i dischi: aggiorna temperature e autodiagnosi, più spesso se
+    /// è in corso un'autodiagnosi.
     fn sample_smart(&mut self, ctx: &egui::Context) {
         let pace = if self.script.is_some() {
             2 // le verifiche automatiche non possono aspettare mezzo minuto per avere uno storico
         } else if self.selftest_running.is_empty() {
-            SAMPLE_SECS
+            self.sample_secs()
         } else {
-            10
+            self.sample_secs().min(10)
         };
         self.next_sample = Instant::now() + Duration::from_secs(pace);
-        let slow_due = self.slow_sampled.elapsed() >= self.slow_interval();
-        if slow_due {
-            self.slow_sampled = Instant::now();
+        self.read_smart(ctx, false, |d| !matches!(d.bus, 14 | 15 | 16));
+    }
+
+    /// Prepara il rapporto di diagnosi della lettura SMART, riprovando tutte le strade. Senza
+    /// `only` riguarda tutti i dischi e finisce in un file, che viene aperto; con `only` riguarda
+    /// quei dischi e si legge nella scheda Info.
+    fn run_diagnosis(&mut self, ctx: &egui::Context, only: Option<Vec<u32>>) {
+        if self.diag_rx.is_some() {
+            return;
         }
-        let running = self.selftest_running.clone();
-        self.read_smart(ctx, |d| {
-            let virtual_disk = matches!(d.bus, 14 | 15 | 16);
-            let awake = d.ssd == Some(true) && d.bus != disks::BUS_USB;
-            !virtual_disk && (awake || slow_due || running.contains_key(&d.number))
-        });
+        let list: Vec<PhysDisk> = self
+            .inventory
+            .disks
+            .iter()
+            .filter(|d| match &only {
+                Some(wanted) => wanted.contains(&d.number),
+                // I dischi virtuali non hanno uno SMART proprio.
+                None => !matches!(d.bus, 14 | 15 | 16),
+            })
+            .cloned()
+            .collect();
+        let to_file = only.is_none();
+        let dir = settings::data_dir();
+        if to_file {
+            self.diag_note = None;
+        }
+        self.diag_rx = Some(background(ctx, move || {
+            let list = smart::diagnose(&list);
+            let saved = to_file.then(|| {
+                let path = dir.join("diagnosi-smart.txt");
+                std::fs::create_dir_all(&dir)
+                    .and_then(|_| std::fs::write(&path, format!("\u{FEFF}{}", smart::diagnosis_file(&list))))
+                    .map(|_| path)
+                    .map_err(|e| e.to_string())
+            });
+            DiagDone { list, saved }
+        }));
+    }
+
+    /// Identità di quello che la scheda Info sta mostrando: cambia quando si sceglie un altro
+    /// disco, o quando al posto di quello arriva un disco diverso.
+    fn info_key(&self) -> String {
+        let mut key = match self.selected {
+            Some(Sel::Volume(l)) => format!("{l}:"),
+            Some(Sel::Disk(n)) => format!("disco {n}"),
+            None => String::new(),
+        };
+        if let Some(v) = self.sel_volume() {
+            key.push_str(&format!("|{}|{}|{}", v.label, v.fs, v.total));
+        }
+        for d in self.sel_disks().iter().filter_map(|n| self.inventory.disk(*n)) {
+            key.push_str(&format!("|{}|{}|{}|{:?}", d.number, disk_key(d), d.size, d.letters));
+        }
+        key
+    }
+
+    /// Chiede a Windows di espellere il disco, in background.
+    fn start_eject(&mut self, ctx: &egui::Context, plan: info::Eject) {
+        if self.eject_rx.is_some() {
+            return;
+        }
+        self.eject_note = None;
+        // Nessun'altra lettura dei dischi nel frattempo: un disco con un comando in corso non si
+        // lascia scollegare.
+        self.eject_rx = Some(background(ctx, move || {
+            smart::exclusive(|| info::eject(&plan)).map(|_| plan.done().to_string())
+        }));
     }
 
     /// Accoglie una lettura SMART: aggiorna lo storico delle temperature e segue le autodiagnosi.
-    fn smart_arrived(&mut self, list: Vec<SmartReport>) {
+    fn smart_arrived(&mut self, batch: SmartBatch) {
         let secs = self.session_start.elapsed().as_secs_f64();
-        for r in list {
+        let now = clock(self.session_start_ft, secs);
+        // Il rapporto di una lettura normale non sostituisce quello chiesto apposta, che ha
+        // riprovato tutte le strade.
+        for (n, at, text) in batch.diagnoses {
+            if let Some(d) = self.inventory.disk(n) {
+                self.diag.entry(disk_key(d)).or_insert((at, text));
+            }
+        }
+        self.asleep.retain(|n, _| self.inventory.disk(*n).is_some());
+        for n in batch.asleep {
+            self.asleep.entry(n).or_insert_with(|| now.clone());
+        }
+        for r in batch.reports {
+            self.asleep.remove(&r.disk);
             let disk = self.inventory.disk(r.disk).cloned();
             if let (Some(d), Some(t)) = (&disk, r.temperature) {
                 let history = self.temps.entry(disk_key(d)).or_default();
@@ -854,26 +1037,15 @@ impl App {
     }
 
     fn restart_elevated(&mut self, ctx: &egui::Context) {
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        // La nuova istanza aspetta la fine di questa (`--after`): altrimenti la troverebbe ancora viva,
-        // la scambierebbe per un'istanza già aperta e si chiuderebbe subito. Riapre poi lo stesso disco
-        // e la stessa scheda.
+        // La nuova istanza riapre lo stesso disco e la stessa scheda.
         let tab = if self.monitor_view { MONITOR_KEY } else { self.tab.key() };
-        let mut params = format!("--after {} --tab {tab}", std::process::id());
+        let mut params = format!("--tab {tab}");
         match self.selected {
             Some(Sel::Volume(l)) => params.push_str(&format!(" --vol {l}")),
             Some(Sel::Disk(n)) => params.push_str(&format!(" --disk {n}")),
             None => {}
         }
-        // Solo per le verifiche automatiche: stesso percorso, senza la richiesta di elevazione.
-        let verb = if std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() { "open" } else { "runas" };
-        let (verb, file, params) = (win::wide(verb), win::wide(&exe), win::wide(&params));
-        let rc = unsafe {
-            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), null(), 1)
-        };
-        if rc as isize > 32 {
+        if launch_elevated(&params) {
             self.allow_close = true;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
@@ -889,6 +1061,8 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Aggiorna").clicked() {
                     self.last_scan = Instant::now() - Duration::from_secs(60);
+                    // Anche i dati di dettaglio della scheda Info si rileggono.
+                    self.info = None;
                 }
             });
         });
@@ -900,7 +1074,7 @@ impl App {
 
         let warn_at = self.settings.temp_warn_c;
         let mut pick: Option<Sel> = None;
-        let bottom = 86.0;
+        let bottom = if self.elevated { 62.0 } else { 114.0 };
         egui::ScrollArea::vertical()
             .id_salt("dischi")
             .auto_shrink([false, false])
@@ -1008,9 +1182,16 @@ impl App {
         if let Some(p) = pick {
             self.selected = Some(p);
             self.monitor_view = false;
+            self.eject_note = None;
         }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.checkbox(&mut self.settings.always_admin, "Avvia sempre come amministratore")
+                .on_hover_text(
+                    "A ogni avvio il programma chiede a Windows i privilegi di amministratore: compare la richiesta \
+                     di conferma di Windows e, se la accetti, si apre già con tutte le funzioni. Vale anche per \
+                     l'avvio con Windows. Dalla riga di comando o da un collegamento si ottiene lo stesso con --admin.",
+                );
             if self.elevated {
                 ui.label(dim("Avviato come amministratore"));
             } else {
@@ -1165,6 +1346,7 @@ impl App {
 
         ui.horizontal(|ui| {
             for (tab, label) in [
+                (Tab::Info, "Info"),
                 (Tab::Test, "Test"),
                 (Tab::Smart, "SMART"),
                 (Tab::Events, "Eventi di sistema"),
@@ -1187,6 +1369,7 @@ impl App {
         ui.add_space(2.0);
 
         match self.tab {
+            Tab::Info => self.tab_info(ui),
             Tab::Test => self.tab_test(ui),
             Tab::Smart => self.tab_smart(ui),
             Tab::Events => self.tab_events(ui),
@@ -1214,6 +1397,202 @@ impl App {
             "Nessun disco fisico associato".to_string()
         } else {
             parts.join("   +   ")
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Scheda Info
+    // -----------------------------------------------------------------------------------------
+
+    fn tab_info(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let disks = self.sel_disks();
+        let vol = self.sel_volume().cloned();
+        // I dati di dettaglio si leggono una volta per disco, in background.
+        let key = self.info_key();
+        if self.info_rx.is_none() && self.info.as_ref().is_none_or(|(k, _)| *k != key) {
+            let letter = vol.as_ref().map(|v| v.letter);
+            let list: Vec<PhysDisk> = disks.iter().filter_map(|n| self.inventory.disk(*n)).cloned().collect();
+            let wanted = key.clone();
+            self.info_rx = Some(background(&ctx, move || (wanted, info::details(letter, &list))));
+        }
+        let det = self.info.as_ref().filter(|(k, _)| *k == key).map(|(_, d)| d.clone());
+
+        // «Espelli» c'è solo per i dispositivi USB e i supporti rimovibili.
+        let plan = match disks.as_slice() {
+            [n] => self.inventory.disk(*n).and_then(|d| info::eject_plan(&self.inventory, d)),
+            _ => None,
+        };
+        let ejecting = self.eject_rx.is_some();
+        let (mut explore, mut eject, mut rerun, mut copy) = (false, false, false, false);
+        ui.horizontal(|ui| {
+            explore = ui
+                .add_enabled(vol.is_some(), egui::Button::new("Esplora"))
+                .on_hover_text("Apre il volume in Esplora risorse.")
+                .on_disabled_hover_text("Questo disco non ha un volume con una lettera di unità da aprire.")
+                .clicked();
+            if let Some(plan) = &plan {
+                let testing = plan.letters().iter().any(|l| self.runs.get(l).is_some_and(|r| r.running()));
+                eject = ui
+                    .add_enabled(!ejecting && !testing, egui::Button::new("Espelli"))
+                    .on_hover_text(plan.describe())
+                    .on_disabled_hover_text(if testing {
+                        "È in corso una prova su questo disco: fermala prima di espellerlo."
+                    } else {
+                        "Espulsione in corso…"
+                    })
+                    .clicked();
+            }
+            if ejecting {
+                ui.spinner();
+                ui.label(dim("Espulsione in corso…"));
+            } else if let Some((ok, text)) = &self.eject_note {
+                ui.add(egui::Label::new(RichText::new(text).color(if *ok { GOOD } else { WARN })).wrap());
+            }
+        });
+
+        let scroll_to_diag = std::mem::take(&mut self.scroll_to_diag);
+        egui::ScrollArea::vertical().id_salt("info").auto_shrink([false, false]).show(ui, |ui| {
+            let value_width = (ui.available_width() - 250.0).max(320.0);
+            if let Some(v) = &vol {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let used = v.total.saturating_sub(v.free);
+                    ui.horizontal(|ui| {
+                        ui.label(bold(format!("Volume {}:", v.letter), 16.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(dim(format!("{} liberi di {}", human_bytes(v.free), human_bytes(v.total))));
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(bold(human_bytes(used), 24.0));
+                        ui.label(dim(format!("occupati · {}", info::percent(used, v.total))));
+                    });
+                    space_bar(ui, used as f32 / v.total.max(1) as f32, 10.0);
+                    ui.add_space(6.0);
+                    info_grid(ui, "volume", &info::volume_rows(v, det.as_ref()), value_width);
+                });
+                ui.add_space(4.0);
+            }
+            if disks.is_empty() {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label("Questo volume non corrisponde a un disco fisico riconoscibile (unità virtuale, cloud o spazio di archiviazione): non ci sono dati sull'hardware.");
+                });
+                return;
+            }
+            for n in &disks {
+                let Some(d) = self.inventory.disk(*n) else { continue };
+                let x = det.as_ref().and_then(|x| x.disk(*n));
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(bold(format!("Disco {} · {}", d.number, d.title()), 16.0));
+                        if det.is_none() {
+                            ui.spinner();
+                        }
+                    });
+                    info_grid(ui, ("disco", *n), &info::disk_rows(d, x, self.smart.get(n)), value_width);
+                    if let Some(x) = x.filter(|x| !x.partitions.is_empty()) {
+                        ui.add_space(6.0);
+                        ui.label(dim("PARTIZIONI"));
+                        egui::Grid::new(("partizioni", *n)).num_columns(6).spacing([18.0, 5.0]).striped(true).show(ui, |ui| {
+                            for head in ["N.", "Volume", "Tipo", "Nome", "Inizio", "Dimensione"] {
+                                ui.label(dim(head));
+                            }
+                            ui.end_row();
+                            for p in &x.partitions {
+                                ui.label(p.number.to_string());
+                                ui.label(p.letter.map(|l| format!("{l}:")).unwrap_or_else(|| "—".into()));
+                                ui.label(if p.active { format!("{} · attiva", p.kind) } else { p.kind.clone() });
+                                ui.label(dim(p.name.as_str()));
+                                ui.label(human_bytes(p.offset));
+                                ui.label(human_bytes(p.length));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+            }
+
+            // In fondo, il rapporto di diagnosi dei dischi di questa pagina.
+            let diagnosing = self.diag_rx.is_some();
+            let report = card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(bold("Rapporto di diagnosi", 16.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        rerun = ui
+                            .add_enabled(!diagnosing, egui::Button::new("Rifai"))
+                            .on_hover_text(
+                                "Interroga di nuovo il disco riprovando tutte le strade, anche quelle già scartate. \
+                                 Sveglia il disco se è fermo.",
+                            )
+                            .clicked();
+                        copy = ui.button("Copia").on_hover_text("Copia il rapporto negli appunti.").clicked();
+                        if diagnosing {
+                            ui.label(dim("Diagnosi in corso…"));
+                            ui.spinner();
+                        }
+                    });
+                });
+                ui.label(dim(
+                    "I comandi inviati al disco per leggere lo SMART e le risposte ricevute: servono a capire perché \
+                     un disco o un bridge USB non restituisce i dati.",
+                ));
+                if !self.elevated {
+                    ui.label(dim(
+                        "Senza i privilegi di amministratore i comandi diretti ai dischi non sono disponibili: il \
+                         rapporto è parziale.",
+                    ));
+                }
+                for n in &disks {
+                    let Some(d) = self.inventory.disk(*n) else { continue };
+                    ui.add_space(2.0);
+                    let Some((at, text)) = self.diag.get(&disk_key(d)) else {
+                        ui.label(dim(format!("Disco {n}: non ancora preparato. Premi «Rifai».")));
+                        continue;
+                    };
+                    ui.label(dim(format!("Preparato il {at}")));
+                    Frame::new()
+                        .fill(Color32::from_rgb(9, 11, 16))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(RichText::new(text.trim_end()).monospace().size(12.5))
+                                    .selectable(true)
+                                    .wrap(),
+                            );
+                        });
+                }
+            });
+            if scroll_to_diag {
+                report.response.scroll_to_me(Some(Align::TOP));
+            }
+        });
+
+        if explore {
+            if let Some(v) = &vol {
+                open_in_explorer(v.letter);
+            }
+        }
+        if let Some(plan) = plan.filter(|_| eject) {
+            self.start_eject(&ctx, plan);
+        }
+        if rerun {
+            self.run_diagnosis(&ctx, Some(disks.clone()));
+        }
+        if copy {
+            let texts: Vec<&str> = disks
+                .iter()
+                .filter_map(|n| self.inventory.disk(*n))
+                .filter_map(|d| self.diag.get(&disk_key(d)))
+                .map(|(_, text)| text.as_str())
+                .collect();
+            ctx.copy_text(texts.join("\n"));
         }
     }
 
@@ -1690,9 +2069,23 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.load_smart(&ctx, false);
             }
-            if loading {
+            let diagnosing = self.diag_rx.is_some();
+            let diagnose = ui
+                .add_enabled(!diagnosing, egui::Button::new("Rapporto di diagnosi"))
+                .on_hover_text(
+                    "Scrive in un file di testo i comandi inviati a ogni disco per leggere lo SMART e le risposte \
+                     ricevute, poi lo apre. Serve a capire perché un disco o un bridge USB non restituisce i dati. \
+                     Sveglia i dischi fermi.",
+                );
+            if diagnose.clicked() {
+                let ctx = ui.ctx().clone();
+                self.run_diagnosis(&ctx, None);
+            }
+            if loading || diagnosing {
                 ui.spinner();
-                ui.label(dim("Lettura in corso…"));
+                ui.label(dim(if diagnosing { "Diagnosi in corso…" } else { "Lettura in corso…" }));
+            } else if let Some((ok, text)) = &self.diag_note {
+                ui.label(RichText::new(text).color(if *ok { DIM } else { WARN }));
             }
         });
         if disks.is_empty() {
@@ -1729,7 +2122,7 @@ impl App {
                     if !r.available {
                         ui.add_space(4.0);
                         ui.label(RichText::new(&r.note).color(WARN));
-                        if !self.elevated && d.bus == disks::BUS_USB {
+                        if !self.elevated && d.is_usb() && r.note.contains("amministratore") {
                             ui.label(dim("Usa «Riavvia come amministratore» in basso a sinistra, poi torna su questa scheda."));
                         }
                         return;
@@ -1799,6 +2192,7 @@ impl App {
                     let Some(d) = self.inventory.disk(*n) else { continue };
                     let history = self.temps.get(&disk_key(d)).map(|v| v.as_slice()).unwrap_or(&[]);
                     let report = self.smart.get(n);
+                    let asleep = self.asleep.get(n);
                     card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.set_height(each - 40.0);
@@ -1808,8 +2202,16 @@ impl App {
                                 if let Some(t) = history.last().map(|q| q[1] as i32) {
                                     pill(ui, &format!("{t} °C"), if t >= warn_at { WARN } else { GOOD });
                                 }
+                                if let Some(since) = asleep {
+                                    pill(ui, &format!("fermo dalle {since}"), DIM);
+                                }
                             });
                         });
+                        if asleep.is_some() {
+                            ui.label(dim(
+                                "Il disco è fermo: non viene svegliato per leggerne la temperatura. Le letture riprendono quando torna a girare.",
+                            ));
+                        }
                         if history.is_empty() {
                             ui.add_space(4.0);
                             let why = match report {
@@ -1844,11 +2246,22 @@ impl App {
                 }
             });
         self.chart_rects[4] = rect;
-        ui.label(dim(format!(
-            "Storico di questa sessione, dall'apertura del programma. Gli SSD interni vengono letti ogni {SAMPLE_SECS} secondi; \
-             i dischi USB e quelli a piatti ogni {} minuti (l'intervallo SMART del monitoraggio), per non tenerli svegli.",
-            self.settings.smart_interval_min
-        )));
+        let before = self.settings.temp_sample_secs;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(dim("Storico di questa sessione, dall'apertura del programma. Tutti i dischi vengono letti ogni"));
+            egui::ComboBox::from_id_salt("campioni")
+                .width(104.0)
+                .selected_text(pace_label(before))
+                .show_ui(ui, |ui| {
+                    for secs in [10u32, 30, 60, 300, 900] {
+                        ui.selectable_value(&mut self.settings.temp_sample_secs, secs, pace_label(secs));
+                    }
+                });
+            ui.label(dim("· un disco fermo non viene svegliato."));
+        });
+        if self.settings.temp_sample_secs != before {
+            self.next_sample = Instant::now() + Duration::from_secs(self.sample_secs().min(before as u64));
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2538,37 +2951,60 @@ impl App {
                 wait(self.script.as_mut().unwrap(), 400);
             }
             18 if autotest => shot(script, "2f-ritorno.png"),
+            // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
             19 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.tab = Tab::Info;
+                wait(self.script.as_mut().unwrap(), 1500);
+            }
+            20 => {
+                // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
+                if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
+                    let script = self.script.as_mut().unwrap();
+                    script.step = 20;
+                    wait(script, 200);
+                } else {
+                    shot(script, "2g-info.png");
+                }
+            }
+            21 => {
+                self.scroll_to_diag = true;
+                wait(self.script.as_mut().unwrap(), 500);
+            }
+            22 => shot(script, "2h-info-diagnosi.png"),
+            23 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            20 => shot(script, "3-smart.png"),
-            21 => {
+            24 => shot(script, "3-smart.png"),
+            25 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            22 => {
+            26 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 22;
+                    script.step = 26;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            23 => {
+            27 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            24 => {
+            28 => {
+                // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
-                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.6, rect.height() * 0.5));
+                if rect.is_positive() {
+                    self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.6, rect.height() * 0.5));
+                }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            25 => shot(script, "5-temperatura.png"),
-            26 => {
+            29 => shot(script, "5-temperatura.png"),
+            30 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -2580,8 +3016,8 @@ impl App {
                 self.monitor_view = true;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            27 => shot(script, "6-monitoraggio.png"),
-            28 => {
+            31 => shot(script, "6-monitoraggio.png"),
+            32 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -3904,9 +4340,55 @@ impl eframe::App for App {
             }
         }
         if let Some(rx) = &self.smart_rx {
-            if let Ok(list) = rx.try_recv() {
+            if let Ok(batch) = rx.try_recv() {
                 self.smart_rx = None;
-                self.smart_arrived(list);
+                self.smart_arrived(batch);
+            }
+        }
+        if let Some(rx) = &self.diag_rx {
+            if let Ok(done) = rx.try_recv() {
+                self.diag_rx = None;
+                // Il rapporto di ogni disco resta nella scheda Info, e lo SMART letto nel prepararlo
+                // aggiorna quello mostrato.
+                let mut batch = SmartBatch::default();
+                for d in done.list {
+                    if let Some(disk) = self.inventory.disk(d.disk) {
+                        self.diag.insert(disk_key(disk), (d.at, d.text));
+                    }
+                    batch.reports.extend(d.report);
+                }
+                self.smart_arrived(batch);
+                match done.saved {
+                    Some(Ok(path)) => {
+                        // Lo apre nel programma associato ai file di testo (non nelle verifiche automatiche).
+                        if self.script.is_none() {
+                            let (verb, file) = (win::wide("open"), win::wide(&path.to_string_lossy()));
+                            unsafe {
+                                ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), null(), null(), 1);
+                            }
+                        }
+                        self.diag_note = Some((true, format!("Rapporto salvato in {}", path.display())));
+                    }
+                    Some(Err(e)) => self.diag_note = Some((false, format!("Impossibile salvare il rapporto: {e}"))),
+                    None => {}
+                }
+            }
+        }
+        if let Some(rx) = &self.info_rx {
+            if let Ok(loaded) = rx.try_recv() {
+                self.info_rx = None;
+                self.info = Some(loaded);
+            }
+        }
+        if let Some(rx) = &self.eject_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.eject_rx = None;
+                self.eject_note = Some(match result {
+                    Ok(text) => (true, text),
+                    Err(e) => (false, format!("Espulsione non riuscita: {e}.")),
+                });
+                // L'elenco dei dischi va riletto subito.
+                self.last_scan = Instant::now() - Duration::from_secs(60);
             }
         }
         if let Some(rx) = &self.events_rx {
@@ -3934,7 +4416,7 @@ impl eframe::App for App {
                 };
                 self.selftest_note.insert(disk, note);
                 // Rilegge subito il disco, per mostrare la prova in corso.
-                self.read_smart(ctx, |d| d.number == disk);
+                self.read_smart(ctx, true, |d| d.number == disk);
                 self.next_sample = Instant::now() + Duration::from_secs(5);
             }
         }
@@ -3952,7 +4434,9 @@ impl eframe::App for App {
 
         if !self.hidden {
             let testing = self.testing();
-            if !testing && self.inventory_rx.is_none() && self.last_scan.elapsed() > Duration::from_secs(4) {
+            // Durante un'espulsione l'elenco non si rilegge: aprire il disco gli impedirebbe di andarsene.
+            let ejecting = self.eject_rx.is_some();
+            if !testing && !ejecting && self.inventory_rx.is_none() && self.last_scan.elapsed() > Duration::from_secs(4) {
                 self.last_scan = Instant::now();
                 self.inventory_rx = Some(background(ctx, disks::scan));
             }
@@ -4007,6 +4491,20 @@ pub fn run(args: &[String]) -> i32 {
         win::wait_process_exit(pid, 15_000);
     } else if !scripted && tray::show_running_instance() {
         return 0;
+    } else if !scripted && !win::is_elevated() {
+        // Avvio diretto da amministratore: con `--admin`, oppure con la scelta «Avvia sempre come
+        // amministratore». Se la richiesta di Windows viene rifiutata si prosegue senza privilegi.
+        let asked = args.iter().any(|a| a == "--admin");
+        if asked || Settings::load().always_admin {
+            let params: Vec<String> = args
+                .iter()
+                .filter(|a| *a != "--admin")
+                .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
+                .collect();
+            if launch_elevated(&params.join(" ")) {
+                return 0;
+            }
+        }
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("myStorageTest")

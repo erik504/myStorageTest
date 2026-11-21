@@ -9,7 +9,29 @@ quando si ha un dubbio, e accorgersi subito quando un disco comincia a dare erro
 ## Cosa fa
 
 La colonna a sinistra elenca i dischi, ognuno con la temperatura e il pallino dello stato SMART; in cima
-c'è la voce **Monitoraggio**, con la casella che lo accende e lo spegne. Ogni disco ha quattro schede.
+c'è la voce **Monitoraggio**, con la casella che lo accende e lo spegne. Ogni disco ha cinque schede.
+
+**Info**, la prima: tutti i dati del volume e dei dischi su cui sta. Del volume lo spazio occupato e
+libero, il file system con le sue funzioni, l'unità di allocazione, il numero di serie e la partizione che
+lo ospita; di ogni disco modello, numero di serie, firmware, collegamento, dimensione dei settori, TRIM,
+cache in scrittura, tabella delle partizioni e stato SMART. Per ogni disco ci sono anche l'interfaccia, cioè
+di che cosa è capace, e il collegamento attuale, cioè a che cosa lavora davvero:
+
+- NVMe: versione dello standard e collegamento PCIe, generazione e linee (per esempio «NVMe 1.4 su PCIe
+  4.0 x4», collegato a «PCIe 4.0 x1»), con la banda massima di ognuno;
+- SATA: revisione dello standard, velocità massima del disco e velocità a cui si è accordato con il
+  controller (1,5, 3 o 6 Gbit/s), dai dati di identificazione che Windows conserva;
+- USB: velocità di cui il dispositivo è capace e quella a cui lavora, chiesta all'hub, con la porta, se
+  è USB 2 o USB 3 e se il connettore è USB-C; da amministratore, per un disco SATA in un contenitore
+  USB, anche il collegamento SATA fra il bridge e il disco.
+
+Quando il collegamento è più lento di quanto il disco saprebbe fare la riga è evidenziata, con le cause
+possibili (un NVMe x4 che usa una sola linea, un disco USB 3 su una porta USB 2, un SATA a 3 Gbit/s). In alto
+«Esplora» apre il volume in Esplora risorse e, per i dispositivi USB e i supporti rimovibili, «Espelli»
+chiede a Windows la rimozione sicura; di una scheda in un lettore con più alloggiamenti espelle solo il
+supporto. In fondo c'è il rapporto di diagnosi del disco: i comandi inviati per leggerne lo SMART e le
+risposte ricevute, già pronti dalla lettura fatta all'avvio; «Rifai» li ripete riprovando tutte le strade.
+Le unità ottiche (CD e DVD) non sono fra i dischi che il programma elenca.
 
 **Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze
 (passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore e che cosa
@@ -51,9 +73,13 @@ avvio della prova breve o estesa e interruzione. Un'autodiagnosi fallita rende c
 nelle ultime 24 ore, 7 giorni o 30 giorni, con una spiegazione per i codici più comuni. «Aggiorna»
 aggiunge solo gli eventi nuovi.
 
-**Temperatura**: lo storico della temperatura del disco da quando il programma è aperto. Gli SSD interni
-vengono letti ogni 30 secondi; i dischi USB e quelli a piatti solo all'intervallo SMART del monitoraggio,
-perché una lettura più frequente potrebbe impedire loro di andare a riposo.
+**Temperatura**: lo storico della temperatura del disco da quando il programma è aperto. Tutti i dischi
+che la dichiarano vengono letti allo stesso ritmo, ogni 30 secondi (da 10 secondi a 15 minuti, a scelta
+nella scheda). Un disco fermo non viene svegliato per leggerlo: prima della lettura periodica il programma
+chiede a Windows se lo ha spento e, da amministratore, al disco stesso se sta girando (CHECK POWER MODE,
+anche attraverso i bridge USB che riportano la risposta); la scheda lo mostra come «fermo» e le letture
+riprendono quando torna a girare. Su certi dischi a piatti una lettura frequente può però rimandare la
+messa a riposo: in quel caso conviene allungare l'intervallo.
 
 **Monitoraggio**: un'icona nell'area di notifica sorveglia in tempo reale gli errori di disco nel registro
 di sistema e rilegge periodicamente lo SMART di tutti i dischi, autodiagnosi comprese. Se compare un
@@ -87,13 +113,41 @@ journal NTFS). L'autodiagnosi la esegue il disco e il suo esito resta nel regist
 | Autodiagnosi: avvio e interruzione | no | sì |
 | Scansione della superficie | no | sì |
 
-«Riavvia come amministratore» in basso a sinistra rilancia il programma con i privilegi necessari.
+«Riavvia come amministratore» in basso a sinistra rilancia il programma con i privilegi necessari. Per
+partire direttamente così c'è la casella «Avvia sempre come amministratore», subito sotto: a ogni avvio,
+anche con Windows, il programma chiede i privilegi e Windows mostra la sua richiesta di conferma; se la
+si rifiuta il programma si apre lo stesso, senza privilegi. Da un collegamento o dalla riga di comando si
+ottiene lo stesso con `mystoragetest --admin`.
 
-Per i dischi USB i comandi passano attraverso il bridge: SAT per i contenitori SATA, protocolli
-proprietari per i contenitori NVMe con bridge JMicron (JMS583/JMS581), Realtek (RTL9210) e ASMedia
-(ASM236x). I comandi proprietari vengono inviati solo ai bridge riconosciuti dal loro identificativo USB.
-Fra i bridge USB-NVMe solo JMicron inoltra il comando di avvio dell'autodiagnosi; Realtek e ASMedia
-inoltrano soltanto le letture.
+### Dischi USB
+
+Per i dischi USB i comandi passano attraverso il bridge, e ogni bridge ha il suo modo di inoltrarli. Alla
+prima lettura il programma cerca quello giusto, in quest'ordine, e lo ricorda per le letture successive:
+
+1. lo standard **SAT** (ATA PASS-THROUGH a 12 e a 16 byte), che parlano quasi tutti i bridge USB-SATA; se
+   il disco risponde ma ha lo SMART spento, il programma lo attiva;
+2. i protocolli dei vecchi bridge USB-SATA **JMicron** (JM2033x), **Cypress**, **Sunplus** e **Prolific**,
+   inviati solo ai bridge di quel produttore;
+3. i protocolli dei bridge USB-NVMe **JMicron** (JMS583/JMS581/JMS586), **Realtek** (RTL9210/9211/9220) e
+   **ASMedia** (ASM236x/ASM246x). Molti contenitori e SSD portatili montano un bridge ASMedia o Realtek
+   sotto il nome del proprio produttore: a un dispositivo di marca sconosciuta che si dichiara un SSD
+   vengono quindi provate anche queste due letture, e la risposta è accettata solo se ha esattamente la
+   forma di un registro NVMe;
+4. le pagine di registro **SCSI** standard (temperatura e previsione di guasto), per i dispositivi che non
+   parlano né ATA né NVMe.
+
+Alle chiavette e alle schede di memoria (supporti rimovibili) vanno solo i comandi SAT: di norma non hanno
+dati SMART e il programma lo dice, senza riprovare a ogni lettura. Se un disco non risponde in tempo la
+ricerca si ferma subito, invece di insistere con altri comandi. Fra i bridge USB-NVMe solo JMicron inoltra
+il comando di avvio dell'autodiagnosi; Realtek e ASMedia inoltrano soltanto le letture.
+
+«Rapporto di diagnosi», nella scheda SMART, scrive in `%LOCALAPPDATA%\myStorageTest\diagnosi-smart.txt` i
+comandi inviati a ogni disco e le risposte ricevute, e lo apre: serve a capire perché un disco o un bridge
+non restituisce i dati (`mystoragetest --diagnosi` fa lo stesso dalla riga di comando). Il rapporto del
+solo disco scelto si legge in fondo alla scheda Info.
+
+I formati dei comandi proprietari dei bridge sono quelli documentati dal progetto
+[smartmontools](https://www.smartmontools.org/).
 
 L'autodiagnosi degli NVMe interni passa dal driver di Windows, che accetta il comando da Windows 10 1903.
 
@@ -101,10 +155,13 @@ L'autodiagnosi degli NVMe interni passa dal driver di Windows, che accetta il co
 
 ```
 mystoragetest                     apre l'interfaccia
+mystoragetest --admin             apre l'interfaccia chiedendo a Windows i privilegi di amministratore
 mystoragetest --monitor           avvia nascosto nell'area di notifica, con il monitoraggio attivo
 mystoragetest --quit              chiude l'istanza in esecuzione
 mystoragetest --list              elenca volumi e dischi
+mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
 mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
+mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
 mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
 mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
 mystoragetest --selftest N breve|estesa|stop
@@ -124,8 +181,10 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
 `--test` esce con 0 se non ci sono errori, 1 con avvisi, 2 con errori, 3 se interrotto.
 
 «Avvia con Windows» nella pagina Monitoraggio registra `mystoragetest --monitor` per l'utente corrente.
-L'avvio automatico parte senza privilegi di amministratore: in quel caso lo SMART dei dischi USB non
-viene sorvegliato e per quei dischi restano gli errori del registro di sistema.
+L'avvio automatico parte senza privilegi di amministratore, a meno che sia spuntata «Avvia sempre come
+amministratore» (e allora all'accesso compare la richiesta di conferma di Windows): senza privilegi lo
+SMART dei dischi USB non viene sorvegliato e per quei dischi restano gli errori del registro di sistema.
+Il monitoraggio non sveglia i dischi fermi: per loro resta valida l'ultima lettura.
 
 ## Lettura veloce degli eventi
 
@@ -161,14 +220,20 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
 - fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato;
-- «Riavvia come amministratore»: la sequenza di chiusura e riapertura, provata senza elevazione;
-- SMART da amministratore di un SSD NVMe in contenitore USB con bridge JMicron (152D:0581): la lettura riesce (prova fatta a mano dall'interfaccia).
+- «Riavvia come amministratore» e l'avvio diretto da amministratore (`--admin` e «Avvia sempre come amministratore»): la sequenza di rilancio, provata senza elevazione;
+- SMART da amministratore di un SSD NVMe in contenitore USB con bridge JMicron (152D:0581): la lettura riesce (prova fatta a mano dall'interfaccia);
+- SMART da amministratore, dal «Rapporto di diagnosi»: due SATA interni con soglie e registro completo delle autodiagnosi; due dischi a piatti Seagate su USB (0BC2:3322 e 0BC2:61B7, UASP) con SAT a 12 byte, soglie, registro delle autodiagnosi e risposta alla domanda «il disco gira?»; lo stesso bridge JMicron senza un disco riconosciuto, che risponde a ogni comando con un errore dell'hardware e viene riportato come tale;
+- comandi diretti a due chiavette USB (una su UASP, una no), che Windows lascia passare anche senza privilegi: i comandi SAT partono, vengono rifiutati come previsto e le chiavette risultano senza SMART, senza altri tentativi;
+- scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
+- interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C).
 
 Non ancora verificato:
 
+- **collegamento SATA dentro un contenitore USB**: si legge solo da amministratore, attraverso il bridge;
+- **«Espelli»**: la richiesta a Windows è quella documentata per la rimozione sicura e il dispositivo a cui va è stato controllato, ma l'espulsione vera non è stata eseguita, per non scollegare i dischi in uso; l'espulsione del solo supporto (lettori con più alloggiamenti, supporti rimovibili non USB) non ha avuto un dispositivo su cui girare;
 - **avvio e interruzione dell'autodiagnosi**, su qualunque disco: richiedono l'amministratore; i comandi sono scritti secondo le specifiche NVMe e ATA e la documentazione di Windows, ma non sono stati eseguiti;
-- **registro completo delle autodiagnosi dei dischi SATA** e **autodiagnosi dei dischi USB**: richiedono l'amministratore;
-- **SMART dei dischi USB con bridge SAT, Realtek e ASMedia** e **SMART SATA con soglie**: richiedono l'amministratore; i comandi sono scritti secondo i protocolli documentati ma non sono stati eseguiti su hardware reale;
+- **SMART dei dischi USB con bridge Realtek e ASMedia, con i vecchi bridge JMicron, Cypress, Sunplus e Prolific** e **registri SCSI**: i comandi sono scritti secondo i protocolli documentati ma non c'era un dispositivo su cui eseguirli («Rapporto di diagnosi» serve proprio a controllarli);
+- **disco fermo lasciato stare**: la domanda al disco funziona, ma un disco davvero fermo durante una lettura periodica non è ancora stato osservato;
 - **scansione della superficie di un volume vero**: richiede l'amministratore; tutto il resto della scansione è stato provato leggendo un file al posto del volume;
 - avviso del monitoraggio per un'autodiagnosi fallita: non c'era un disco con una prova fallita;
 - storico delle temperature dei dischi USB;
@@ -185,6 +250,7 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 | File | Contenuto |
 |---|---|
 | `src/disks.rs` | elenco di volumi e dischi fisici, bridge USB |
+| `src/info.rs` | dati di dettaglio di volumi e dischi (partizioni, settori, collegamenti PCIe, SATA e USB) ed espulsione |
 | `src/tester.rs` | motore delle prove di I/O |
 | `src/errors.rs` | classificazione dei codici d'errore |
 | `src/smart.rs` | SMART e autodiagnosi (NVMe, ATA, pass-through USB) |

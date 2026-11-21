@@ -3,17 +3,25 @@
 //! Senza privilegi di amministratore si leggono i dischi NVMe interni (registro "SMART / Health"
 //! tramite IOCTL_STORAGE_QUERY_PROPERTY) e gli attributi dei dischi SATA interni
 //! (IOCTL_STORAGE_PREDICT_FAILURE, senza soglie). Da amministratore si aggiungono le soglie SATA e
-//! i dischi USB, passando i comandi attraverso il bridge (SAT, oppure i protocolli proprietari di
-//! JMicron, Realtek e ASMedia per i contenitori USB-NVMe).
+//! i dischi USB, passando i comandi attraverso il bridge: lo standard SAT per i bridge USB-SATA, i
+//! protocolli di JMicron, Realtek e ASMedia per i contenitori USB-NVMe, quelli dei vecchi bridge
+//! JMicron, Cypress, Sunplus e Prolific, e in mancanza d'altro le pagine di registro SCSI.
+//!
+//! I formati dei comandi proprietari sono quelli documentati dal progetto smartmontools.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::System::Ioctl::{
     StorageAdapterProtocolSpecificProperty, StorageDeviceProtocolSpecificProperty, StorageDeviceTemperatureProperty,
 };
+use windows_sys::Win32::System::Power::GetDevicePowerState;
 
-use crate::disks::{self, BUS_ATA, BUS_NVME, BUS_RAID, BUS_SATA, BUS_USB, IOCTL_STORAGE_QUERY_PROPERTY, PhysDisk};
-use crate::win::{self, Handle, rd_u16, rd_u32, rd_u64};
+use crate::disks::{self, BUS_ATA, BUS_NVME, BUS_SATA, IOCTL_STORAGE_QUERY_PROPERTY, PhysDisk};
+use crate::win::{self, Handle, rd_u16, rd_u32, rd_u64, thousands};
 
 const IOCTL_STORAGE_PREDICT_FAILURE: u32 = 0x002D_1100;
 const IOCTL_ATA_PASS_THROUGH: u32 = 0x0004_D02C;
@@ -160,18 +168,6 @@ impl SmartReport {
     }
 }
 
-fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
-        }
-        out.push(c);
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------------------------
 // NVMe
 // ---------------------------------------------------------------------------------------------
@@ -204,11 +200,16 @@ fn nvme_log_plausible(log: &[u8; 512]) -> bool {
 /// Dati NVMe letti attraverso il driver di Windows, senza privilegi. `property` distingue le
 /// richieste al controller da quelle al dispositivo; `data_type` 1 = Identify, 2 = registro.
 fn nvme_query(h: &Handle, property: u32, data_type: u32, value: u32, len: usize) -> Option<Vec<u8>> {
+    protocol_query(h, 3, property, data_type, value, len)
+}
+
+/// Richiesta specifica di un protocollo al driver di Windows: `protocol` 2 = ATA, 3 = NVMe.
+fn protocol_query(h: &Handle, protocol: u32, property: u32, data_type: u32, value: u32, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; 8 + 40 + len];
     let put = |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
     put(&mut buf, 0, property);
     put(&mut buf, 4, 0); // PropertyStandardQuery
-    put(&mut buf, 8, 3); // ProtocolTypeNvme
+    put(&mut buf, 8, protocol);
     put(&mut buf, 12, data_type);
     put(&mut buf, 16, value);
     put(&mut buf, 24, 40); // posizione dei dati rispetto alla struttura
@@ -580,7 +581,9 @@ fn ata_data_plausible(data: &[u8]) -> bool {
             ids.push(id);
         }
     }
-    ids.len() >= 4
+    // Pochi attributi (certi SSD ne hanno due o tre) bastano se la somma di controllo torna.
+    let checksum = data[..512].iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
+    ids.len() >= 4 || (!ids.is_empty() && checksum == 0)
 }
 
 fn ata_report(disk: u32, data: &[u8], thresholds: Option<&[u8]>, predict_failure: bool, method: &str) -> SmartReport {
@@ -622,7 +625,8 @@ fn ata_report(disk: u32, data: &[u8], thresholds: Option<&[u8]>, predict_failure
         let value = match kind {
             2 => {
                 let c = (raw & 0xFF) as i32;
-                if id == 194 || r.temperature.is_none() {
+                // Uno zero o un valore assurdo vuol dire che il disco non misura la temperatura.
+                if (1..=125).contains(&c) && (id == 194 || r.temperature.is_none()) {
                     r.temperature = Some(c);
                 }
                 if c >= 65 && level < Health::Warning {
@@ -661,6 +665,76 @@ fn ata_predict_failure(h: &Handle) -> Option<(bool, [u8; 512])> {
     ata_data_plausible(&data).then_some((rd_u32(&out, 0) != 0, data))
 }
 
+/// Registri di un comando ATA a 28 bit.
+#[derive(Clone, Copy, Debug, Default)]
+struct AtaCmd {
+    feature: u8,
+    count: u8,
+    lba_low: u8,
+    lba_mid: u8,
+    lba_high: u8,
+    command: u8,
+}
+
+impl AtaCmd {
+    const IDENTIFY: AtaCmd = AtaCmd {
+        feature: 0,
+        count: 1,
+        lba_low: 0,
+        lba_mid: 0,
+        lba_high: 0,
+        command: 0xEC,
+    };
+    /// Chiede al disco se sta girando, senza svegliarlo.
+    const CHECK_POWER_MODE: AtaCmd = AtaCmd {
+        feature: 0,
+        count: 0,
+        lba_low: 0,
+        lba_mid: 0,
+        lba_high: 0,
+        command: 0xE5,
+    };
+
+    /// Comando SMART (B0h), con la sua firma nei registri LBA.
+    fn smart(feature: u8, count: u8, lba_low: u8) -> AtaCmd {
+        AtaCmd {
+            feature,
+            count,
+            lba_low,
+            lba_mid: 0x4F,
+            lba_high: 0xC2,
+            command: 0xB0,
+        }
+    }
+
+    /// Dati SMART: gli attributi.
+    fn read_values() -> AtaCmd {
+        AtaCmd::smart(0xD0, 1, 0)
+    }
+
+    fn read_thresholds() -> AtaCmd {
+        AtaCmd::smart(0xD1, 1, 1)
+    }
+
+    /// Un settore del registro `log` (06h = prove di autodiagnosi, E0h = stato SCT).
+    fn read_log(log: u8) -> AtaCmd {
+        AtaCmd::smart(0xD5, 1, log)
+    }
+
+    /// Avvia o interrompe una prova di autodiagnosi (EXECUTE OFF-LINE IMMEDIATE).
+    fn self_test(code: u8) -> AtaCmd {
+        AtaCmd::smart(0xD4, 0, code)
+    }
+
+    /// Attiva lo SMART su un disco che lo ha ma lo tiene spento.
+    fn enable_smart() -> AtaCmd {
+        AtaCmd::smart(0xD8, 0, 1)
+    }
+}
+
+/// Secondi concessi a un comando ATA: un disco a piatti fermo deve prima rimettersi a girare.
+const ATA_TIMEOUT: u32 = 30;
+
 #[repr(C)]
 struct AtaPassThrough {
     length: u16,
@@ -683,27 +757,42 @@ struct AtaBuf {
     data: [u8; 512],
 }
 
-/// Comando SMART (B0h) attraverso il driver ATA di Windows. Con `read` legge un settore di dati;
-/// senza è un comando privo di dati (avvio o interruzione dell'autodiagnosi).
-fn ata_smart(h: &Handle, feature: u8, lba_low: u8, read: bool) -> Option<[u8; 512]> {
+/// Comando ATA attraverso il driver di Windows (dischi interni). Con `read` legge un settore di
+/// dati; senza è un comando privo di dati. Restituisce i dati e i registri del disco al ritorno:
+/// errore, conteggio, LBA basso, medio e alto, dispositivo, stato.
+fn ata_native(h: &Handle, cmd: AtaCmd, read: bool) -> Option<([u8; 512], [u8; 8])> {
     let mut buf: AtaBuf = unsafe { std::mem::zeroed() };
     buf.pt.length = size_of::<AtaPassThrough>() as u16;
     buf.pt.ata_flags = if read { 0x01 | 0x02 } else { 0x01 }; // DRDY richiesto, dati in ingresso
     buf.pt.data_transfer_length = if read { 512 } else { 0 };
-    buf.pt.timeout = 5;
+    buf.pt.timeout = ATA_TIMEOUT;
     buf.pt.data_buffer_offset = offset_of!(AtaBuf, data);
-    buf.pt.current = [feature, read as u8, lba_low, 0x4F, 0xC2, 0xA0, 0xB0, 0];
+    buf.pt.current = [
+        cmd.feature,
+        cmd.count,
+        cmd.lba_low,
+        cmd.lba_mid,
+        cmd.lba_high,
+        0xA0,
+        cmd.command,
+        0,
+    ];
     let bytes = unsafe { std::slice::from_raw_parts_mut(&mut buf as *mut AtaBuf as *mut u8, size_of::<AtaBuf>()) };
-    win::ioctl_inout(h, IOCTL_ATA_PASS_THROUGH, bytes).ok()?;
-    // Al ritorno `current` contiene i registri del disco: il bit 0 dello stato segnala un errore.
-    if buf.pt.current[6] & 0x01 != 0 {
+    let result = win::ioctl_inout(h, IOCTL_ATA_PASS_THROUGH, bytes);
+    let regs = buf.pt.current;
+    trace(|| {
+        let what = format!("ATA {:02X}h/{:02X}h dal driver di Windows", cmd.command, cmd.feature);
+        match result {
+            Ok(_) => format!("{what} → registri al ritorno {}", hex(&regs[..7])),
+            Err(code) => format!("{what} → errore di Windows {code} ({})", win::error_text(code)),
+        }
+    });
+    result.ok()?;
+    // Il bit 0 dello stato segnala un errore.
+    if regs[6] & 0x01 != 0 {
         return None;
     }
-    Some(buf.data)
-}
-
-fn ata_smart_read(h: &Handle, feature: u8) -> Option<[u8; 512]> {
-    ata_smart(h, feature, 1, true)
+    Some((buf.data, regs))
 }
 
 fn ata_selftest_kind(number: u8) -> &'static str {
@@ -806,7 +895,38 @@ fn ata_selftest(data: &[u8], log: Option<&[u8; 512]>) -> SelfTest {
 }
 
 // ---------------------------------------------------------------------------------------------
-// SCSI pass-through (dischi USB)
+// Traccia per la diagnosi
+// ---------------------------------------------------------------------------------------------
+
+thread_local! {
+    /// Quando c'è, raccoglie una riga per ogni comando inviato e per ogni decisione presa.
+    static TRACE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// Il dispositivo ha smesso di rispondere: in questa lettura non gli si invia altro.
+    static STUCK: Cell<bool> = const { Cell::new(false) };
+    /// Perché è fallito l'ultimo comando SCSI.
+    static LAST_FAIL: Cell<Option<ScsiFail>> = const { Cell::new(None) };
+    /// Il disco ha risposto a un comando ATA (IDENTIFY) attraverso il bridge.
+    static ATA_ANSWERED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn tracing() -> bool {
+    TRACE.with(|t| t.borrow().is_some())
+}
+
+fn trace(line: impl FnOnce() -> String) {
+    TRACE.with(|t| {
+        if let Some(lines) = t.borrow_mut().as_mut() {
+            lines.push(line());
+        }
+    });
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+}
+
+// ---------------------------------------------------------------------------------------------
+// SCSI pass-through (dischi USB, controller SAS e RAID)
 // ---------------------------------------------------------------------------------------------
 
 #[repr(C)]
@@ -841,10 +961,75 @@ enum Dir {
     None,
 }
 
-/// Invia un comando SCSI al dispositivo e restituisce i dati ricevuti (per i comandi in ingresso).
-fn scsi(h: &Handle, cdb: &[u8], dir: Dir, payload: &[u8], len: usize) -> Option<Vec<u8>> {
+/// Perché un comando SCSI non ha dato dati.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScsiFail {
+    /// Il dispositivo ha risposto rifiutando il comando.
+    Rejected { status: u8, key: u8, asc: u8, ascq: u8 },
+    /// Il comando non è arrivato o non ha avuto risposta: codice d'errore di Windows.
+    Io(u32),
+}
+
+struct ScsiReply {
+    data: Vec<u8>,
+    sense: [u8; 32],
+}
+
+/// Chiave, codice e qualificatore dai dati di errore SCSI (0xFF se non ci sono).
+fn sense_codes(sense: &[u8; 32]) -> (u8, u8, u8) {
+    match sense[0] & 0x7F {
+        0x72 | 0x73 => (sense[1] & 0x0F, sense[2], sense[3]),
+        0x70 | 0x71 => (sense[2] & 0x0F, sense[12], sense[13]),
+        _ => (0xFF, 0, 0),
+    }
+}
+
+/// Secondi concessi ai comandi che non devono aspettare l'avvio del motore.
+const SCSI_TIMEOUT: u32 = 8;
+const ERROR_SEM_TIMEOUT: u32 = 121;
+
+/// Invia un comando SCSI al dispositivo. Con `ata_sense` accetta come riuscito anche lo stato
+/// «CHECK CONDITION» senza errore vero, con cui i bridge SAT restituiscono i registri ATA.
+#[allow(clippy::too_many_arguments)]
+fn scsi_exec(
+    h: &Handle,
+    what: &str,
+    cdb: &[u8],
+    dir: Dir,
+    payload: &[u8],
+    len: usize,
+    timeout: u32,
+    ata_sense: bool,
+) -> Result<ScsiReply, ScsiFail> {
+    match scsi_once(h, what, cdb, dir, payload, len, timeout, ata_sense) {
+        // «UNIT ATTENTION»: il dispositivo avvisa di un cambiamento (appena collegato, appena
+        // ripartito) e scarta il comando, che va soltanto ripetuto.
+        Err(ScsiFail::Rejected { key: 6, .. }) => scsi_once(h, what, cdb, dir, payload, len, timeout, ata_sense),
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scsi_once(
+    h: &Handle,
+    what: &str,
+    cdb: &[u8],
+    dir: Dir,
+    payload: &[u8],
+    len: usize,
+    timeout: u32,
+    ata_sense: bool,
+) -> Result<ScsiReply, ScsiFail> {
+    LAST_FAIL.set(None);
+    let fail = |f: ScsiFail| {
+        LAST_FAIL.set(Some(f));
+        Err(f)
+    };
+    if STUCK.get() {
+        return fail(ScsiFail::Io(ERROR_SEM_TIMEOUT));
+    }
     if cdb.len() > 16 || len > 4096 || payload.len() > 4096 {
-        return None;
+        return fail(ScsiFail::Io(87));
     }
     let mut buf: Box<ScsiBuf> = Box::new(unsafe { std::mem::zeroed() });
     buf.pt.length = size_of::<ScsiPassThrough>() as u16;
@@ -856,7 +1041,7 @@ fn scsi(h: &Handle, cdb: &[u8], dir: Dir, payload: &[u8], len: usize) -> Option<
         Dir::None => 2,
     };
     buf.pt.data_transfer_length = len as u32;
-    buf.pt.timeout = 8;
+    buf.pt.timeout = timeout;
     buf.pt.data_buffer_offset = offset_of!(ScsiBuf, data);
     buf.pt.sense_info_offset = offset_of!(ScsiBuf, sense) as u32;
     buf.pt.cdb[..cdb.len()].copy_from_slice(cdb);
@@ -864,61 +1049,407 @@ fn scsi(h: &Handle, cdb: &[u8], dir: Dir, payload: &[u8], len: usize) -> Option<
         buf.data[..payload.len()].copy_from_slice(payload);
     }
     let bytes = unsafe { std::slice::from_raw_parts_mut(&mut *buf as *mut ScsiBuf as *mut u8, size_of::<ScsiBuf>()) };
-    win::ioctl_inout(h, IOCTL_SCSI_PASS_THROUGH, bytes).ok()?;
-    if buf.pt.scsi_status != 0 {
-        return None;
+    let started = Instant::now();
+    let result = win::ioctl_inout(h, IOCTL_SCSI_PASS_THROUGH, bytes);
+    let elapsed = started.elapsed();
+    let status = buf.pt.scsi_status;
+    let (key, asc, ascq) = sense_codes(&buf.sense);
+    let outcome = match result {
+        Err(code) => {
+            // Senza risposta in tempo, o dispositivo non pronto o sparito: insistere con altri
+            // comandi è inutile e fa solo ripartire il bridge.
+            if matches!(code, 21 | 55 | ERROR_SEM_TIMEOUT | 433 | 1167) || elapsed >= Duration::from_secs(5) {
+                STUCK.set(true);
+            }
+            Err(ScsiFail::Io(code))
+        }
+        Ok(_) if status == 0 => Ok(()),
+        Ok(_) if ata_sense && status == 2 && key <= 1 => Ok(()),
+        Ok(_) => Err(ScsiFail::Rejected { status, key, asc, ascq }),
+    };
+    trace(|| {
+        let text = match outcome {
+            Ok(()) => {
+                let extra = if status != 0 {
+                    format!(" (con registri di ritorno, chiave {key:X}h {asc:02X}/{ascq:02X})")
+                } else {
+                    String::new()
+                };
+                if dir == Dir::In && len > 0 {
+                    format!("ok, {len} byte: {} …{extra}", hex(&buf.data[..len.min(16)]))
+                } else {
+                    format!("ok{extra}")
+                }
+            }
+            Err(ScsiFail::Rejected { .. }) => {
+                format!("rifiutato (stato {status:02X}h, chiave {key:X}h, codice {asc:02X}/{ascq:02X})")
+            }
+            Err(ScsiFail::Io(code)) => format!("errore di Windows {code} ({})", win::error_text(code)),
+        };
+        format!("{what}: [{}] → {text}  [{} ms]", hex(cdb), elapsed.as_millis())
+    });
+    match outcome {
+        Ok(()) => Ok(ScsiReply {
+            data: buf.data[..len].to_vec(),
+            sense: buf.sense,
+        }),
+        Err(f) => fail(f),
     }
-    Some(buf.data[..len].to_vec())
 }
 
-/// Comando SMART attraverso un bridge USB-SATA (ATA PASS-THROUGH dello standard SAT, a 12 e poi a
-/// 16 byte). Con `read` legge un settore di dati; senza è un comando privo di dati.
-fn sat_smart(h: &Handle, feature: u8, lba_low: u8, read: bool) -> Option<[u8; 512]> {
-    if read {
-        let cdb12 = [0xA1, 4 << 1, 0x0E, feature, 1, lba_low, 0x4F, 0xC2, 0, 0xB0, 0, 0];
-        let cdb16 = [0x85, 4 << 1, 0x0E, 0, feature, 0, 1, 0, lba_low, 0, 0x4F, 0, 0xC2, 0, 0xB0, 0];
-        let data = scsi(h, &cdb12, Dir::In, &[], 512).or_else(|| scsi(h, &cdb16, Dir::In, &[], 512))?;
-        data.try_into().ok()
+/// Comando SCSI semplice: i dati ricevuti (per i comandi in ingresso), o niente se non è riuscito.
+fn scsi(h: &Handle, what: &str, cdb: &[u8], dir: Dir, payload: &[u8], len: usize) -> Option<Vec<u8>> {
+    scsi_exec(h, what, cdb, dir, payload, len, SCSI_TIMEOUT, false)
+        .ok()
+        .map(|r| r.data)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Comandi ATA attraverso un bridge
+// ---------------------------------------------------------------------------------------------
+
+/// Per quale strada un comando ATA arriva al disco.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtaVia {
+    /// Driver ATA di Windows: dischi interni.
+    Native,
+    /// ATA PASS-THROUGH dello standard SAT, a 12 e a 16 byte: quasi tutti i bridge USB-SATA.
+    Sat12,
+    Sat16,
+    /// Vecchi bridge JMicron (JM2033x) e, con `prolific`, Prolific PL2507/PL3507.
+    Jmicron { port: u8, prolific: bool },
+    /// Cypress CY7C68300 (ATACB).
+    Cypress,
+    /// Sunplus SPIF215/225.
+    Sunplus,
+    /// Prolific PL2571/2771/2773/2775.
+    Prolific,
+}
+
+impl AtaVia {
+    fn label(self, usb: bool) -> &'static str {
+        match self {
+            AtaVia::Native => "ATA pass-through",
+            AtaVia::Sat12 | AtaVia::Sat16 if usb => "Bridge USB (SAT)",
+            AtaVia::Sat12 | AtaVia::Sat16 => "Controller SCSI (SAT)",
+            AtaVia::Jmicron { prolific: false, .. } => "Bridge USB JMicron (protocollo proprio)",
+            AtaVia::Jmicron { prolific: true, .. } | AtaVia::Prolific => "Bridge USB Prolific (protocollo proprio)",
+            AtaVia::Cypress => "Bridge USB Cypress (protocollo proprio)",
+            AtaVia::Sunplus => "Bridge USB Sunplus (protocollo proprio)",
+        }
+    }
+}
+
+/// CDB di ATA PASS-THROUGH (SAT) per un comando a 28 bit: senza dati oppure con un settore in
+/// ingresso. Con `ck_cond` il bridge restituisce i registri del disco nei dati di errore.
+fn sat_cdb(wide: bool, cmd: AtaCmd, read: bool, ck_cond: bool) -> Vec<u8> {
+    // Protocollo 4 = PIO con dati in ingresso, 3 = nessun dato.
+    let protocol: u8 = if read { 4 } else { 3 };
+    // Direzione dal dispositivo, lunghezza in blocchi, numero di blocchi nel registro del conteggio.
+    let flags: u8 = ((ck_cond as u8) << 5) | (1 << 3) | (1 << 2) | if read { 2 } else { 0 };
+    if wide {
+        vec![
+            0x85,
+            protocol << 1,
+            flags,
+            0,
+            cmd.feature,
+            0,
+            cmd.count,
+            0,
+            cmd.lba_low,
+            0,
+            cmd.lba_mid,
+            0,
+            cmd.lba_high,
+            0,
+            cmd.command,
+            0,
+        ]
     } else {
-        // Protocollo 3: nessun dato.
-        let cdb12 = [0xA1, 3 << 1, 0x00, feature, 0, lba_low, 0x4F, 0xC2, 0, 0xB0, 0, 0];
-        let cdb16 = [0x85, 3 << 1, 0x00, 0, feature, 0, 0, 0, lba_low, 0, 0x4F, 0, 0xC2, 0, 0xB0, 0];
-        scsi(h, &cdb12, Dir::None, &[], 0).or_else(|| scsi(h, &cdb16, Dir::None, &[], 0))?;
-        Some([0u8; 512])
+        vec![
+            0xA1,
+            protocol << 1,
+            flags,
+            cmd.feature,
+            cmd.count,
+            cmd.lba_low,
+            cmd.lba_mid,
+            cmd.lba_high,
+            0,
+            cmd.command,
+            0,
+            0,
+        ]
     }
 }
 
-fn sat_smart_read(h: &Handle, feature: u8) -> Option<[u8; 512]> {
-    sat_smart(h, feature, 0, true)
+/// Registri ATA restituiti da un bridge SAT nei dati di errore: conteggio e stato.
+fn sat_registers(sense: &[u8; 32]) -> Option<(u8, u8)> {
+    match sense[0] & 0x7F {
+        // Formato a descrittori: si cerca quello di ritorno ATA (09h).
+        0x72 | 0x73 => {
+            let end = (8 + sense[7] as usize).min(sense.len());
+            let mut at = 8;
+            while at + 14 <= end {
+                if sense[at] == 0x09 {
+                    return Some((sense[at + 5], sense[at + 13]));
+                }
+                at += 2 + sense[at + 1] as usize;
+            }
+            None
+        }
+        // Formato fisso, valido solo con il codice «informazioni ATA disponibili» (00/1D).
+        0x70 | 0x71 if sense[12] == 0x00 && sense[13] == 0x1D => Some((sense[6], sense[4])),
+        _ => None,
+    }
 }
 
-/// Contenitori USB-NVMe con bridge Realtek RTL9210/RTL9211: registro `lid`, al massimo 512 byte
-/// (oltre, il bridge restituisce dati vecchi). Inoltra solo Identify e Get Log Page.
-fn realtek_nvme_log(h: &Handle, lid: u8) -> Option<Vec<u8>> {
+/// Invia un comando ATA per la strada indicata. Con `read` restituisce il settore letto; senza,
+/// un settore vuoto se il comando è stato accettato.
+fn ata_io(h: &Handle, via: AtaVia, cmd: AtaCmd, read: bool) -> Option<[u8; 512]> {
+    let (dir, len) = if read { (Dir::In, 512usize) } else { (Dir::None, 0) };
+    let sector = |data: Vec<u8>| -> Option<[u8; 512]> {
+        if read {
+            data.try_into().ok()
+        } else {
+            Some([0u8; 512])
+        }
+    };
+    match via {
+        AtaVia::Native => ata_native(h, cmd, read).map(|r| r.0),
+        AtaVia::Sat12 | AtaVia::Sat16 => {
+            let wide = via == AtaVia::Sat16;
+            let what = if wide { "SAT a 16 byte" } else { "SAT a 12 byte" };
+            let cdb = sat_cdb(wide, cmd, read, false);
+            sector(scsi_exec(h, what, &cdb, dir, &[], len, ATA_TIMEOUT, true).ok()?.data)
+        }
+        AtaVia::Jmicron { port, prolific } => {
+            let mut cdb = vec![
+                0xDF,
+                0x10,
+                0x00,
+                (len >> 8) as u8,
+                len as u8,
+                cmd.feature,
+                cmd.count,
+                cmd.lba_low,
+                cmd.lba_mid,
+                cmd.lba_high,
+                if port == 0 { 0xA0 } else { 0xB0 },
+                cmd.command,
+            ];
+            if prolific {
+                cdb.extend([0x06, 0x7B]);
+            }
+            sector(scsi(h, "JMicron ATA", &cdb, dir, &[], len)?)
+        }
+        AtaVia::Cypress => {
+            // Byte 3: registri validi (funzioni, conteggio, LBA e comando); byte 4: blocchi da 512.
+            let identify = if cmd.command == 0xEC { 0x80 } else { 0x00 };
+            let cdb = [
+                0x24,
+                0x24,
+                identify,
+                0xBE,
+                1,
+                0,
+                cmd.feature,
+                cmd.count,
+                cmd.lba_low,
+                cmd.lba_mid,
+                cmd.lba_high,
+                0,
+                cmd.command,
+                0,
+                0,
+                0,
+            ];
+            sector(scsi(h, "Cypress ATA", &cdb, dir, &[], len)?)
+        }
+        AtaVia::Sunplus => {
+            let cdb = [
+                0xF8,
+                0x00,
+                0x22,
+                if read { 0x10 } else { 0x00 },
+                (len >> 9) as u8,
+                cmd.feature,
+                cmd.count,
+                cmd.lba_low,
+                cmd.lba_mid,
+                cmd.lba_high,
+                0xA0,
+                cmd.command,
+            ];
+            sector(scsi(h, "Sunplus ATA", &cdb, dir, &[], len)?)
+        }
+        AtaVia::Prolific => {
+            let size = (len as u32).to_be_bytes();
+            let cdb = [
+                0xD8,
+                0x15,
+                0x00,
+                cmd.feature,
+                0x06,
+                0x7B,
+                size[0],
+                size[1],
+                size[2],
+                size[3],
+                cmd.count,
+                cmd.lba_low,
+                cmd.lba_mid,
+                cmd.lba_high,
+                0xA0,
+                cmd.command,
+            ];
+            sector(scsi(h, "Prolific ATA", &cdb, dir, &[], len)?)
+        }
+    }
+}
+
+/// Stato di alimentazione dichiarato dal disco (CHECK POWER MODE), senza svegliarlo: 00h e 01h =
+/// fermo, 80h = inattivo, FFh = in funzione. `None` se il collegamento non riporta la risposta.
+fn ata_power_mode(h: &Handle, via: AtaVia) -> Option<u8> {
+    // Stato plausibile: pronto, non occupato, senza errore.
+    let ready = |status: u8| status & 0xC1 == 0x40;
+    match via {
+        AtaVia::Native => {
+            let (_, regs) = ata_native(h, AtaCmd::CHECK_POWER_MODE, false)?;
+            ready(regs[6]).then_some(regs[1])
+        }
+        AtaVia::Sat12 | AtaVia::Sat16 => {
+            let cdb = sat_cdb(via == AtaVia::Sat16, AtaCmd::CHECK_POWER_MODE, false, true);
+            let reply = scsi_exec(h, "SAT: il disco gira?", &cdb, Dir::None, &[], 0, SCSI_TIMEOUT, true).ok()?;
+            let (count, status) = sat_registers(&reply.sense)?;
+            ready(status).then_some(count)
+        }
+        // I vecchi protocolli proprietari non riportano i registri in modo affidabile.
+        _ => None,
+    }
+}
+
+/// Vero se il disco dichiara di essere fermo.
+fn standing_by(mode: Option<u8>) -> bool {
+    matches!(mode, Some(0x00 | 0x01 | 0x40))
+}
+
+/// Su quale porta di un vecchio bridge JMicron è collegato il disco.
+fn jmicron_port(h: &Handle, prolific: bool) -> Option<u8> {
+    // Lettura di un byte dal registro 720Fh del bridge.
+    let mut cdb = vec![0xDF, 0x10, 0x00, 0x00, 0x01, 0x00, 0x72, 0x0F, 0x00, 0x00, 0x00, 0xFD];
+    if prolific {
+        cdb.extend([0x06, 0x7B]);
+    }
+    let data = scsi(h, "JMicron: porta del disco", &cdb, Dir::In, &[], 1)?;
+    match data[0] & 0x44 {
+        0x04 | 0x44 => Some(0),
+        0x40 => Some(1),
+        _ => None,
+    }
+}
+
+/// SMART di un disco ATA per la strada indicata. `None` se quella strada non porta i comandi al
+/// disco, o se il disco non ha lo SMART.
+fn ata_read(disk: &PhysDisk, h: &Handle, via: AtaVia, predict: bool) -> Option<SmartReport> {
+    let values = || ata_io(h, via, AtaCmd::read_values(), true).filter(|d| ata_data_plausible(d));
+    LAST_FAIL.set(None);
+    let mut method = via.label(disk.is_usb()).to_string();
+    let data = match values() {
+        Some(data) => data,
+        None => {
+            // Un bridge che non conosce il comando, che non risponde o che segnala un guasto non
+            // va interrogato oltre. Se invece è il disco ad averlo respinto («ABORTED COMMAND»), o
+            // se la risposta non ha senso, può darsi che abbia lo SMART spento.
+            let unknown = match LAST_FAIL.get() {
+                Some(ScsiFail::Rejected { key, .. }) => key != 0x0B,
+                Some(ScsiFail::Io(_)) => true,
+                None => false,
+            };
+            if unknown || STUCK.get() {
+                return None;
+            }
+            let id = ata_io(h, via, AtaCmd::IDENTIFY, true)?;
+            // Parola 83: i bit 15 e 14 valgono 0 e 1 quando i dati sono validi.
+            if rd_u16(&id, 166) & 0xC000 != 0x4000 {
+                trace(|| "IDENTIFY DEVICE: la risposta non ha la forma attesa".into());
+                return None;
+            }
+            let (supported, enabled) = (rd_u16(&id, 164) & 1 != 0, rd_u16(&id, 170) & 1 != 0);
+            trace(|| format!("IDENTIFY DEVICE: SMART presente = {supported}, attivo = {enabled}"));
+            // Dietro il bridge c'è un disco ATA che risponde: è lo SMART a mancare.
+            ATA_ANSWERED.set(true);
+            if !supported || enabled {
+                return None;
+            }
+            ata_io(h, via, AtaCmd::enable_smart(), false)?;
+            method.push_str(" · SMART attivato ora");
+            values()?
+        }
+    };
+    let thresholds = ata_io(h, via, AtaCmd::read_thresholds(), true);
+    let mut r = ata_report(
+        disk.number,
+        &data,
+        thresholds.as_ref().map(|t| &t[..]),
+        predict,
+        &method,
+    );
+    // Registro delle prove (06h), con il comando SMART READ LOG.
+    let tests = ata_io(h, via, AtaCmd::read_log(0x06), true);
+    r.set_selftest(ata_selftest(&data, tests.as_ref()));
+    if r.temperature.is_none() {
+        // Dischi senza l'attributo della temperatura: la riporta lo stato SCT (registro E0h).
+        let sct = ata_io(h, via, AtaCmd::read_log(0xE0), true);
+        if let Some(t) = sct.filter(|s| matches!(rd_u16(s, 0), 2 | 3)).map(|s| s[200] as i8 as i32) {
+            if (1..=125).contains(&t) {
+                r.temperature = Some(t);
+                r.push(
+                    "",
+                    "Temperatura",
+                    format!("{t} °C"),
+                    "dallo stato SCT del disco".into(),
+                    if t >= 65 { Health::Warning } else { Health::Unknown },
+                );
+            }
+        }
+    }
+    Some(r)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Comandi NVMe attraverso un bridge USB
+// ---------------------------------------------------------------------------------------------
+
+const FORWARD_ONLY_READS: &str =
+    "Il bridge USB di questo contenitore inoltra solo le letture: l'autodiagnosi non si può avviare da qui.";
+
+/// Contenitori USB-NVMe con bridge Realtek RTL9210/RTL9211/RTL9220: inoltra solo Identify e Get
+/// Log Page, e del registro al massimo 512 byte (oltre, restituisce dati vecchi).
+fn realtek_nvme(h: &Handle, opcode: u8, low: u8, len: usize) -> Option<Vec<u8>> {
     let mut cdb = [0u8; 16];
     cdb[0] = 0xE4;
-    cdb[1] = 0x00; // lunghezza 512, little endian
-    cdb[2] = 0x02;
-    cdb[3] = 0x02; // comando Get Log Page
-    cdb[4] = lid;
-    scsi(h, &cdb, Dir::In, &[], 512)
+    cdb[1] = len as u8; // lunghezza in byte, little endian
+    cdb[2] = (len >> 8) as u8;
+    cdb[3] = opcode;
+    cdb[4] = low; // byte basso di CDW10: registro o tipo di Identify
+    scsi(h, "Realtek NVMe", &cdb, Dir::In, &[], len)
 }
 
-/// Contenitori USB-NVMe con bridge ASMedia ASM236x: registro `lid` di `len` byte.
-/// Inoltra solo Identify e Get Log Page.
-fn asmedia_nvme_log(h: &Handle, lid: u8, len: usize) -> Option<Vec<u8>> {
-    let dwords = (len / 4).checked_sub(1)?;
+/// Contenitori USB-NVMe con bridge ASMedia ASM236x/ASM246x: inoltra solo Identify e Get Log Page.
+fn asmedia_nvme(h: &Handle, opcode: u8, cdw10: u32, len: usize) -> Option<Vec<u8>> {
     let mut cdb = [0u8; 16];
     cdb[0] = 0xE6;
-    cdb[1] = 0x02; // comando Get Log Page
-    cdb[3] = lid;
-    cdb[6] = (dwords >> 8) as u8; // numero di doppie parole meno uno
-    cdb[7] = dwords as u8;
-    scsi(h, &cdb, Dir::In, &[], len)
+    cdb[1] = opcode;
+    cdb[3] = cdw10 as u8;
+    cdb[6] = (cdw10 >> 24) as u8; // metà alta di CDW10: numero di doppie parole meno uno
+    cdb[7] = (cdw10 >> 16) as u8;
+    scsi(h, "ASMedia NVMe", &cdb, Dir::In, &[], len)
 }
 
-/// Contenitori USB-NVMe con bridge JMicron JMS583/JMS581: un comando NVMe di amministrazione in tre
-/// passi (comando, dati, risposta). Con `len` zero il comando non ha dati.
+/// Contenitori USB-NVMe con bridge JMicron JMS583/JMS581/JMS586: un comando NVMe di amministrazione
+/// in tre passi (comando, dati, risposta). Con `len` zero il comando non ha dati.
 fn jmicron_admin(h: &Handle, opcode: u8, nsid: u32, cdw10: u32, len: usize) -> Option<Vec<u8>> {
     const SIGNATURE: u32 = 0x454D_564E; // "NVME"
     let mut cmd = [0u8; 512];
@@ -937,23 +1468,67 @@ fn jmicron_admin(h: &Handle, opcode: u8, nsid: u32, cdw10: u32, len: usize) -> O
         cdb[5] = len as u8;
         cdb
     };
-    scsi(h, &step(0x00, 512), Dir::Out, &cmd, 512)?;
+    scsi(h, "JMicron NVMe: comando", &step(0x00, 512), Dir::Out, &cmd, 512)?;
     let data = if len > 0 {
-        scsi(h, &step(0x02, len), Dir::In, &[], len)?
+        scsi(h, "JMicron NVMe: dati", &step(0x02, len), Dir::In, &[], len)?
     } else {
-        scsi(h, &step(0x01, 0), Dir::None, &[], 0)?
+        scsi(h, "JMicron NVMe: nessun dato", &step(0x01, 0), Dir::None, &[], 0)?
     };
-    let reply = scsi(h, &step(0x0F, 512), Dir::In, &[], 512)?;
+    let reply = scsi(h, "JMicron NVMe: risposta", &step(0x0F, 512), Dir::In, &[], 512)?;
     if rd_u32(&reply, 0) != SIGNATURE || (rd_u32(&reply, 20) >> 17) != 0 {
+        trace(|| "JMicron NVMe: la risposta non porta la firma attesa, o il disco segnala un errore".into());
         return None;
     }
     Some(data)
 }
 
-/// Registro NVMe `lid` di `len` byte attraverso un bridge JMicron.
-fn jmicron_nvme_log(h: &Handle, lid: u8, len: usize) -> Option<Vec<u8>> {
-    let dwords = (len / 4).checked_sub(1)? as u32;
-    jmicron_admin(h, 0x02, 0xFFFF_FFFF, (dwords << 16) | lid as u32, len)
+/// Quale protocollo proprietario porta i comandi NVMe attraverso il bridge USB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NvmeVia {
+    Jmicron,
+    Realtek,
+    Asmedia,
+}
+
+impl NvmeVia {
+    fn label(self) -> &'static str {
+        match self {
+            NvmeVia::Jmicron => "Bridge USB-NVMe JMicron",
+            NvmeVia::Realtek => "Bridge USB-NVMe Realtek",
+            NvmeVia::Asmedia => "Bridge USB-NVMe ASMedia",
+        }
+    }
+
+    /// Registro NVMe `lid`, di `len` byte.
+    fn log(self, h: &Handle, lid: u8, len: usize) -> Option<Vec<u8>> {
+        let cdw10 = (((len / 4).checked_sub(1)? as u32) << 16) | lid as u32;
+        match self {
+            NvmeVia::Jmicron => jmicron_admin(h, 0x02, 0xFFFF_FFFF, cdw10, len),
+            NvmeVia::Realtek => realtek_nvme(h, 0x02, lid, len.min(512)),
+            NvmeVia::Asmedia => asmedia_nvme(h, 0x02, cdw10, len),
+        }
+    }
+
+    /// Identify Controller; scartato se non ha la forma attesa.
+    fn identify(self, h: &Handle) -> Option<Vec<u8>> {
+        let id = match self {
+            NvmeVia::Jmicron => jmicron_admin(h, 0x06, 0, 1, 4096),
+            NvmeVia::Realtek => realtek_nvme(h, 0x06, 1, 4096),
+            NvmeVia::Asmedia => asmedia_nvme(h, 0x06, 1, 4096),
+        }?;
+        // Il nome del modello (byte 24–63) è testo.
+        id[24..64].iter().all(|b| (0x20..0x7F).contains(b)).then_some(id)
+    }
+
+    /// Quanti byte del registro delle prove si possono chiedere: JMicron si blocca oltre 536
+    /// (19 prove), Realtek ne dà 512.
+    fn tests_len(self) -> usize {
+        match self {
+            NvmeVia::Jmicron => 536,
+            NvmeVia::Realtek => 512,
+            NvmeVia::Asmedia => NVME_SELFTEST_LOG,
+        }
+    }
 }
 
 /// Registro "SMART / Health" (02h) da uno dei bridge, scartando le risposte senza senso.
@@ -962,14 +1537,344 @@ fn health_log(data: Option<Vec<u8>>) -> Option<[u8; 512]> {
     nvme_log_plausible(&log).then_some(log)
 }
 
-/// Bridge USB-NVMe conosciuti: i comandi proprietari si inviano solo a questi.
-fn usb_nvme_bridge(vid: u16, pid: u16) -> Option<&'static str> {
-    match (vid, pid) {
-        (0x152D, 0x0583 | 0xA583 | 0x0581 | 0x0586 | 0x0562 | 0x1581) => Some("jmicron"),
-        (0x0BDA, 0x9210 | 0x9211 | 0x9220 | 0x9201) => Some("realtek"),
-        (0x174C, 0x2362 | 0x2364 | 0x2463 | 0x2464 | 0x1362) => Some("asmedia"),
-        _ => None,
+/// SMART di un disco NVMe dentro un contenitore USB. Con `strict` (bridge di marca sconosciuta,
+/// interrogato per tentativi) la risposta deve anche avere a zero i byte riservati.
+fn nvme_bridge_read(disk: &PhysDisk, h: &Handle, via: NvmeVia, strict: bool) -> Option<SmartReport> {
+    let log = health_log(via.log(h, 0x02, 512))?;
+    if strict && log[7..32].iter().any(|b| *b != 0) {
+        trace(|| "risposta scartata: non ha la forma di un registro NVMe".into());
+        return None;
     }
+    let identify = via.identify(h);
+    let tests = via.log(h, 0x06, via.tests_len());
+    let mut st = nvme_selftest(identify.as_deref(), tests.as_deref());
+    if via != NvmeVia::Jmicron && st.supported {
+        st.cannot_start = FORWARD_ONLY_READS.into();
+    }
+    let mut r = nvme_report(disk.number, &log, via.label());
+    r.set_selftest(st);
+    Some(r)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Registri SCSI (dispositivi che non parlano né ATA né NVMe)
+// ---------------------------------------------------------------------------------------------
+
+/// Pagina di registro SCSI (LOG SENSE), valori correnti.
+fn log_sense(h: &Handle, page: u8, len: usize) -> Option<Vec<u8>> {
+    let cdb = [0x4D, 0, 0x40 | page, 0, 0, 0, 0, (len >> 8) as u8, len as u8, 0];
+    let data = scsi(h, "LOG SENSE", &cdb, Dir::In, &[], len)?;
+    (data[0] & 0x3F == page).then_some(data)
+}
+
+/// Parametri di una pagina di registro SCSI: codice e dati di ciascuno.
+fn log_params(page: &[u8]) -> Vec<(u16, &[u8])> {
+    let end = (4 + u16::from_be_bytes([page[2], page[3]]) as usize).min(page.len());
+    let mut out = Vec::new();
+    let mut at = 4;
+    while at + 4 <= end {
+        let len = page[at + 3] as usize;
+        let Some(data) = page.get(at + 4..at + 4 + len) else { break };
+        out.push((u16::from_be_bytes([page[at], page[at + 1]]), data));
+        at += 4 + len;
+    }
+    out
+}
+
+/// Temperatura e previsione di guasto dalle pagine di registro SCSI standard (0Dh e 2Fh).
+fn scsi_log_report(disk: &PhysDisk, h: &Handle) -> Option<SmartReport> {
+    let pages = log_sense(h, 0x00, 64)?;
+    let count = (u16::from_be_bytes([pages[2], pages[3]]) as usize).min(60);
+    let listed = &pages[4..4 + count];
+    let valid = |t: u8| (1..=125).contains(&t).then_some(t as i32);
+    let mut temperature = None;
+    if listed.contains(&0x0D) {
+        if let Some(page) = log_sense(h, 0x0D, 64) {
+            temperature = log_params(&page)
+                .into_iter()
+                .find(|(code, data)| *code == 0 && data.len() >= 2)
+                .and_then(|(_, data)| valid(data[1]));
+        }
+    }
+    let mut prediction = None;
+    if listed.contains(&0x2F) {
+        if let Some(page) = log_sense(h, 0x2F, 64) {
+            let first = log_params(&page)
+                .into_iter()
+                .find(|(code, data)| *code == 0 && data.len() >= 3);
+            if let Some((_, data)) = first {
+                prediction = Some((data[0], data[1]));
+                temperature = temperature.or(valid(data[2]));
+            }
+        }
+    }
+    if temperature.is_none() && prediction.is_none() {
+        return None;
+    }
+    let mut r = SmartReport::empty(disk.number);
+    r.available = true;
+    r.kind = "SCSI";
+    r.method = "Registri SCSI del dispositivo".into();
+    if let Some((asc, ascq)) = prediction {
+        // Il codice 5Dh annuncia un guasto previsto.
+        let failing = asc == 0x5D;
+        r.health = Health::Good;
+        r.push(
+            "",
+            "Previsione di guasto",
+            if failing { "Guasto previsto" } else { "Nessuna" }.into(),
+            format!("codice {asc:02X}/{ascq:02X}"),
+            if failing { Health::Critical } else { Health::Good },
+        );
+        r.counters.push(("Previsione di guasto".into(), failing as u64));
+    }
+    if let Some(t) = temperature {
+        r.temperature = Some(t);
+        r.push(
+            "",
+            "Temperatura",
+            format!("{t} °C"),
+            String::new(),
+            if t >= 65 { Health::Warning } else { Health::Unknown },
+        );
+    }
+    Some(r)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dischi USB: quale strada porta allo SMART
+// ---------------------------------------------------------------------------------------------
+
+/// La strada trovata per un disco USB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    Ata(AtaVia),
+    Nvme(NvmeVia),
+    ScsiLog,
+    /// Nessuna: il dispositivo non ha lo SMART o il bridge non lo lascia passare.
+    Nothing,
+}
+
+impl Via {
+    /// Come la strada compare nel rapporto di diagnosi.
+    fn name(self) -> &'static str {
+        match self {
+            Via::Ata(AtaVia::Sat12) => "SAT a 12 byte",
+            Via::Ata(AtaVia::Sat16) => "SAT a 16 byte",
+            Via::Ata(via) => via.label(true),
+            Via::Nvme(via) => via.label(),
+            Via::ScsiLog => "registri SCSI del dispositivo",
+            Via::Nothing => "nessuna",
+        }
+    }
+}
+
+struct Known {
+    via: Via,
+    /// Perché lo SMART non è disponibile, quando `via` è `Nothing`.
+    note: String,
+    /// Letture consecutive fallite con una strada che prima funzionava.
+    misses: u8,
+    /// Il bridge non riporta se il disco gira: non glielo si chiede più.
+    no_power: bool,
+}
+
+/// Strada trovata per ogni disco USB già interrogato: così le letture periodiche inviano solo i
+/// comandi che servono, e a un dispositivo senza SMART non si ripetono i tentativi ogni volta.
+static METHODS: LazyLock<Mutex<HashMap<String, Known>>> = LazyLock::new(Default::default);
+
+/// Un solo scambio di comandi diretti alla volta: i protocolli a più passi non vanno intrecciati
+/// fra la finestra e il monitoraggio.
+static BUS: Mutex<()> = Mutex::new(());
+
+fn methods() -> MutexGuard<'static, HashMap<String, Known>> {
+    METHODS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn method_key(d: &PhysDisk) -> String {
+    format!("{}|{}|{:?}|{}", d.model, d.serial, d.usb_id, d.size)
+}
+
+fn known_via(d: &PhysDisk) -> Option<Via> {
+    methods().get(&method_key(d)).map(|k| k.via)
+}
+
+fn read_via(disk: &PhysDisk, h: &Handle, via: Via) -> Option<SmartReport> {
+    match via {
+        Via::Ata(v) => ata_read(disk, h, v, false),
+        Via::Nvme(v) => nvme_bridge_read(disk, h, v, false),
+        Via::ScsiLog => scsi_log_report(disk, h),
+        Via::Nothing => None,
+    }
+}
+
+/// Prodotti JMicron che sono bridge USB-NVMe (gli altri sono bridge SATA).
+fn jmicron_nvme_product(pid: u16) -> bool {
+    matches!(pid, 0x0583 | 0xA583 | 0x0581 | 0x0586 | 0x0562 | 0x1581 | 0x0580 | 0xF583)
+}
+
+const NOT_ANSWERING: &str = "Il disco non ha risposto in tempo ai comandi: riprova con «Rileggi».";
+
+/// Prova in ordine le strade possibili per un disco USB e riporta quella che funziona. I comandi
+/// dello standard SAT vanno a tutti; quelli proprietari solo ai bridge del produttore che li ha
+/// definiti, con la sola eccezione delle letture NVMe di ASMedia e Realtek (vedi sotto).
+fn usb_probe(disk: &PhysDisk, h: &Handle) -> (Via, Result<SmartReport, String>) {
+    let (vid, pid) = disk.usb_id.unwrap_or((0, 0));
+    let no_media = disk.size == 0;
+    const NO_MEDIA: &str = "Nel contenitore o nel lettore USB non c'è un disco pronto: niente da leggere.";
+    // Un bridge che a ogni comando risponde con un errore suo va detto: è diverso da un contenitore
+    // semplicemente vuoto, e dentro può esserci un disco che il bridge non riesce più a vedere.
+    let no_media_note = || match LAST_FAIL.get() {
+        Some(ScsiFail::Rejected {
+            key: key @ (2 | 4),
+            asc,
+            ascq,
+            ..
+        }) => format!(
+            "Il bridge USB risponde a ogni comando con un errore ({}, codice {asc:02X}/{ascq:02X}): nel contenitore \
+             non c'è un disco, oppure il bridge non riesce a riconoscerlo.",
+            if key == 4 { "guasto dell'hardware" } else { "dispositivo non pronto" }
+        ),
+        _ => NO_MEDIA.to_string(),
+    };
+    if no_media && disk.removable {
+        return (Via::Nothing, Err(NO_MEDIA.into()));
+    }
+    // Un disco ATA che risponde ma non ha lo SMART (o non lo lascia attivare) chiude la ricerca:
+    // i comandi degli altri protocolli non gli vanno mandati.
+    const NO_SMART: &str = "Il disco risponde ai comandi attraverso il bridge USB, ma non ha lo SMART o non lo lascia attivare.";
+    ATA_ANSWERED.set(false);
+    for via in [AtaVia::Sat12, AtaVia::Sat16] {
+        if let Some(r) = ata_read(disk, h, via, false) {
+            return (Via::Ata(via), Ok(r));
+        }
+        if ATA_ANSWERED.get() {
+            return (Via::Nothing, Err(NO_SMART.into()));
+        }
+    }
+    if disk.removable {
+        let note = "Chiavetta o scheda di memoria USB: di norma questi dispositivi non hanno dati SMART, e questo non li ha restituiti.";
+        return (Via::Nothing, Err(note.into()));
+    }
+
+    // Vecchi bridge USB-SATA con un protocollo proprio.
+    let mut legacy = Vec::new();
+    match vid {
+        0x152D if !jmicron_nvme_product(pid) => {
+            if let Some(port) = jmicron_port(h, false) {
+                legacy.push(AtaVia::Jmicron { port, prolific: false });
+            }
+        }
+        0x04B4 => legacy.push(AtaVia::Cypress),
+        0x04FC => legacy.push(AtaVia::Sunplus),
+        0x067B => {
+            legacy.push(AtaVia::Prolific);
+            legacy.push(AtaVia::Jmicron { port: 0, prolific: true });
+        }
+        _ => {}
+    }
+    for via in legacy {
+        if let Some(r) = ata_read(disk, h, via, false) {
+            return (Via::Ata(via), Ok(r));
+        }
+        if ATA_ANSWERED.get() {
+            return (Via::Nothing, Err(NO_SMART.into()));
+        }
+    }
+
+    // Bridge USB-NVMe: quello del produttore. Se la marca non dice nulla e il dispositivo si
+    // dichiara un SSD si provano i protocolli ASMedia e Realtek, che molti contenitori e SSD
+    // portatili montano sotto un altro nome e che sono semplici letture; non quello JMicron, che
+    // comincia con un comando di scrittura.
+    let bridges: Vec<(NvmeVia, bool)> = match vid {
+        0x152D => vec![(NvmeVia::Jmicron, false)],
+        0x0BDA => vec![(NvmeVia::Realtek, false)],
+        0x174C => vec![(NvmeVia::Asmedia, false)],
+        _ if no_media || disk.ssd != Some(true) => Vec::new(),
+        _ => vec![(NvmeVia::Asmedia, true), (NvmeVia::Realtek, true)],
+    };
+    for (via, strict) in bridges {
+        if let Some(r) = nvme_bridge_read(disk, h, via, strict) {
+            return (Via::Nvme(via), Ok(r));
+        }
+    }
+
+    if no_media {
+        return (Via::Nothing, Err(no_media_note()));
+    }
+    if let Some(r) = scsi_log_report(disk, h) {
+        return (Via::ScsiLog, Ok(r));
+    }
+    let note = format!(
+        "Il bridge USB ({vid:04X}:{pid:04X}) non inoltra i comandi SMART con nessuno dei protocolli conosciuti \
+         (SAT, JMicron, ASMedia, Realtek, Cypress, Sunplus, Prolific) e non espone i registri SCSI."
+    );
+    (Via::Nothing, Err(note))
+}
+
+/// Lettura non riuscita di un disco USB.
+struct Miss {
+    note: String,
+    /// Il disco non ha risposto questa volta: i dati letti prima restano buoni.
+    transient: bool,
+}
+
+/// SMART di un disco USB: per la strada già trovata, oppure cercandola.
+fn usb_read(disk: &PhysDisk, h: &Handle, mode: Mode) -> Result<SmartReport, Miss> {
+    let key = method_key(disk);
+    let known = methods().get(&key).map(|k| (k.via, k.note.clone()));
+    match known {
+        // Già interrogato senza esito: nelle letture periodiche non si ripetono i tentativi.
+        Some((Via::Nothing, note)) if mode == Mode::Sample => {
+            return Err(Miss { note, transient: false });
+        }
+        Some((via, _)) if via != Via::Nothing => {
+            trace(|| format!("strada già trovata per questo disco: {}", via.name()));
+            if let Some(r) = read_via(disk, h, via) {
+                if let Some(k) = methods().get_mut(&key) {
+                    k.misses = 0;
+                }
+                return Ok(r);
+            }
+            if mode == Mode::Sample || STUCK.get() {
+                // Dopo tre letture fallite di fila la strada si cerca di nuovo da capo.
+                let mut all = methods();
+                let forget = all.get_mut(&key).is_some_and(|k| {
+                    k.misses += 1;
+                    k.misses >= 3
+                });
+                if forget {
+                    all.remove(&key);
+                }
+                return Err(Miss {
+                    note: NOT_ANSWERING.into(),
+                    transient: true,
+                });
+            }
+            trace(|| "la strada trovata prima non funziona più: si ricomincia".into());
+        }
+        _ => {}
+    }
+    let (via, outcome) = usb_probe(disk, h);
+    if outcome.is_err() && STUCK.get() {
+        // Un disco che non risponde non dice nulla sul bridge: non si ricorda niente.
+        return Err(Miss {
+            note: NOT_ANSWERING.into(),
+            transient: true,
+        });
+    }
+    trace(|| format!("strada scelta: {}", via.name()));
+    let note = outcome.as_ref().err().cloned().unwrap_or_default();
+    methods().insert(
+        key,
+        Known {
+            via,
+            note: note.clone(),
+            misses: 0,
+            no_power: false,
+        },
+    );
+    outcome.map_err(|_| Miss { note, transient: false })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -985,16 +1890,114 @@ fn temperature_property(h: &Handle) -> Option<i32> {
     (-40..=130).contains(&t).then_some(t).filter(|t| *t != 0)
 }
 
-/// Legge lo SMART del disco con il metodo migliore disponibile.
+/// Vero se Windows ha tolto l'alimentazione al disco (spegnimento dei dischi inattivi).
+fn powered_off(h: &Handle) -> bool {
+    let mut on = 1i32;
+    unsafe { GetDevicePowerState(h.raw(), &mut on) != 0 && on == 0 }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Lettura chiesta dall'utente o all'avvio: completa, anche se deve svegliare il disco.
+    Full,
+    /// Lettura periodica: non sveglia i dischi fermi e non ripete i tentativi già falliti.
+    Sample,
+}
+
+/// Esito di una lettura periodica.
+pub enum Sample {
+    Report(SmartReport),
+    /// Il disco è fermo: non lo si è svegliato.
+    Asleep,
+    /// Il disco non ha risposto questa volta: restano validi i dati di prima.
+    Unchanged,
+}
+
+/// Legge lo SMART del disco con il metodo migliore disponibile, svegliandolo se è fermo.
 pub fn read(disk: &PhysDisk) -> SmartReport {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    match read_inner(disk, Mode::Full) {
+        Sample::Report(r) => r,
+        _ => SmartReport::empty(disk.number),
+    }
+}
+
+/// Lettura periodica dello SMART (temperatura, contatori, autodiagnosi): lascia stare i dischi
+/// fermi, quando lo si può sapere senza svegliarli.
+pub fn sample(disk: &PhysDisk) -> Sample {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    read_inner(disk, Mode::Sample)
+}
+
+fn read_inner(disk: &PhysDisk, mode: Mode) -> Sample {
+    STUCK.set(false);
     let elevated = win::is_elevated();
     let path = disk.device_path();
     let hq = win::open_device_query(&path).ok();
+    let usb = disk.is_usb();
+    // Dischi che possono essere fermi: a piatti, di tipo non dichiarato, e tutti quelli USB.
+    let may_sleep = usb || disk.ssd != Some(true);
+
+    if may_sleep && hq.as_ref().is_some_and(powered_off) {
+        trace(|| "Windows ha tolto l'alimentazione al disco".into());
+        if mode == Mode::Sample {
+            return Sample::Asleep;
+        }
+    }
     let hrw = if elevated {
-        win::open_device_rw(&path).ok()
+        match win::open_device_rw(&path) {
+            Ok(h) => Some(h),
+            Err(code) => {
+                trace(|| {
+                    format!(
+                        "apertura per i comandi diretti fallita: errore {code} ({})",
+                        win::error_text(code)
+                    )
+                });
+                None
+            }
+        }
+    } else if usb && disk.removable {
+        // Supporti rimovibili: Windows lascia passare i comandi diretti anche senza privilegi,
+        // purché arrivino dal volume invece che dal disco.
+        disk.letters
+            .first()
+            .and_then(|letter| win::open_device_rw(&format!(r"\\.\{letter}:")).ok())
+            .inspect(|_| trace(|| "comandi diretti attraverso il volume (supporto rimovibile)".into()))
     } else {
         None
     };
+    // Per chiedere al disco se gira serve una strada ATA già nota.
+    let power_via = || -> Option<AtaVia> {
+        if usb {
+            match methods().get(&method_key(disk)) {
+                Some(Known {
+                    via: Via::Ata(via),
+                    no_power: false,
+                    ..
+                }) => Some(*via),
+                _ => None,
+            }
+        } else {
+            matches!(disk.bus, BUS_SATA | BUS_ATA).then_some(AtaVia::Native)
+        }
+    };
+    if mode == Mode::Sample && may_sleep {
+        if let (Some(h), Some(via)) = (&hrw, power_via()) {
+            match ata_power_mode(h, via) {
+                power if standing_by(power) => return Sample::Asleep,
+                None if usb => {
+                    // Il bridge non riporta la risposta: d'ora in poi il disco si legge senza
+                    // chiederglielo, e una domanda rimasta senza risposta non blocca questa lettura.
+                    if let Some(known) = methods().get_mut(&method_key(disk)) {
+                        known.no_power = true;
+                    }
+                    STUCK.set(false);
+                }
+                _ => {}
+            }
+        }
+    }
 
     const NEEDS_ADMIN: &str = "Per avviare l'autodiagnosi servono i privilegi di amministratore.";
     let try_nvme = |method: &str| -> Option<SmartReport> {
@@ -1019,24 +2022,14 @@ pub fn read(disk: &PhysDisk) -> SmartReport {
         Some(r)
     };
     let try_ata = || -> Option<SmartReport> {
+        let predicted = hq.as_ref().and_then(ata_predict_failure);
         if let Some(h) = &hrw {
-            if let Some(data) = ata_smart_read(h, 0xD0).filter(|d| ata_data_plausible(d)) {
-                let thr = ata_smart_read(h, 0xD1);
-                let predict = hq.as_ref().and_then(ata_predict_failure).is_some_and(|p| p.0);
-                let mut r = ata_report(
-                    disk.number,
-                    &data,
-                    thr.as_ref().map(|t| &t[..]),
-                    predict,
-                    "ATA pass-through",
-                );
-                // Registro delle prove (06h), con il comando SMART READ LOG.
-                let tests = ata_smart(h, 0xD5, 0x06, true);
-                r.set_selftest(ata_selftest(&data, tests.as_ref()));
+            let failing = predicted.as_ref().is_some_and(|p| p.0);
+            if let Some(r) = ata_read(disk, h, AtaVia::Native, failing) {
                 return Some(r);
             }
         }
-        let (predict, data) = hq.as_ref().and_then(ata_predict_failure)?;
+        let (predict, data) = predicted?;
         let mut r = ata_report(
             disk.number,
             &data,
@@ -1055,64 +2048,28 @@ pub fn read(disk: &PhysDisk) -> SmartReport {
         r.set_selftest(st);
         Some(r)
     };
+    // Dischi SATA dietro un controller SAS o RAID, e dischi SCSI veri.
+    let try_scsi = || -> Option<SmartReport> {
+        let h = hrw.as_ref()?;
+        [AtaVia::Sat16, AtaVia::Sat12]
+            .into_iter()
+            .find_map(|via| ata_read(disk, h, via, false))
+            .or_else(|| scsi_log_report(disk, h))
+    };
 
     let mut note = String::new();
-    let report = match disk.bus {
-        BUS_NVME => try_nvme("Driver NVMe di Windows"),
-        BUS_SATA | BUS_ATA => try_ata(),
-        BUS_RAID => try_nvme("Driver NVMe di Windows").or_else(try_ata),
-        BUS_USB => {
-            if let Some(h) = &hrw {
-                let mut rep = None;
-                if let Some(data) = sat_smart_read(h, 0xD0).filter(|d| ata_data_plausible(d)) {
-                    let thr = sat_smart_read(h, 0xD1);
-                    let mut r = ata_report(
-                        disk.number,
-                        &data,
-                        thr.as_ref().map(|t| &t[..]),
-                        false,
-                        "Bridge USB (SAT)",
-                    );
-                    let tests = sat_smart(h, 0xD5, 0x06, true);
-                    r.set_selftest(ata_selftest(&data, tests.as_ref()));
-                    rep = Some(r);
-                } else if let Some((vid, pid)) = disk.usb_id {
-                    // Registro delle prove: JMicron si blocca oltre 536 byte (19 prove), Realtek ne dà 512.
-                    const FORWARD_ONLY_READS: &str =
-                        "Il bridge USB di questo contenitore inoltra solo le letture: l'autodiagnosi non si può avviare da qui.";
-                    let bridge = usb_nvme_bridge(vid, pid);
-                    let found = match bridge {
-                        Some("jmicron") => health_log(jmicron_nvme_log(h, 0x02, 512)).map(|l| {
-                            let identify = jmicron_admin(h, 0x06, 0, 1, 4096);
-                            let tests = jmicron_nvme_log(h, 0x06, 536);
-                            (l, "Bridge USB-NVMe JMicron", nvme_selftest(identify.as_deref(), tests.as_deref()))
-                        }),
-                        Some("realtek") => health_log(realtek_nvme_log(h, 0x02)).map(|l| {
-                            let mut st = nvme_selftest(None, realtek_nvme_log(h, 0x06).as_deref());
-                            st.cannot_start = FORWARD_ONLY_READS.into();
-                            (l, "Bridge USB-NVMe Realtek", st)
-                        }),
-                        Some("asmedia") => health_log(asmedia_nvme_log(h, 0x02, 512)).map(|l| {
-                            let tests = asmedia_nvme_log(h, 0x06, NVME_SELFTEST_LOG);
-                            let mut st = nvme_selftest(None, tests.as_deref());
-                            st.cannot_start = FORWARD_ONLY_READS.into();
-                            (l, "Bridge USB-NVMe ASMedia", st)
-                        }),
-                        _ => None,
-                    };
-                    rep = found.map(|(l, m, st)| {
-                        let mut r = nvme_report(disk.number, &l, m);
-                        r.set_selftest(st);
-                        r
-                    });
-                    if rep.is_none() {
-                        note = format!(
-                            "Il bridge USB ({vid:04X}:{pid:04X}) non ha restituito i dati SMART: non inoltra i comandi oppure non è fra quelli riconosciuti."
-                        );
-                    }
+    let mut transient = false;
+    let report = if usb {
+        match &hrw {
+            Some(h) => match usb_read(disk, h, mode) {
+                Ok(r) => Some(r),
+                Err(miss) => {
+                    note = miss.note;
+                    transient = miss.transient;
+                    None
                 }
-                rep
-            } else {
+            },
+            None => {
                 note = if elevated {
                     "Impossibile aprire il disco per i comandi diretti.".into()
                 } else {
@@ -1121,15 +2078,33 @@ pub fn read(disk: &PhysDisk) -> SmartReport {
                 None
             }
         }
-        14 | 15 | 16 => {
-            note = "Disco virtuale: lo SMART si legge sui dischi fisici che lo compongono.".into();
-            None
+    } else {
+        match disk.bus {
+            BUS_NVME => try_nvme("Driver NVMe di Windows"),
+            BUS_SATA | BUS_ATA => try_ata(),
+            14 | 15 | 16 => {
+                note = "Disco virtuale: lo SMART si legge sui dischi fisici che lo compongono.".into();
+                None
+            }
+            _ => try_nvme("Driver NVMe di Windows").or_else(try_ata).or_else(try_scsi),
         }
-        _ => try_nvme("Driver NVMe di Windows").or_else(try_ata),
     };
+    if tracing() && mode == Mode::Full && may_sleep {
+        if let (Some(h), Some(via)) = (&hrw, power_via()) {
+            let power = ata_power_mode(h, via);
+            trace(|| match power {
+                Some(p) => format!(
+                    "stato dichiarato dal disco: {p:02X}h ({})",
+                    if standing_by(power) { "fermo" } else { "in funzione" }
+                ),
+                None => "il collegamento non riporta se il disco gira: verrà letto comunque".into(),
+            });
+        }
+    }
 
     match report {
-        Some(r) => r,
+        Some(r) => Sample::Report(r),
+        None if mode == Mode::Sample && (transient || STUCK.get()) => Sample::Unchanged,
         None => {
             let mut r = SmartReport::empty(disk.number);
             if note.is_empty() {
@@ -1151,9 +2126,181 @@ pub fn read(disk: &PhysDisk) -> SmartReport {
                 );
                 r.health = Health::Unknown;
             }
-            r
+            Sample::Report(r)
         }
     }
+}
+
+/// Rapporto di diagnosi di un disco: i comandi inviati per leggere lo SMART e le risposte ricevute.
+pub struct Diagnosis {
+    pub disk: u32,
+    /// Il disco, un comando per riga con la sua risposta, l'esito.
+    pub text: String,
+    /// Quando è stato preparato.
+    pub at: String,
+    /// Lo SMART letto nel prepararlo.
+    pub report: Option<SmartReport>,
+}
+
+/// Lettura completa del disco tenendo traccia dei comandi. Con `fresh` dimentica la strada già
+/// trovata e le riprova tutte, anche quelle scartate. Chi chiama tiene `BUS`.
+fn traced(d: &PhysDisk, fresh: bool) -> Diagnosis {
+    if fresh {
+        methods().remove(&method_key(d));
+    }
+    TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+    let outcome = read_inner(d, Mode::Full);
+    let lines = TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+
+    let usb = d.usb_id.map(|(v, p)| format!(" [{v:04X}:{p:04X}]")).unwrap_or_default();
+    let kind = match d.ssd {
+        Some(true) => "SSD",
+        Some(false) => "a piatti",
+        None => "tipo non dichiarato",
+    };
+    let mut out = format!(
+        "Disco {} — {} · {}{usb} · {} · {} · {kind} · firmware {}\n",
+        d.number,
+        d.title(),
+        disks::bus_name(d.bus),
+        win::human_bytes(d.size),
+        if d.removable { "supporto rimovibile" } else { "fisso" },
+        if d.revision.is_empty() { "?" } else { &d.revision },
+    );
+    for line in lines {
+        out.push_str(&format!("    {line}\n"));
+    }
+    let report = match outcome {
+        Sample::Report(r) => Some(r),
+        _ => None,
+    };
+    match &report {
+        Some(r) if r.available => {
+            let temp = r.temperature.map(|t| format!("{t} °C")).unwrap_or_else(|| "non dichiarata".into());
+            let tests = if !r.selftest.supported {
+                "non dichiarata".to_string()
+            } else if r.selftest.cannot_start.is_empty() {
+                format!("disponibile, {} prove nel registro", r.selftest.entries.len())
+            } else {
+                format!("solo in lettura, {} prove nel registro", r.selftest.entries.len())
+            };
+            out.push_str(&format!(
+                "  ESITO: SMART letto — {} · {} · stato {} · temperatura {temp} · {} attributi · autodiagnosi {tests}\n",
+                r.kind,
+                r.method,
+                r.health.label(),
+                r.attrs.len()
+            ));
+            // Gli attributi che fanno scattare un avviso, con i loro valori.
+            for a in r.attrs.iter().filter(|a| a.level >= Health::Warning) {
+                let detail = if a.detail.is_empty() { String::new() } else { format!(" ({})", a.detail) };
+                out.push_str(&format!("    ! {} {}: {}{detail}\n", a.id, a.name, a.value));
+            }
+        }
+        Some(r) => {
+            let temp = r.temperature.map(|t| format!(" · temperatura dal driver {t} °C")).unwrap_or_default();
+            out.push_str(&format!("  ESITO: SMART non disponibile — {}{temp}\n", r.note));
+        }
+        None => out.push_str("  ESITO: nessuna lettura\n"),
+    }
+    Diagnosis {
+        disk: d.number,
+        text: out,
+        at: win::now_string(),
+        report,
+    }
+}
+
+/// Come `read`, ma conserva i comandi inviati e le risposte: è il rapporto di diagnosi della
+/// lettura appena fatta. Se la strada per quel disco è già nota, percorre solo quella.
+pub fn read_traced(disk: &PhysDisk) -> Diagnosis {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    traced(disk, false)
+}
+
+/// Rapporto di diagnosi dei dischi indicati: riprova tutte le strade, anche quelle già scartate.
+/// Sveglia i dischi fermi.
+pub fn diagnose(disks: &[PhysDisk]) -> Vec<Diagnosis> {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    disks.iter().map(|d| traced(d, true)).collect()
+}
+
+/// Il testo del rapporto di diagnosi come va in un file: intestazione e un blocco per disco.
+pub fn diagnosis_file(list: &[Diagnosis]) -> String {
+    let mut out = format!(
+        "myStorageTest {} — diagnosi della lettura SMART\n{} · {}\n",
+        env!("CARGO_PKG_VERSION"),
+        win::now_string(),
+        if win::is_elevated() {
+            "avviato come amministratore"
+        } else {
+            "SENZA privilegi di amministratore: i comandi diretti ai dischi non sono disponibili"
+        }
+    );
+    for d in list {
+        out.push('\n');
+        out.push_str(&d.text);
+    }
+    out.replace('\n', "\r\n")
+}
+
+/// Vero se i dati di IDENTIFY DEVICE hanno la forma attesa (parola 83, bit 15 e 14 a 0 e 1).
+fn identify_valid(id: &[u8]) -> bool {
+    id.len() >= 512 && rd_u16(id, 166) & 0xC000 == 0x4000
+}
+
+/// Dati d'identità del disco per la scheda Info: IDENTIFY DEVICE (ATA) e Identify Controller
+/// (NVMe). Senza privilegi arrivano dal driver di Windows; da amministratore anche attraverso il
+/// bridge USB, per la strada già trovata leggendo lo SMART (nessun tentativo alla cieca). Non
+/// sveglia un disco fermo.
+pub fn identity(disk: &PhysDisk) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    let path = disk.device_path();
+    let hq = win::open_device_query(&path).ok();
+    let usb = disk.is_usb();
+    if !usb && disk.bus == BUS_NVME {
+        let id = hq
+            .as_ref()
+            .and_then(|h| nvme_query(h, StorageAdapterProtocolSpecificProperty as u32, 1, 1, 4096));
+        return (None, id);
+    }
+    // Il driver ATA di Windows conserva i dati di IDENTIFY e li dà senza privilegi.
+    let cached = hq
+        .as_ref()
+        .and_then(|h| protocol_query(h, 2, StorageDeviceProtocolSpecificProperty as u32, 1, 0, 512))
+        .filter(|id| identify_valid(id));
+    if cached.is_some() || !win::is_elevated() {
+        return (cached, None);
+    }
+    let via = if usb {
+        match known_via(disk) {
+            Some(Via::Ata(via)) => via,
+            _ => return (None, None),
+        }
+    } else if matches!(disk.bus, BUS_SATA | BUS_ATA) {
+        AtaVia::Native
+    } else {
+        return (None, None);
+    };
+    if hq.as_ref().is_some_and(powered_off) {
+        return (None, None);
+    }
+    let Ok(h) = win::open_device_rw(&path) else { return (None, None) };
+    let may_sleep = usb || disk.ssd != Some(true);
+    let no_power = methods().get(&method_key(disk)).is_some_and(|k| k.no_power);
+    if may_sleep && !no_power && standing_by(ata_power_mode(&h, via)) {
+        return (None, None);
+    }
+    STUCK.set(false);
+    let id = ata_io(&h, via, AtaCmd::IDENTIFY, true).filter(|id| identify_valid(id));
+    (id.map(|id| id.to_vec()), None)
+}
+
+/// Esegue `work` mentre nessun'altra lettura dello SMART tocca i dischi: serve a chi deve
+/// scollegarne uno, perché un disco con un comando in corso non si lascia rimuovere.
+pub fn exclusive<T>(work: impl FnOnce() -> T) -> T {
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    work()
 }
 
 /// Avvia o interrompe l'autodiagnosi del disco. Richiede i privilegi di amministratore.
@@ -1161,6 +2308,8 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
     if !win::is_elevated() {
         return Err("servono i privilegi di amministratore".into());
     }
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    STUCK.set(false);
     let h = win::open_device_rw(&disk.device_path())
         .map_err(|code| format!("impossibile aprire il disco: {} (codice {code})", win::error_text(code)))?;
     // Codici della prova: NVMe Device Self-test (14h) e ATA SMART EXECUTE OFF-LINE IMMEDIATE (D4h).
@@ -1169,21 +2318,30 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
         SelfTestCmd::Extended => (0x2, 0x02),
         SelfTestCmd::Abort => (0xF, 0x7F),
     };
-    let refused = || "il disco ha rifiutato il comando".to_string();
+    let refused = |who: &str| format!("{who} ha rifiutato il comando");
     let nvme = || nvme_admin_command(&h, 0x14, 0xFFFF_FFFF, nvme_code);
-    let ata = || ata_smart(&h, 0xD4, ata_code, false).map(|_| ()).ok_or_else(refused);
+    let ata = |via: AtaVia, who: &str| {
+        ata_io(&h, via, AtaCmd::self_test(ata_code), false)
+            .map(|_| ())
+            .ok_or_else(|| refused(who))
+    };
+    if disk.is_usb() {
+        const BRIDGE: &str = "il disco o il bridge USB";
+        return match known_via(disk) {
+            Some(Via::Ata(via)) => ata(via, BRIDGE),
+            Some(Via::Nvme(NvmeVia::Jmicron)) => jmicron_admin(&h, 0x14, 0xFFFF_FFFF, nvme_code, 0)
+                .map(|_| ())
+                .ok_or_else(|| refused(BRIDGE)),
+            Some(Via::Nvme(_)) => Err("il bridge USB di questo contenitore inoltra solo le letture".into()),
+            Some(Via::ScsiLog | Via::Nothing) => Err("il bridge USB non inoltra i comandi al disco".into()),
+            None => ata(AtaVia::Sat12, BRIDGE).or_else(|_| ata(AtaVia::Sat16, BRIDGE)),
+        };
+    }
     match disk.bus {
         BUS_NVME => nvme(),
-        BUS_SATA | BUS_ATA => ata(),
-        BUS_USB => match disk.usb_id.and_then(|(v, p)| usb_nvme_bridge(v, p)) {
-            Some("jmicron") => jmicron_admin(&h, 0x14, 0xFFFF_FFFF, nvme_code, 0)
-                .map(|_| ())
-                .ok_or_else(|| "il disco o il bridge USB ha rifiutato il comando".to_string()),
-            Some(_) => Err("il bridge USB di questo contenitore inoltra solo le letture".into()),
-            None => sat_smart(&h, 0xD4, ata_code, false)
-                .map(|_| ())
-                .ok_or_else(|| "il disco o il bridge USB ha rifiutato il comando".to_string()),
-        },
-        _ => nvme().or_else(|_| ata()),
+        BUS_SATA | BUS_ATA => ata(AtaVia::Native, "il disco"),
+        _ => nvme()
+            .or_else(|_| ata(AtaVia::Native, "il disco"))
+            .or_else(|_| ata(AtaVia::Sat16, "il disco")),
     }
 }
