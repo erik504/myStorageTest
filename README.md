@@ -40,6 +40,12 @@ guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure
 il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
+- velocità massima in lettura («Lettura max»): il file di prova riletto tenendo più letture in volo
+  insieme, come fanno i programmi di benchmark, a passi di un secondo (1, 4, 8, 16 e 32 letture da 1 MB,
+  4, 8 e 16 da 4 MB). Il riquadro mostra il passo più veloce e, passandoci sopra con il mouse, tutti i
+  passi. La lettura sequenziale normale fa una lettura alla volta: su un NVMe o su un RAID di NVMe resta
+  a metà o meno di quello che il disco fa davvero. Qui i dati non vengono controllati, lo fa già la
+  lettura sequenziale;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
 - flush su disco, misurato operazione per operazione;
 - rilettura di verifica dei blocchi scritti dalla scrittura casuale e dal flush: è una fase a sé
@@ -91,6 +97,17 @@ in `%LOCALAPPDATA%\myStorageTest\monitor.log`.
 Le prove in scrittura usano un solo file temporaneo nascosto, aperto con `FILE_FLAG_DELETE_ON_CLOSE`:
 Windows lo elimina quando l'handle si chiude, anche se il programma viene terminato a metà. A fine prova
 il programma controlla che il file non esista più e lo dichiara.
+
+Il file va nella radice del volume. Se la radice non accetta file, va nella cartella temporanea o in quella
+dell'utente quando stanno sullo stesso volume (è il caso del disco di sistema). Se nemmeno questo è
+possibile, perché la radice accetta solo cartelle (i permessi del disco di sistema, che si ritrovano su
+dischi preparati allo stesso modo), il file va in una cartella nascosta creata lì per la prova, aperta
+anche lei perché Windows la elimini alla chiusura; a fine prova si controlla che sia sparita anche la
+cartella. Se il programma viene terminato, Windows chiude gli handle in ordine di numero: quello della
+cartella viene aperto dopo quelli del file, così si chiude per ultimo, quando la cartella è già vuota.
+Se una cartella vuota restasse comunque, la prova successiva sullo stesso volume la elimina. Se le
+prove sul file non possono partire (spazio insufficiente, permessi), la prova finisce «Completato con
+avvisi» e non «Nessun errore».
 
 La lettura dei file esistenti non modifica nulla, nemmeno la data di ultimo accesso, e salta i segnaposto
 dei servizi cloud per non farli scaricare. Impostazioni e registro degli avvisi stanno sul disco di
@@ -176,6 +193,7 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
     --from P     inizio della scansione della superficie, in percentuale (predefinito 0)
     --to P       fine della scansione della superficie, in percentuale (predefinito 100)
     --no-write   salta le prove in scrittura
+    --no-peak    salta la velocità massima in lettura (più letture in volo)
 ```
 
 `--test` esce con 0 se non ci sono errori, 1 con avvisi, 2 con errori, 3 se interrotto.
@@ -212,6 +230,8 @@ L'eseguibile è `target\release\mystoragetest.exe`, senza altre dipendenze da in
 Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 
 - test completi su un NVMe interno e su un SSD NVMe in contenitore USB, con controllo che il file di prova sparisca;
+- test completo su una chiavetta USB la cui radice accetta solo cartelle: il file di prova va in una cartella nascosta creata per la prova, e alla fine non restano né il file né la cartella, anche chiudendo a forza il programma durante la scrittura e durante la velocità massima; su un volume senza spazio per il file la prova finisce «Completato con avvisi»;
+- velocità massima in lettura su un NVMe PCIe 4.0 (circa 7,4 GB/s, come da specifica, contro 4,7 con una lettura alla volta), su un volume distribuito su due NVMe (circa 9,5 GB/s contro 4,7), su un volume cifrato VeraCrypt (2,2 GB/s), su un disco a piatti USB e su un SSD USB: nessuno stallo falso con le code lunghe sui dischi lenti, file di prova eliminato; il riquadro e il suo fumetto con la finestra alla dimensione normale e a quella minima (dove i riquadri vanno su due righe);
 - due prove contemporanee su due volumi, ognuna con la sua pagina, che resta dopo aver cambiato disco;
 - SMART senza privilegi su sei NVMe e due SATA interni;
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
@@ -263,7 +283,7 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 | `src/cli.rs` | modalità a riga di comando |
 
 Le variabili d'ambiente `MYSTORAGETEST_SHOT`, `MYSTORAGETEST_AUTOTEST`, `MYSTORAGETEST_VOL`,
-`MYSTORAGETEST_VOL2`, `MYSTORAGETEST_NOACTIVATE`, `MYSTORAGETEST_POS` e `MYSTORAGETEST_FAKE_ALERT` servono
+`MYSTORAGETEST_VOL2`, `MYSTORAGETEST_NOACTIVATE`, `MYSTORAGETEST_POS`, `MYSTORAGETEST_SIZE` e `MYSTORAGETEST_FAKE_ALERT` servono
 alle verifiche automatiche dell'interfaccia: eseguono una prova (con `VOL2` anche una seconda, insieme,
 su un altro volume), salvano le schermate di ogni scheda (comprese quelle dei fumetti dei grafici, con un
 puntatore simulato, e quella del grafico della superficie, con dati inventati) e chiudono.

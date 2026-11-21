@@ -38,6 +38,7 @@ Opzioni di --test:
   --from P       inizio della scansione della superficie, in percentuale (predefinito 0)
   --to P         fine della scansione della superficie, in percentuale (predefinito 100)
   --no-write     salta le prove in scrittura
+  --no-peak      salta la velocità massima in lettura (più letture in volo)
 
 Codice di uscita di --test: 0 nessun errore, 1 avvisi, 2 errori, 3 interrotto.
 ";
@@ -319,6 +320,7 @@ fn test(args: &[String]) -> i32 {
         file_tests: !flag("--no-write"),
         file_size: size,
         seq_read: true,
+        seq_peak: !flag("--no-peak"),
         rand_read: true,
         rand_write: true,
         flush: true,

@@ -12,12 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::Storage::FileSystem::{
-    DeleteFileW, FlushFileBuffers, GetFileAttributesW, ReadFile, SetEndOfFile, SetFilePointerEx, SetFileTime, WriteFile,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::IO::{CancelSynchronousIo, OVERLAPPED};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, DeleteFileW, FlushFileBuffers, GetFileAttributesW, ReadFile, RemoveDirectoryW, SetEndOfFile,
+    SetFileAttributesW, SetFilePointerEx, SetFileTime, WriteFile,
+};
+use windows_sys::Win32::System::IO::{CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Power::SetThreadExecutionState;
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
 use crate::errors::{ErrClass, classify};
 use crate::eventlog::{self, StorEvent};
@@ -35,11 +39,31 @@ const MAX_STORED_ERRORS: usize = 2000;
 /// Un'operazione più lenta di così viene segnalata come stallo.
 const STALL_SECS: f64 = 2.0;
 const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+/// Passi della prova di velocità massima: dimensione dei blocchi e letture tenute in volo insieme.
+/// I dischi veloci (NVMe, RAID) arrivano al massimo solo con molte letture in volo, spesso con
+/// blocchi grandi; quelli lenti ci arrivano già ai primi passi, e alcuni bridge USB vanno più
+/// piano con più letture insieme: per questo c'è anche il passo con una sola.
+const PEAK_STEPS: [(usize, usize); 8] = [
+    (1 << 20, 1),
+    (1 << 20, 4),
+    (1 << 20, 8),
+    (1 << 20, 16),
+    (1 << 20, 32),
+    (4 << 20, 4),
+    (4 << 20, 8),
+    (4 << 20, 16),
+];
+/// Durata di ciascun passo della prova di velocità massima.
+const PEAK_STEP_SECS: f64 = 1.0;
+/// Dopo l'annullamento, attesa massima per le letture ancora in volo.
+const PEAK_CANCEL_SECS: f64 = 30.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Phase {
     SeqWrite,
     SeqRead,
+    /// Lettura sequenziale con più letture in volo insieme: la velocità massima del disco.
+    SeqPeak,
     RandRead,
     RandWrite,
     Flush,
@@ -54,6 +78,7 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura sequenziale",
             Phase::SeqRead => "Lettura sequenziale e verifica",
+            Phase::SeqPeak => "Lettura sequenziale, velocità massima",
             Phase::RandRead => "Lettura casuale 4K",
             Phase::RandWrite => "Scrittura casuale 4K",
             Phase::Flush => "Flush su disco",
@@ -67,6 +92,7 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura seq.",
             Phase::SeqRead => "Lettura seq.",
+            Phase::SeqPeak => "Lettura max",
             Phase::RandRead => "Lettura 4K",
             Phase::RandWrite => "Scrittura 4K",
             Phase::Flush => "Flush",
@@ -89,6 +115,8 @@ pub struct TestConfig {
     pub file_tests: bool,
     pub file_size: u64,
     pub seq_read: bool,
+    /// Rilettura con più letture in volo, per la velocità massima.
+    pub seq_peak: bool,
     pub rand_read: bool,
     pub rand_write: bool,
     pub flush: bool,
@@ -168,6 +196,8 @@ pub struct PhaseResult {
     pub errors: u32,
     pub stalls: u32,
     pub note: String,
+    /// Prova di velocità massima: letture in volo e dimensione dei blocchi (byte) del passo più veloce.
+    pub peak: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -203,6 +233,8 @@ pub struct Shared {
     pub fault_count: u64,
     pub stall_count: u64,
     pub skipped: u64,
+    /// Le prove sul file temporaneo erano richieste ma non sono partite (spazio, permessi).
+    pub file_tests_skipped: bool,
     pub log: Vec<(f64, LogLevel, String)>,
     pub outcome: Option<Outcome>,
     /// `Some(true)` quando il file temporaneo non è più sul disco.
@@ -441,6 +473,135 @@ impl Drop for AlignedBuf {
     }
 }
 
+const ATTR_NOT_INDEXED: u32 = 0x2000;
+const FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// Cartella creata nella radice del volume per il file di prova, quando la radice accetta solo
+/// cartelle. L'handle, aperto con DELETE_ON_CLOSE, la fa eliminare da Windows alla chiusura.
+struct TempDir {
+    path: String,
+    handle: Option<Handle>,
+}
+
+/// Handle sulla cartella del file di prova, aperto con DELETE_ON_CLOSE: chiudendolo, Windows elimina
+/// la cartella se a quel punto è vuota. Se il programma viene terminato, Windows chiude gli handle
+/// in ordine di numero: quello della cartella deve venire dopo quello del file, altrimenti si
+/// chiuderebbe quando il file c'è ancora e la cartella resterebbe. Per questo si apre dopo il file
+/// e, se Windows gli dà un numero più basso (riusando un posto libero), se ne apre un altro.
+fn delete_on_close_dir(dir: &str, files: &[&Handle]) -> Option<Handle> {
+    let after = files.iter().map(|h| h.raw() as usize).max().unwrap_or(0);
+    let open = || {
+        win::open(
+            dir,
+            win::ACCESS_DELETE,
+            win::SHARE_ALL,
+            win::OPEN_EXISTING,
+            FLAG_BACKUP_SEMANTICS | win::FLAG_DELETE_ON_CLOSE,
+        )
+        .ok()
+    };
+    let mut lower = Vec::new();
+    for _ in 0..64 {
+        let h = open()?;
+        if h.raw() as usize > after {
+            // Quelli con il numero più basso si chiudono qui, quando la cartella non è vuota:
+            // l'eliminazione è comunque affidata a quest'ultimo.
+            drop(lower);
+            return Some(h);
+        }
+        lower.push(h);
+    }
+    lower.pop()
+}
+
+/// Apre (creandolo) il file di prova: senza cache, eliminato da Windows alla chiusura, nascosto e
+/// fuori dall'indicizzazione. Condiviso in lettura: la prova di velocità massima lo riapre con un
+/// secondo handle, per le letture asincrone.
+fn open_test_file(path: &str) -> Result<Handle, u32> {
+    win::open(
+        path,
+        win::GENERIC_READ | win::GENERIC_WRITE | win::ACCESS_DELETE,
+        win::SHARE_READ,
+        win::CREATE_NEW,
+        win::FLAG_NO_BUFFERING | win::FLAG_DELETE_ON_CLOSE | win::ATTR_HIDDEN | ATTR_NOT_INDEXED,
+    )
+}
+
+/// Una lettura della prova di velocità massima: la struttura e il buffer restano fermi in memoria
+/// finché la lettura è in volo.
+struct PeakSlot {
+    ov: OVERLAPPED,
+    buf: AlignedBuf,
+    at: u64,
+    started: Instant,
+    busy: bool,
+}
+
+impl PeakSlot {
+    fn new(block: usize) -> Option<Self> {
+        let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+        ov.hEvent = unsafe { CreateEventW(null(), 1, 0, null()) };
+        if ov.hEvent.is_null() {
+            return None;
+        }
+        Some(PeakSlot {
+            ov,
+            buf: AlignedBuf::new(block),
+            at: 0,
+            started: Instant::now(),
+            busy: false,
+        })
+    }
+
+    /// Lancia la lettura asincrona del blocco che comincia a `at`.
+    fn issue(&mut self, h: &Handle, at: u64) -> Result<(), u32> {
+        self.ov.Internal = 0;
+        self.ov.InternalHigh = 0;
+        self.ov.Anonymous.Anonymous.Offset = at as u32;
+        self.ov.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+        self.at = at;
+        self.started = Instant::now();
+        let len = self.buf.layout.size() as u32;
+        let ok = unsafe { ReadFile(h.raw(), self.buf.ptr, len, null_mut(), &mut self.ov) };
+        if ok == 0 {
+            let code = win::last_error();
+            if code != ERROR_IO_PENDING {
+                return Err(code);
+            }
+        }
+        self.busy = true;
+        Ok(())
+    }
+}
+
+impl Drop for PeakSlot {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.ov.hEvent);
+        }
+    }
+}
+
+/// Posizione del prossimo blocco da leggere: il file si rilegge da capo quando finisce.
+fn next_block(off: &mut u64, block: u64, size: u64) -> u64 {
+    if *off + block > size {
+        *off = 0;
+    }
+    let at = *off;
+    *off += block;
+    at
+}
+
+/// Esito di un passo della prova di velocità massima.
+struct PeakStep {
+    bytes: u64,
+    ops: u64,
+    /// Dal lancio delle prime letture alla conclusione dell'ultima.
+    secs: f64,
+    /// La fase deve fermarsi: arresto chiesto, errore grave o troppi errori.
+    stop: bool,
+}
+
 fn overlapped_at(off: u64) -> OVERLAPPED {
     let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
     ov.Anonymous.Anonymous.Offset = off as u32;
@@ -487,6 +648,12 @@ struct Sampler {
     hist: Vec<u64>,
     errors: u32,
     stalls: u32,
+    /// Letture in volo insieme: la velocità nei grafici si misura sul tempo trascorso, non sulla
+    /// somma delle durate delle singole letture (che si sovrappongono).
+    wall: bool,
+    /// Passo più veloce della prova di velocità massima: MB/s, operazioni al secondo, letture in
+    /// volo, dimensione dei blocchi. Se c'è, è il risultato della fase.
+    peak: Option<(f64, f64, u32, u32)>,
 }
 
 impl Sampler {
@@ -507,10 +674,24 @@ impl Sampler {
             hist: vec![0; HIST_BUCKETS],
             errors: 0,
             stalls: 0,
+            wall: false,
+            peak: None,
         }
     }
 
     fn add(&mut self, eng: &Engine, bytes: u64, secs: f64, what: &str) {
+        if secs >= STALL_SECS {
+            self.stalls += 1;
+            eng.shared.lock().unwrap().stall_count += 1;
+            eng.log(LogLevel::Warn, format!("Stallo di {secs:.1} s: {what}"));
+        }
+        self.record(eng, bytes, secs);
+    }
+
+    /// Come `add`, senza il controllo dello stallo: serve alle letture tenute in volo insieme, la
+    /// cui durata comprende l'attesa in coda dietro alle altre. Lì lo stallo lo giudica chi le
+    /// lancia: nessuna lettura conclusa per un po'.
+    fn record(&mut self, eng: &Engine, bytes: u64, secs: f64) {
         self.w_bytes += bytes;
         self.w_secs += secs;
         self.w_max = self.w_max.max(secs);
@@ -520,11 +701,6 @@ impl Sampler {
         self.ops += 1;
         self.lats.push((secs * 1000.0) as f32);
         self.hist[bucket_of(secs)] += 1;
-        if secs >= STALL_SECS {
-            self.stalls += 1;
-            eng.shared.lock().unwrap().stall_count += 1;
-            eng.log(LogLevel::Warn, format!("Stallo di {secs:.1} s: {what}"));
-        }
         if self.every_op || self.last.elapsed() >= self.interval {
             self.emit(eng);
         }
@@ -535,10 +711,11 @@ impl Sampler {
             return;
         }
         let t = eng.now();
+        let span = if self.wall { self.last.elapsed().as_secs_f64() } else { self.w_secs };
         let mut sh = eng.shared.lock().unwrap();
         let series = sh.series_mut(self.phase);
-        if self.w_bytes > 0 && self.w_secs > 0.0 {
-            series.speed.push([t, self.w_bytes as f64 / self.w_secs / 1e6]);
+        if self.w_bytes > 0 && span > 0.0 {
+            series.speed.push([t, self.w_bytes as f64 / span / 1e6]);
         }
         series.lat_avg.push([t, self.w_secs / self.w_n as f64 * 1000.0]);
         series.lat_max.push([t, self.w_max * 1000.0]);
@@ -568,22 +745,19 @@ impl Sampler {
                 lats[((lats.len() as f64 * q) as usize).min(lats.len() - 1)] as f64
             }
         };
+        let (mbps, iops) = match self.peak {
+            Some((mbps, iops, _, _)) => (mbps, iops),
+            None if self.secs > 0.0 => (self.bytes as f64 / self.secs / 1e6, self.ops as f64 / self.secs),
+            None => (0.0, 0.0),
+        };
         let result = PhaseResult {
             phase: self.phase,
             completed,
             bytes: self.bytes,
             ops: self.ops,
             io_secs: self.secs,
-            mbps: if self.secs > 0.0 {
-                self.bytes as f64 / self.secs / 1e6
-            } else {
-                0.0
-            },
-            iops: if self.secs > 0.0 {
-                self.ops as f64 / self.secs
-            } else {
-                0.0
-            },
+            mbps,
+            iops,
             lat_avg_ms: if self.ops > 0 {
                 self.secs / self.ops as f64 * 1000.0
             } else {
@@ -596,6 +770,7 @@ impl Sampler {
             errors: self.errors,
             stalls: self.stalls,
             note,
+            peak: self.peak.map(|p| (p.2, p.3)),
         };
         eng.shared.lock().unwrap().results.push(result.clone());
         result
@@ -777,7 +952,14 @@ impl Engine {
             Outcome::Failed
         } else if stopped {
             Outcome::Aborted
-        } else if sh.stall_count > 0 || !events.is_empty() || sh.results.iter().any(|r| !r.completed) {
+        } else if sh.stall_count > 0
+            || !events.is_empty()
+            || sh.results.iter().any(|r| !r.completed)
+            // Errori che non sono difetti del disco (accesso negato, spazio esaurito, sola lettura):
+            // qualcosa della prova non è andato, quindi non è «Nessun errore».
+            || !sh.errors.is_empty()
+            || sh.file_tests_skipped
+        {
             Outcome::Warnings
         } else {
             Outcome::Passed
@@ -801,9 +983,13 @@ impl Engine {
         }
     }
 
-    /// Crea il file temporaneo nella radice del volume o, se non è scrivibile, in una cartella dell'utente.
-    fn create_file(&self) -> Option<(Handle, String)> {
-        let name = format!(".mystoragetest-{}-{:08x}.tmp", std::process::id(), self.seed as u32);
+    /// Crea il file temporaneo nella radice del volume o, se non è scrivibile, in una cartella dell'utente
+    /// sullo stesso volume. Se la radice accetta solo cartelle (i permessi che Windows dà al disco di
+    /// sistema, e che si ritrovano su dischi preparati allo stesso modo) il file va in una cartella
+    /// nascosta creata lì per la prova.
+    fn create_file(&self) -> Option<(Handle, String, Option<TempDir>)> {
+        let name = format!(".mystoragetest-{}-{:08x}", std::process::id(), self.seed as u32);
+        let file = format!("{name}.tmp");
         let root = format!("{}:\\", self.cfg.letter);
         let mut dirs = vec![root.clone()];
         for var in ["TEMP", "USERPROFILE"] {
@@ -813,23 +999,69 @@ impl Engine {
                 }
             }
         }
-        const NOT_INDEXED: u32 = 0x2000;
         let mut last = (0u32, root.clone());
         for dir in dirs {
-            let path = format!("{dir}{name}");
-            match win::open(
-                &path,
-                win::GENERIC_READ | win::GENERIC_WRITE | win::ACCESS_DELETE,
-                0,
-                win::CREATE_NEW,
-                win::FLAG_NO_BUFFERING | win::FLAG_DELETE_ON_CLOSE | win::ATTR_HIDDEN | NOT_INDEXED,
-            ) {
-                Ok(h) => return Some((h, path)),
+            let path = format!("{dir}{file}");
+            match open_test_file(&path) {
+                Ok(h) => return Some((h, path, None)),
                 Err(code) => last = (code, path),
+            }
+        }
+        if classify(last.0).0 == ErrClass::Access {
+            self.remove_stale_folders(&root);
+            let dir = format!("{root}{name}");
+            let w = win::wide(&dir);
+            if unsafe { CreateDirectoryW(w.as_ptr(), null()) } == 0 {
+                last = (win::last_error(), dir);
+            } else {
+                unsafe {
+                    SetFileAttributesW(w.as_ptr(), win::ATTR_HIDDEN | ATTR_NOT_INDEXED);
+                }
+                let path = format!("{dir}\\{file}");
+                match open_test_file(&path) {
+                    Ok(h) => {
+                        let handle = delete_on_close_dir(&dir, &[&h]);
+                        self.log(
+                            LogLevel::Info,
+                            format!(
+                                "Nella radice di {}: si possono creare solo cartelle: il file di prova va in una \
+                                 cartella nascosta creata per la prova, che viene eliminata alla fine",
+                                self.cfg.letter
+                            ),
+                        );
+                        return Some((h, path, Some(TempDir { path: dir, handle })));
+                    }
+                    Err(code) => {
+                        unsafe {
+                            RemoveDirectoryW(w.as_ptr());
+                        }
+                        last = (code, path);
+                    }
+                }
             }
         }
         self.error(Phase::SeqWrite, "creazione del file di prova", &last.1, 0, 0, last.0);
         None
+    }
+
+    /// Elimina le cartelle di prova rimaste vuote nella radice: Windows non riesce a toglierle se
+    /// il programma viene terminato mentre il file c'è ancora (per esempio durante la prova di
+    /// velocità massima, che tiene aperto un secondo handle sul file). Solo cartelle vuote e con il
+    /// nome di questo programma: una prova in corso in un'altra istanza ha il suo file dentro.
+    fn remove_stale_folders(&self, root: &str) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(".mystoragetest-") || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if std::fs::remove_dir(entry.path()).is_ok() {
+                self.log(
+                    LogLevel::Info,
+                    format!("Eliminata la cartella vuota {root}{name}, rimasta da una prova interrotta"),
+                );
+            }
+        }
     }
 
     /// Prove sul file temporaneo. Restituisce il percorso del file (già eliminato) per escluderlo dalle scansioni.
@@ -840,10 +1072,21 @@ impl Engine {
                 LogLevel::Warn,
                 "Spazio libero insufficiente per le prove in scrittura: fase saltata",
             );
-            self.shared.lock().unwrap().skipped += 1;
+            let mut sh = self.shared.lock().unwrap();
+            sh.skipped += 1;
+            sh.file_tests_skipped = true;
             return None;
         }
-        let (h, path) = self.create_file()?;
+        let Some((h, path, mut folder)) = self.create_file() else {
+            self.log(
+                LogLevel::Warn,
+                "Prove di velocità e integrità saltate: il file di prova non si può creare",
+            );
+            let mut sh = self.shared.lock().unwrap();
+            sh.skipped += 1;
+            sh.file_tests_skipped = true;
+            return None;
+        };
         self.log(
             LogLevel::Info,
             format!("File di prova: {path} ({})", win::human_bytes(size)),
@@ -873,6 +1116,9 @@ impl Engine {
         }
         if self.cfg.seq_read && !self.halted() {
             self.seq_read(&h, &path, size, &map);
+        }
+        if self.cfg.seq_peak && !self.halted() {
+            self.seq_peak(&h, &path, size, folder.as_mut());
         }
         if self.cfg.rand_read && !self.halted() {
             self.rand_read(&h, &path, &map);
@@ -907,13 +1153,35 @@ impl Engine {
             }
             gone = unsafe { GetFileAttributesW(w.as_ptr()) } == win::INVALID_ATTRIBUTES;
         }
-        self.shared.lock().unwrap().cleaned = Some(gone);
-        if gone {
+        // La cartella creata per il file, se c'è: sparisce chiudendo il suo handle, ormai vuota.
+        let mut folder_gone = true;
+        if let Some(dir) = folder.as_mut() {
+            drop(dir.handle.take());
+            let wd = win::wide(&dir.path);
+            if unsafe { GetFileAttributesW(wd.as_ptr()) } != win::INVALID_ATTRIBUTES {
+                unsafe {
+                    RemoveDirectoryW(wd.as_ptr());
+                }
+            }
+            folder_gone = unsafe { GetFileAttributesW(wd.as_ptr()) } == win::INVALID_ATTRIBUTES;
+            if !folder_gone {
+                self.log(
+                    LogLevel::Error,
+                    format!("Impossibile eliminare la cartella del file di prova: {}", dir.path),
+                );
+            }
+        }
+        self.shared.lock().unwrap().cleaned = Some(gone && folder_gone);
+        if gone && folder_gone {
             self.log(
                 LogLevel::Good,
-                "File di prova eliminato: nessuna traccia lasciata sul disco",
+                if folder.is_some() {
+                    "File di prova e sua cartella eliminati: nessuna traccia lasciata sul disco"
+                } else {
+                    "File di prova eliminato: nessuna traccia lasciata sul disco"
+                },
             );
-        } else {
+        } else if !gone {
             self.log(
                 LogLevel::Error,
                 format!("Impossibile eliminare il file di prova: {path}"),
@@ -1044,6 +1312,270 @@ impl Engine {
             self.log(LogLevel::Good, "Verifica dei dati superata");
         }
         s.finish(self, completed, note);
+    }
+
+    /// Rilegge il file di prova tenendo più letture in volo insieme, come i programmi di benchmark:
+    /// a passi (`PEAK_STEPS`), con blocchi da 1 e 4 MB e da 1 a 32 letture insieme. Il risultato è
+    /// il passo più veloce. La lettura sequenziale normale ne fa una alla volta e su NVMe e RAID resta
+    /// molto sotto il massimo. Qui i dati non si controllano (lo fa già la lettura sequenziale): il
+    /// controllo costerebbe più della lettura e abbasserebbe la misura.
+    fn seq_peak(&self, main: &Handle, path: &str, size: u64, folder: Option<&mut TempDir>) {
+        self.begin(Phase::SeqPeak);
+        let mut s = Sampler::new(Phase::SeqPeak);
+        s.wall = true;
+        // Un secondo handle, asincrono, sullo stesso file: quello delle altre prove è sincrono e
+        // Windows lo serializza.
+        let h = match win::open(
+            path,
+            win::GENERIC_READ,
+            win::SHARE_ALL,
+            win::OPEN_EXISTING,
+            win::FLAG_NO_BUFFERING | win::FLAG_OVERLAPPED,
+        ) {
+            Ok(h) => h,
+            Err(code) => {
+                s.errors += 1;
+                self.error(Phase::SeqPeak, "apertura", path, 0, 0, code);
+                s.finish(self, false, String::new());
+                return;
+            }
+        };
+        // Se il file sta in una cartella creata per la prova, l'handle che la elimina deve chiudersi
+        // dopo entrambi quelli del file, anche se il programma viene terminato qui: si riapre.
+        if let Some(dir) = folder {
+            if let Some(newer) = delete_on_close_dir(&dir.path, &[main, &h]) {
+                dir.handle = Some(newer);
+            }
+        }
+        let mut off = 0u64;
+        let mut completed = true;
+        let mut steps: Vec<(usize, usize, f64)> = Vec::new();
+        for (i, &(block, depth)) in PEAK_STEPS.iter().enumerate() {
+            if self.halted() {
+                completed = false;
+                break;
+            }
+            let Some(step) = self.peak_step(&h, path, size, block, depth, &mut off, &mut s, i) else {
+                // Letture rimaste in sospeso dopo l'annullamento: i loro buffer non si possono
+                // liberare, e nemmeno l'handle si può chiudere.
+                std::mem::forget(h);
+                self.op_started.store(0, Ordering::Relaxed);
+                s.finish(self, false, "letture rimaste in sospeso".into());
+                return;
+            };
+            if step.ops > 0 && step.secs > 0.0 {
+                let mbps = step.bytes as f64 / step.secs / 1e6;
+                let iops = step.ops as f64 / step.secs;
+                // Un passo interrotto a metà conta solo se è l'unico misurato.
+                if !step.stop || steps.is_empty() {
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "{depth} letture da {} MB in volo: {} MB/s",
+                            block >> 20,
+                            win::thousands(mbps.round() as u64)
+                        ),
+                    );
+                    steps.push((block, depth, mbps));
+                    if s.peak.is_none_or(|p| mbps > p.0) {
+                        s.peak = Some((mbps, iops, depth as u32, block as u32));
+                    }
+                }
+            }
+            if step.stop {
+                completed = false;
+                break;
+            }
+        }
+        drop(h);
+        self.op_started.store(0, Ordering::Relaxed);
+        let note = match s.peak {
+            Some((mbps, _, depth, block)) => {
+                let mut note = format!(
+                    "massimo {} MB/s con {depth} letture da {} MB in volo",
+                    win::thousands(mbps.round() as u64),
+                    block >> 20
+                );
+                for mb in [1usize, 4] {
+                    let row: Vec<String> = steps
+                        .iter()
+                        .filter(|(b, _, _)| *b == mb << 20)
+                        .map(|(_, d, v)| format!("{d} → {}", win::thousands(v.round() as u64)))
+                        .collect();
+                    if !row.is_empty() {
+                        note.push_str(&format!(" · da {mb} MB: {}", row.join(", ")));
+                    }
+                }
+                note
+            }
+            None => String::new(),
+        };
+        if let Some((mbps, _, depth, block)) = s.peak {
+            self.log(
+                LogLevel::Good,
+                format!(
+                    "Velocità massima in lettura: {} MB/s, con {depth} letture da {} MB in volo",
+                    win::thousands(mbps.round() as u64),
+                    block >> 20
+                ),
+            );
+        }
+        s.finish(self, completed, note);
+    }
+
+    /// Un passo della prova di velocità massima: per `PEAK_STEP_SECS` tiene `depth` letture da
+    /// `block` byte sempre in volo, poi aspetta che finiscano. `None` se dopo l'annullamento alcune
+    /// non si concludono: allora i buffer restano allocati (lo fa sapere il chiamante).
+    #[allow(clippy::too_many_arguments)]
+    fn peak_step(
+        &self,
+        h: &Handle,
+        path: &str,
+        size: u64,
+        block: usize,
+        depth: usize,
+        off: &mut u64,
+        s: &mut Sampler,
+        index: usize,
+    ) -> Option<PeakStep> {
+        let mut out = PeakStep {
+            bytes: 0,
+            ops: 0,
+            secs: 0.0,
+            stop: false,
+        };
+        let mut slots: Vec<PeakSlot> = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            match PeakSlot::new(block) {
+                Some(slot) => slots.push(slot),
+                None => {
+                    s.errors += 1;
+                    self.error(Phase::SeqPeak, "preparazione", path, 0, 0, win::last_error());
+                    out.stop = true;
+                    return Some(out);
+                }
+            }
+        }
+        // Da qui le strutture non si spostano più: il vettore non cresce né si accorcia. Se una
+        // lettura non si conclude il vettore viene abbandonato senza liberarlo (`mem::forget`).
+        let step_start = Instant::now();
+        let mut last_done = step_start;
+        let mut stalled = false;
+        let mut cancelled_at: Option<Instant> = None;
+        let mut ui_tick = Instant::now();
+        let waiting_since = |t: Instant| t.duration_since(self.t0).as_micros() as u64 + 1;
+        self.op_started.store(waiting_since(step_start), Ordering::Relaxed);
+
+        for slot in slots.iter_mut() {
+            if let Err(code) = slot.issue(h, next_block(off, block as u64, size)) {
+                s.errors += 1;
+                if self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code).is_fatal() {
+                    out.stop = true;
+                    break;
+                }
+            }
+        }
+        let mut busy: Vec<usize> = Vec::with_capacity(depth);
+        let mut events: Vec<HANDLE> = Vec::with_capacity(depth);
+        loop {
+            busy.clear();
+            busy.extend((0..slots.len()).filter(|&i| slots[i].busy));
+            if busy.is_empty() {
+                break;
+            }
+            if (out.stop || self.halted()) && cancelled_at.is_none() {
+                unsafe {
+                    CancelIoEx(h.raw(), null());
+                }
+                cancelled_at = Some(Instant::now());
+            }
+            if cancelled_at.is_some_and(|t| t.elapsed().as_secs_f64() > PEAK_CANCEL_SECS) {
+                self.log(
+                    LogLevel::Error,
+                    format!("{} letture non si sono concluse nemmeno dopo l'annullamento", busy.len()),
+                );
+                std::mem::forget(slots);
+                return None;
+            }
+            events.clear();
+            events.extend(busy.iter().map(|&i| slots[i].ov.hEvent));
+            let r = unsafe { WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, 100) };
+            if r != WAIT_TIMEOUT && r.wrapping_sub(WAIT_OBJECT_0) as usize >= events.len() {
+                // Attesa fallita: senza sapere quali letture sono finite non si possono liberare i buffer.
+                s.errors += 1;
+                self.error(Phase::SeqPeak, "attesa delle letture", path, 0, 0, win::last_error());
+                unsafe {
+                    CancelIoEx(h.raw(), null());
+                }
+                std::mem::forget(slots);
+                return None;
+            }
+            // L'attesa indica solo la prima lettura conclusa, sempre quella con l'indice più basso:
+            // raccogliendo solo quella, le altre restano indietro (fino a tutto il passo, sui dischi
+            // più veloci). Si raccolgono tutte quelle concluse, anche quando l'attesa scade.
+            for &i in &busy {
+                let slot = &mut slots[i];
+                let mut n = 0u32;
+                let ok = unsafe { GetOverlappedResult(h.raw(), &slot.ov, &mut n, 0) };
+                let code = if ok == 0 { win::last_error() } else { 0 };
+                if code == ERROR_IO_INCOMPLETE {
+                    continue;
+                }
+                let dt = slot.started.elapsed().as_secs_f64();
+                slot.busy = false;
+                if ok != 0 && n as usize == block {
+                    s.record(self, n as u64, dt);
+                    out.bytes += n as u64;
+                    out.ops += 1;
+                    last_done = Instant::now();
+                    stalled = false;
+                } else if ok != 0 {
+                    s.errors += 1;
+                    self.log(LogLevel::Error, format!("Lettura parziale: {n} byte su {block}"));
+                    self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, 30);
+                } else {
+                    let class = self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code);
+                    if class != ErrClass::Cancelled {
+                        s.errors += 1;
+                        if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
+                            out.stop = true;
+                        }
+                    }
+                }
+                let in_time = step_start.elapsed().as_secs_f64() < PEAK_STEP_SECS;
+                if in_time && !out.stop && !self.halted() {
+                    if let Err(code) = slot.issue(h, next_block(off, block as u64, size)) {
+                        s.errors += 1;
+                        let class = self.error(Phase::SeqPeak, "lettura", path, slot.at, block as u32, code);
+                        if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
+                            out.stop = true;
+                        }
+                    }
+                }
+            }
+            let idle = last_done.elapsed().as_secs_f64();
+            if !stalled && idle >= STALL_SECS && cancelled_at.is_none() {
+                stalled = true;
+                s.stalls += 1;
+                self.shared.lock().unwrap().stall_count += 1;
+                self.log(
+                    LogLevel::Warn,
+                    format!("Stallo: nessuna lettura conclusa da {idle:.1} s ({} in volo)", busy.len()),
+                );
+            }
+            if ui_tick.elapsed() >= Duration::from_millis(100) {
+                ui_tick = Instant::now();
+                let within = (step_start.elapsed().as_secs_f64() / PEAK_STEP_SECS).min(1.0);
+                self.progress((index as f64 + within) / PEAK_STEPS.len() as f64);
+                self.op_started.store(waiting_since(last_done), Ordering::Relaxed);
+            }
+        }
+        if self.halted() {
+            out.stop = true;
+        }
+        out.secs = last_done.duration_since(step_start).as_secs_f64();
+        self.progress((index + 1) as f64 / PEAK_STEPS.len() as f64);
+        Some(out)
     }
 
     fn rand_read(&self, h: &Handle, path: &str, map: &[u8]) {

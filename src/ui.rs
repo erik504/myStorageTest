@@ -45,6 +45,7 @@ fn phase_color(p: Phase) -> Color32 {
     match p {
         Phase::SeqWrite => Color32::from_rgb(245, 158, 11),
         Phase::SeqRead => Color32::from_rgb(79, 140, 255),
+        Phase::SeqPeak => Color32::from_rgb(163, 230, 53),
         Phase::RandRead => Color32::from_rgb(34, 211, 238),
         Phase::RandWrite => Color32::from_rgb(244, 114, 182),
         Phase::Flush => Color32::from_rgb(167, 139, 250),
@@ -370,6 +371,7 @@ impl Startup {
 struct TestOptions {
     file_tests: bool,
     seq_read: bool,
+    seq_peak: bool,
     rand_read: bool,
     rand_write: bool,
     flush: bool,
@@ -484,12 +486,14 @@ pub struct App {
     /// Solo per le verifiche automatiche: istante in cui provare da sé il riavvio.
     restart_test: Option<Instant>,
     /// Rettangoli dei grafici nell'ultimo fotogramma: velocità, latenza, distribuzione, superficie,
-    /// temperatura.
-    chart_rects: [egui::Rect; 5],
+    /// temperatura; e del riquadro «Lettura max», che ha anche lui un fumetto.
+    chart_rects: [egui::Rect; 6],
     /// Solo per le verifiche automatiche: puntatore simulato, per provare i fumetti dei grafici
     /// senza toccare il mouse vero.
     fake_pointer: Option<egui::Pos2>,
     fake_pointer_gone: bool,
+    /// Ultima posizione del puntatore simulato comunicata a egui.
+    fake_pointer_sent: Option<egui::Pos2>,
     /// Al prossimo disegno porta in vista il grafico della superficie.
     scroll_to_surface: bool,
     /// La scansione della superficie è disponibile: da amministratore (o nelle verifiche automatiche,
@@ -587,6 +591,7 @@ impl App {
             opt: TestOptions {
                 file_tests: true,
                 seq_read: true,
+                seq_peak: true,
                 rand_read: true,
                 rand_write: true,
                 flush: true,
@@ -617,9 +622,10 @@ impl App {
             script,
             restart_test: (std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() && startup.after.is_none())
                 .then(|| Instant::now() + Duration::from_millis(1500)),
-            chart_rects: [egui::Rect::NOTHING; 5],
+            chart_rects: [egui::Rect::NOTHING; 6],
             fake_pointer: None,
             fake_pointer_gone: false,
+            fake_pointer_sent: None,
             scroll_to_surface: false,
             can_surface: win::is_elevated() || std::env::var_os("MYSTORAGETEST_SURFACE_FILE").is_some(),
             surface_range: HashMap::new(),
@@ -990,6 +996,7 @@ impl App {
             file_tests: whole && self.opt.file_tests,
             file_size: (self.settings.test_size_mb << 20).min(max),
             seq_read: self.opt.seq_read,
+            seq_peak: self.opt.seq_peak,
             rand_read: self.opt.rand_read,
             rand_write: self.opt.rand_write,
             flush: self.opt.flush,
@@ -1618,8 +1625,11 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
+                    // Lo spazio a destra resta al pulsante: con la finestra stretta le caselle vanno a
+                    // capo invece di finirci sotto.
+                    ui.set_max_width((ui.available_width() - 150.0).max(320.0));
                     ui.add_enabled_ui(!testing, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.opt.file_tests, "Velocità e integrità su file temporaneo");
                             egui::ComboBox::from_id_salt("dimensione")
                                 .width(86.0)
@@ -1647,9 +1657,16 @@ impl App {
                             }
                         });
                         ui.add_enabled_ui(self.opt.file_tests, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.add_space(22.0);
                                 ui.checkbox(&mut self.opt.seq_read, "Rilettura e verifica");
+                                ui.checkbox(&mut self.opt.seq_peak, "Velocità massima")
+                                    .on_hover_text(
+                                        "Rilegge il file di prova tenendo più letture in volo insieme (da 1 a 32, \
+                                         blocchi da 1 e 4 MB), come i programmi di benchmark: mostra la velocità \
+                                         massima del disco. La rilettura normale ne fa una alla volta e su NVMe e \
+                                         RAID resta molto più bassa. Dura circa 8 secondi.",
+                                    );
                                 ui.checkbox(&mut self.opt.rand_read, "Lettura casuale 4K");
                                 ui.checkbox(&mut self.opt.rand_write, "Scrittura casuale 4K");
                                 ui.checkbox(&mut self.opt.flush, "Flush su disco");
@@ -1751,6 +1768,7 @@ impl App {
                 ui.label(bold("Cosa viene controllato", 15.0));
                 for line in [
                     "Velocità di scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti.",
+                    "Velocità massima in lettura, con più letture in volo insieme come nei programmi di benchmark: è quella che NVMe e RAID raggiungono davvero.",
                     "Lettura e scrittura casuale a blocchi da 4 KiB: operazioni al secondo e latenza (media, percentili, massimo).",
                     "Flush su disco: l'operazione che fallisce per prima quando un disco o un bridge USB smette di rispondere.",
                     "Lettura dei file già presenti, per trovare settori illeggibili senza modificare nulla.",
@@ -1762,7 +1780,7 @@ impl App {
                     });
                 }
                 ui.add_space(4.0);
-                ui.label(dim("Il file di prova viene eliminato da Windows alla chiusura, anche se il programma viene interrotto: sul disco non resta nulla."));
+                ui.label(dim("Il file di prova (e la cartella creata per lui, dove la radice accetta solo cartelle) viene eliminato da Windows alla chiusura, anche se il programma viene interrotto: sul disco non resta nulla."));
             });
             return;
         };
@@ -1814,8 +1832,10 @@ impl App {
             );
         }
 
-        // Riquadri dei risultati.
-        ui.columns(6, |cols| {
+        // Riquadri dei risultati: prima i contenuti, poi la disposizione (su una riga, o su due quando
+        // la finestra è stretta e i titoli non ci starebbero).
+        let mut tiles: Vec<TileData> = Vec::with_capacity(7);
+        {
             let r = |p: Phase| sh.result(p);
             let live = |p: Phase| sh.phase == Some(p);
             let last_speed = |p: Phase| {
@@ -1825,7 +1845,7 @@ impl App {
                     .and_then(|(_, s)| s.speed.last())
                     .map(|pt| pt[1])
             };
-            for (i, p) in [Phase::SeqWrite, Phase::SeqRead].into_iter().enumerate() {
+            for p in [Phase::SeqWrite, Phase::SeqRead] {
                 let (value, sub) = match (r(p), last_speed(p)) {
                     (Some(res), _) => (
                         num(res.mbps, 0),
@@ -1840,9 +1860,28 @@ impl App {
                     (None, Some(v)) if live(p) => (num(v, 0), "in corso…".into()),
                     _ => ("—".into(), String::new()),
                 };
-                tile(&mut cols[i], p.short(), &value, "MB/s", &sub, phase_color(p));
+                tiles.push(TileData::new(p.short(), value, "MB/s", sub, phase_color(p)));
             }
-            for (i, p) in [Phase::RandRead, Phase::RandWrite].into_iter().enumerate() {
+            // Velocità massima: il passo più veloce, e nel fumetto tutti i passi.
+            let p = Phase::SeqPeak;
+            let (value, sub, note) = match (r(p), last_speed(p)) {
+                (Some(res), _) if res.peak.is_some() => {
+                    let (depth, block) = res.peak.unwrap_or_default();
+                    (
+                        num(res.mbps, 0),
+                        // Corto, per stare nel riquadro: il fumetto lo dice per esteso.
+                        format!("{depth} × {} MB in volo", block >> 20),
+                        res.note.clone(),
+                    )
+                }
+                (Some(res), _) if res.errors > 0 => ("—".into(), format!("{} errori", res.errors), String::new()),
+                (None, Some(v)) if live(p) => (num(v, 0), "in corso…".into(), String::new()),
+                _ => ("—".into(), String::new(), String::new()),
+            };
+            let mut peak = TileData::new(p.short(), value, "MB/s", sub, phase_color(p));
+            peak.peak_note = Some(note);
+            tiles.push(peak);
+            for p in [Phase::RandRead, Phase::RandWrite] {
                 let (value, sub) = match (r(p), last_speed(p)) {
                     (Some(res), _) => (
                         int(res.iops as u64),
@@ -1855,7 +1894,7 @@ impl App {
                     }
                     _ => ("—".into(), String::new()),
                 };
-                tile(&mut cols[2 + i], p.short(), &value, "IOPS", &sub, phase_color(p));
+                tiles.push(TileData::new(p.short(), value, "IOPS", sub, phase_color(p)));
             }
             let (value, unit, sub) = match r(Phase::Flush) {
                 Some(res) if res.ops > 0 => {
@@ -1872,17 +1911,44 @@ impl App {
                 }
                 _ => ("—".to_string(), "", String::new()),
             };
-            tile(&mut cols[4], "Flush", &value, unit, &sub, phase_color(Phase::Flush));
+            tiles.push(TileData::new("Flush", value, unit, sub, phase_color(Phase::Flush)));
             let faults = sh.fault_count;
-            tile(
-                &mut cols[5],
+            tiles.push(TileData::new(
                 "Errori",
-                &int(faults),
+                int(faults),
                 "",
-                &format!("{} stalli · {} saltati", sh.stall_count, sh.skipped),
+                format!("{} stalli · {} saltati", sh.stall_count, sh.skipped),
                 if faults > 0 { BAD } else { GOOD },
-            );
-        });
+            ));
+        }
+        // Sotto questa larghezza i titoli dei sette riquadri non stanno su una riga.
+        let per_row = if ui.available_width() < 820.0 { 4 } else { tiles.len() };
+        let mut peak_rect = egui::Rect::NOTHING;
+        for (row, chunk) in tiles.chunks(per_row).enumerate() {
+            if row > 0 {
+                ui.add_space(2.0);
+            }
+            ui.columns(per_row, |cols| {
+                for (t, col) in chunk.iter().zip(cols.iter_mut()) {
+                    let resp = tile(col, t.title, &t.value, t.unit, &t.sub, t.color);
+                    let Some(note) = &t.peak_note else { continue };
+                    peak_rect = resp.rect;
+                    resp.on_hover_ui(|ui| {
+                        ui.set_max_width(360.0);
+                        ui.label(
+                            "Velocità massima in lettura: il file di prova riletto con più letture in volo \
+                             insieme, come fanno i programmi di benchmark. Il riquadro mostra il passo più veloce.",
+                        );
+                        if !note.is_empty() {
+                            ui.add_space(4.0);
+                            // Spazi che non vanno a capo: ogni passo resta intero sulla sua riga.
+                            let steps = note.replace(" · ", "\n").replace(" → ", "\u{a0}→\u{a0}");
+                            ui.label(RichText::new(steps).color(DIM));
+                        }
+                    });
+                }
+            });
+        }
         for p in [Phase::FileScan, Phase::Surface] {
             if let Some(res) = sh.result(p) {
                 ui.horizontal(|ui| {
@@ -2033,6 +2099,7 @@ impl App {
             });
         drop(sh);
         self.chart_rects[..4].copy_from_slice(&rects);
+        self.chart_rects[5] = peak_rect;
         if toggle_speed {
             self.opt.log_speed = !self.opt.log_speed;
         }
@@ -2911,9 +2978,21 @@ impl App {
                 wait(self.script.as_mut().unwrap(), 400);
             }
             11 if autotest => shot(script, "2c2-istogramma-lineare.png"),
+            // Fumetto del riquadro «Lettura max»: tutti i passi della velocità massima.
+            12 if autotest => {
+                // Il puntatore può essere rimasto fuori dalla finestra (alla larghezza minima il
+                // grafico della distribuzione sta sotto il bordo): prima esce, come un mouse vero.
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                wait(self.script.as_mut().unwrap(), 300);
+            }
+            13 if autotest => {
+                self.fake_pointer = Some(self.chart_rects[5].center());
+                wait(self.script.as_mut().unwrap(), 1200);
+            }
+            14 if autotest => shot(script, "2c3-lettura-max.png"),
             // Grafico della superficie: la scansione vera richiede l'amministratore, quindi qui si
             // prova solo il disegno, con dati inventati.
-            12 if autotest => {
+            15 if autotest => {
                 self.opt.log_hist = true;
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 if let Some(Sel::Volume(l)) = self.selected {
@@ -2924,14 +3003,14 @@ impl App {
                 self.scroll_to_surface = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            13 if autotest => {
+            16 if autotest => {
                 let rect = self.chart_rects[3];
                 self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * 0.755, rect.height() * 0.4));
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            14 if autotest => shot(script, "2d-superficie.png"),
+            17 if autotest => shot(script, "2d-superficie.png"),
             // Una pagina Test per disco: si guarda un altro volume e poi si torna.
-            15 if autotest => {
+            18 if autotest => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 let home = script.home;
                 self.selected = script.second.or_else(|| {
@@ -2944,58 +3023,58 @@ impl App {
                 });
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            16 if autotest => shot(script, "2e-altro-disco.png"),
-            17 if autotest => {
+            19 if autotest => shot(script, "2e-altro-disco.png"),
+            20 if autotest => {
                 self.selected = script.home;
                 self.scroll_to_selected = true;
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            18 if autotest => shot(script, "2f-ritorno.png"),
+            21 if autotest => shot(script, "2f-ritorno.png"),
             // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
-            19 => {
+            22 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Info;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            20 => {
+            23 => {
                 // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
                 if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 20;
+                    script.step = 23;
                     wait(script, 200);
                 } else {
                     shot(script, "2g-info.png");
                 }
             }
-            21 => {
+            24 => {
                 self.scroll_to_diag = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            22 => shot(script, "2h-info-diagnosi.png"),
-            23 => {
+            25 => shot(script, "2h-info-diagnosi.png"),
+            26 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            24 => shot(script, "3-smart.png"),
-            25 => {
+            27 => shot(script, "3-smart.png"),
+            28 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            26 => {
+            29 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 26;
+                    script.step = 29;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            27 => {
+            30 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            28 => {
+            31 => {
                 // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
                 if rect.is_positive() {
@@ -3003,8 +3082,8 @@ impl App {
                 }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            29 => shot(script, "5-temperatura.png"),
-            30 => {
+            32 => shot(script, "5-temperatura.png"),
+            33 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -3016,8 +3095,8 @@ impl App {
                 self.monitor_view = true;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            31 => shot(script, "6-monitoraggio.png"),
-            32 => {
+            34 => shot(script, "6-monitoraggio.png"),
+            35 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -3054,7 +3133,31 @@ fn fake_surface(sh: &mut tester::Shared) {
     sh.surface_bad = vec![(0.751 * len) as u64, (0.757 * len) as u64];
 }
 
-fn tile(ui: &mut Ui, title: &str, value: &str, unit: &str, sub: &str, color: Color32) {
+/// Contenuto di un riquadro dei risultati della scheda Test.
+struct TileData {
+    title: &'static str,
+    value: String,
+    unit: &'static str,
+    sub: String,
+    color: Color32,
+    /// Solo per «Lettura max»: i passi della prova, per il fumetto.
+    peak_note: Option<String>,
+}
+
+impl TileData {
+    fn new(title: &'static str, value: String, unit: &'static str, sub: String, color: Color32) -> Self {
+        TileData {
+            title,
+            value,
+            unit,
+            sub,
+            color,
+            peak_note: None,
+        }
+    }
+}
+
+fn tile(ui: &mut Ui, title: &str, value: &str, unit: &str, sub: &str, color: Color32) -> egui::Response {
     Frame::new()
         .fill(CARD)
         .corner_radius(CornerRadius::same(12))
@@ -3067,14 +3170,24 @@ fn tile(ui: &mut Ui, title: &str, value: &str, unit: &str, sub: &str, color: Col
             ui.set_min_height(64.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("●").color(color).size(10.0));
-                ui.label(dim(title));
+                ui.add(egui::Label::new(dim(title)).truncate());
             });
+            // Con la finestra stretta i riquadri si restringono: il numero rimpicciolisce invece di
+            // uscire dal riquadro.
+            let room = ui.available_width();
+            let width = |text: &str, font: FontId| ui.painter().layout_no_wrap(text.to_string(), font, TEXT).size().x;
+            let unit_w = width(unit, FontId::proportional(12.5)) + ui.spacing().item_spacing.x;
+            let size = [24.0f32, 21.0, 18.0, 16.0]
+                .into_iter()
+                .find(|&s| width(value, FontId::new(s, FontFamily::Name("semibold".into()))) + unit_w <= room)
+                .unwrap_or(16.0);
             ui.horizontal(|ui| {
-                ui.label(bold(value, 24.0));
+                ui.label(bold(value, size));
                 ui.label(dim(unit));
             });
             ui.add(egui::Label::new(dim(sub)).truncate());
-        });
+        })
+        .response
 }
 
 fn chart_frame(ui: &mut Ui, title: &str, height: f32, extra: impl FnOnce(&mut Ui), body: impl FnOnce(&mut Ui)) {
@@ -3245,6 +3358,10 @@ fn phase_meaning(p: Phase) -> &'static str {
         Phase::SeqWrite => "La prova scrive il file di prova dall'inizio alla fine, a blocchi da 1 MB.",
         Phase::SeqRead => {
             "La prova rilegge il file di prova dall'inizio alla fine e controlla che i dati siano quelli scritti."
+        }
+        Phase::SeqPeak => {
+            "La prova rilegge il file di prova tenendo più letture in volo insieme, a passi: da 1 a 32 letture, \
+             blocchi da 1 e 4 MB, un secondo per passo. Il risultato è il passo più veloce."
         }
         Phase::RandRead => "La prova legge blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
         Phase::RandWrite => "La prova scrive blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
@@ -4451,10 +4568,17 @@ impl eframe::App for App {
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         // Solo per le verifiche automatiche: simula il puntatore senza toccare il mouse vero.
+        // Come un mouse vero, un evento solo quando il puntatore si sposta: ripetuto a ogni
+        // fotogramma, egui lo crederebbe sempre in movimento e i fumetti normali, che aspettano il
+        // puntatore fermo, non comparirebbero.
         if let Some(pos) = self.fake_pointer {
-            raw_input.events.push(egui::Event::PointerMoved(pos));
+            if self.fake_pointer_sent != Some(pos) {
+                raw_input.events.push(egui::Event::PointerMoved(pos));
+                self.fake_pointer_sent = Some(pos);
+            }
         } else if std::mem::take(&mut self.fake_pointer_gone) {
             raw_input.events.push(egui::Event::PointerGone);
+            self.fake_pointer_sent = None;
         }
         raw_input.events.append(&mut self.fake_events);
     }
@@ -4528,6 +4652,13 @@ pub fn run(args: &[String]) -> i32 {
         let mut it = pos.split(',').filter_map(|s| s.trim().parse::<f32>().ok());
         if let (Some(x), Some(y)) = (it.next(), it.next()) {
             viewport = viewport.with_position([x, y]);
+        }
+    }
+    // Per le verifiche automatiche: la finestra a una dimensione data, per esempio la più piccola.
+    if let Ok(size) = std::env::var("MYSTORAGETEST_SIZE") {
+        let mut it = size.split(',').filter_map(|s| s.trim().parse::<f32>().ok());
+        if let (Some(w), Some(h)) = (it.next(), it.next()) {
+            viewport = viewport.with_inner_size([w, h]);
         }
     }
     let options = eframe::NativeOptions {
