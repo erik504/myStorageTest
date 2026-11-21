@@ -32,10 +32,21 @@ modo in cui li usano (a strisce, esteso, in mirroring, chiesto a Windows), e i c
 VeraCrypt o TrueCrypt, collegati al disco o al volume che contiene il loro file. In fondo i dischi virtuali
 e i volumi senza un disco fisico, ciascuno con il driver che lo crea (per esempio Google Drive con il suo
 driver di file system): Windows dice se un driver sta sul percorso delle richieste di un volume, e lo si
-chiede per ogni driver caricato. Il grafo si stringe per stare in larghezza nella finestra; Ctrl +
-rotellina lo ingrandisce o lo rimpicciolisce. Passando sopra a un riquadro si vedono i nomi completi e
-gli identificativi di Windows, e si accendono il percorso fino al processore e la voce corrispondente
-nella colonna a sinistra; passando sopra a una voce della colonna si accendono i suoi dischi nel grafo.
+chiede per ogni driver caricato. Il grafo sta in un riquadro suo e all'inizio vi entra tutto (non sotto
+il 45 %); la rotellina lo ingrandisce o lo rimpicciolisce attorno al puntatore, trascinandolo con il mouse
+lo si sposta, + e − ingrandiscono e rimpiccioliscono, le frecce lo spostano (con Maiuscolo a passi più
+lunghi) e 0 torna alla vista iniziale; sotto il grafo c'è la scala. Passando sopra a un riquadro si
+vedono i nomi completi e gli identificativi, e si accendono il percorso fino al processore e la voce
+corrispondente nella colonna a sinistra; passando sopra a una voce della colonna si accendono i suoi
+dischi nel grafo. Gli identificativi di un riquadro: ID istanza di Windows, indirizzo PCI
+(bus:dispositivo.funzione), percorsi di posizione (`PCIROOT(0)#PCI(0301)#PCI(0000)` e quello ACPI, con il
+nome della porta nel firmware), il numero dello slot quando il firmware lo dichiara; per i dischi anche
+`\\.\PhysicalDriveN`, la posizione, il numero di serie e gli identificativi del controller NVMe o del
+dispositivo USB che li contiene; per i controller USB l'hub radice; per hub e dispositivi USB la porta e il
+percorso fino a lì (`…#USBROOT(0)#USB(8)#USB(1)`); per i volumi il nome `\\?\Volume{…}\`, il dispositivo
+di Windows e i driver. Sulle linee il canale: la porta PCIe da cui passa il collegamento (indirizzo, ID
+istanza, percorsi), la porta dell'hub USB o quella del controller SATA, il file di un contenitore. Il clic
+destro su un riquadro o su una linea copia gli identificativi; anche `--graph` li stampa.
 Un clic su un disco ne apre la pagina. Il grafo viene dall'albero dei dispositivi di Windows: per ogni
 disco e per ogni dispositivo PCI si risale fino al processore, senza privilegi di amministratore e senza
 svegliare i dischi fermi, e si ricostruisce quando i dischi cambiano.
@@ -296,7 +307,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - comandi diretti a due chiavette USB (una su UASP, una no), che Windows lascia passare anche senza privilegi: i comandi SAT partono, vengono rifiutati come previsto e le chiavette risultano senza SMART, senza altri tentativi;
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
 - interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
-- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo.
+- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo. La vista del grafo con eventi simulati: rotellina e tasto + ingrandiscono attorno al puntatore, le frecce spostano, 0 torna alla vista iniziale, e un trascinamento che parte sopra un disco sposta la vista senza aprirlo. Gli identificativi di porte, controller, NVMe, hub radice, hub e dispositivi USB e volumi, confrontati con le proprietà che Windows dà per ciascun dispositivo (ID istanza, indirizzi PCI, percorsi di posizione, nomi ACPI delle porte del processore e del chipset); il clic destro che li copia non è nelle verifiche automatiche, per non toccare gli appunti.
 
 Non ancora verificato:
 

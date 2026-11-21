@@ -15,7 +15,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Locate_DevNodeW, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
 };
 use windows_sys::Win32::Foundation::DEVPROPKEY;
-use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+use windows_sys::Win32::Storage::FileSystem::{GetVolumeNameForVolumeMountPointW, QueryDosDeviceW};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameW};
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
@@ -30,7 +30,12 @@ const CM_DRP_SERVICE: u32 = 0x05;
 const CM_DRP_CLASS: u32 = 0x08;
 const CM_DRP_FRIENDLYNAME: u32 = 0x0D;
 const CM_DRP_LOCATION_INFORMATION: u32 = 0x0E;
+const CM_DRP_UI_NUMBER: u32 = 0x13;
 const CM_DRP_ADDRESS: u32 = 0x1D;
+const CM_DRP_LOCATION_PATHS: u32 = 0x24;
+
+/// Identificativi da mostrare e copiare: voce e valore.
+pub type Ids = Vec<(String, String)>;
 
 /// Che cosa è un riquadro del grafo: decide la forma e il posto.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +102,12 @@ pub struct Node {
     pub bw_tip: String,
     /// Il collegamento va più piano di quanto il dispositivo potrebbe.
     pub warn: bool,
+    /// Identificativi del riquadro: ID istanza di Windows, indirizzo PCI, percorsi di posizione, numero
+    /// di serie, nome del volume…
+    pub ids: Ids,
+    /// Identificativi del collegamento con il riquadro a sinistra: la porta PCIe (indirizzo, ID istanza,
+    /// percorsi), la porta dell'hub USB o del controller SATA.
+    pub link_ids: Ids,
     pub disk: Option<u32>,
     pub letters: Vec<char>,
     pub children: Vec<usize>,
@@ -145,6 +156,46 @@ struct Dev {
     name: String,
     location: String,
     address: Option<u32>,
+    /// Percorsi di posizione: «PCIROOT(0)#PCI(0301)#PCI(0000)», «ACPI(_SB_)#ACPI(PCI0)#ACPI(GPP8)…»,
+    /// per l'USB «…#USBROOT(0)#USB(8)#USB(1)».
+    paths: Vec<String>,
+    /// Numero dello slot, se il firmware lo dichiara.
+    slot: Option<u32>,
+}
+
+fn dev_multi(node: u32, prop: u32) -> Vec<String> {
+    let mut buf = [0u16; 2048];
+    let mut len = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        CM_Get_DevNode_Registry_PropertyW(node, prop, null_mut(), buf.as_mut_ptr() as *mut c_void, &mut len, 0)
+    };
+    if rc != 0 {
+        return Vec::new();
+    }
+    buf[..(len as usize / 2).min(buf.len())]
+        .split(|&c| c == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+/// Gli identificativi di un dispositivo; `whose` si aggiunge alle voci («del controller NVMe»).
+fn dev_ids(dev: &Dev, whose: &str) -> Ids {
+    let sep = if whose.is_empty() { "" } else { " " };
+    let mut v = vec![(format!("ID istanza{sep}{whose}"), dev.id.clone())];
+    match pci_address(&dev.location).filter(|_| dev.id.to_ascii_uppercase().starts_with("PCI\\")) {
+        Some(a) => v.push((format!("Indirizzo PCI{sep}{whose}"), a)),
+        None if !dev.location.is_empty() => v.push((format!("Posizione{sep}{whose}"), dev.location.clone())),
+        None => {}
+    }
+    for p in &dev.paths {
+        let what = if p.starts_with("ACPI") { "Percorso ACPI" } else { "Percorso" };
+        v.push((format!("{what}{sep}{whose}"), p.clone()));
+    }
+    if let Some(n) = dev.slot.filter(|_| dev.id.to_ascii_uppercase().starts_with("PCI\\")) {
+        v.push((format!("Slot{sep}{whose}"), n.to_string()));
+    }
+    v
 }
 
 fn dev_string(node: u32, prop: u32) -> String {
@@ -199,6 +250,8 @@ fn chain_of(start: u32) -> Vec<Dev> {
             class: dev_string(node, CM_DRP_CLASS).to_ascii_lowercase(),
             location: dev_string(node, CM_DRP_LOCATION_INFORMATION),
             address: dev_u32(node, CM_DRP_ADDRESS),
+            paths: dev_multi(node, CM_DRP_LOCATION_PATHS),
+            slot: dev_u32(node, CM_DRP_UI_NUMBER),
             id,
         });
         let mut parent = 0u32;
@@ -486,6 +539,8 @@ fn item(key: String, kind: Kind, icon: Icon, title: String, lines: Vec<String>, 
             bw: None,
             bw_tip: String::new(),
             warn: false,
+            ids: Vec::new(),
+            link_ids: Vec::new(),
             disk: None,
             letters: Vec::new(),
             children: Vec::new(),
@@ -500,6 +555,16 @@ fn item(key: String, kind: Kind, icon: Icon, title: String, lines: Vec<String>, 
 struct Port {
     addr: String,
     internal: bool,
+    /// Identificativi della porta: vanno sul collegamento con il riquadro che sta dietro.
+    ids: Ids,
+}
+
+fn port_of(dev: &Dev) -> Port {
+    Port {
+        addr: pci_address(&dev.location).unwrap_or_default(),
+        internal: internal_bridge(dev),
+        ids: dev_ids(dev, "della porta"),
+    }
 }
 
 /// I riquadri del percorso fino al dispositivo `chain[end]` escluso, e quello che il dispositivo
@@ -533,9 +598,10 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
                 Icon::Cpu,
                 cpu.to_string(),
                 vec!["processore · radice PCIe".into()],
-                format!("{cpu}\n{}\n{}", dev.name, dev.id),
+                format!("{cpu}\n{}", dev.name),
             );
             it.node.order = "0".into();
+            it.node.ids = dev_ids(dev, "");
             w.items.push(it);
         } else if is_bridge(dev) {
             let parent_bridge = i > 0 && is_bridge(&chain[i - 1]);
@@ -556,13 +622,13 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
                     title.clone(),
                     vec![format!("switch PCIe · {v:04X}:{devid:04X}")],
                     format!(
-                        "{}\n{}\n{}{}",
+                        "{}{}",
                         dev.name,
-                        dev.location,
-                        dev.id,
                         via.as_ref().map(|p| format!("\ncollegato alla porta PCIe {} del processore", p.addr)).unwrap_or_default()
                     ),
                 );
+                it.node.ids = dev_ids(dev, "");
+                it.node.link_ids = via.as_ref().map(|p| p.ids.clone()).unwrap_or_default();
                 // Windows non dichiara il collegamento del chipset: per l'X570 è noto (PCIe 4.0 x4).
                 if (v, devid) == (0x1022, 0x57AD) {
                     let l = PcieLink {
@@ -585,10 +651,7 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
                 it.node.order = via.map(|p| p.addr).unwrap_or_default();
                 w.items.push(it);
             } else {
-                w.port = Some(Port {
-                    addr: pci_address(&dev.location).unwrap_or_default(),
-                    internal: internal_bridge(dev),
-                });
+                w.port = Some(port_of(dev));
             }
         } else if up.starts_with("PCI\\") {
             if dev.service == "stornvme" || (nvme_disk && chain.get(i + 1).is_some_and(|n| n.class == "diskdrive")) {
@@ -598,7 +661,10 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
             }
             w.items.push(controller_item(dev, &mut w.port, w.uplink, true));
         } else if up.starts_with("USB\\ROOT_HUB") {
-            // L'hub radice fa parte del controller.
+            // L'hub radice fa parte del controller: i suoi identificativi vanno lì.
+            if let Some(ctrl) = w.items.last_mut().filter(|it| it.node.kind == Kind::UsbController) {
+                ctrl.node.ids.extend(dev_ids(dev, "dell'hub radice"));
+            }
         } else if up.starts_with("USB\\") {
             if dev.service.starts_with("usbhub") {
                 let usb3 = dev.name.contains("SuperSpeed") || dev.name.contains("USB 3");
@@ -611,9 +677,11 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
                     Icon::Hub,
                     if usb3 { "Hub USB 3".into() } else { "Hub USB 2".into() },
                     vec![format!("{v:04X}:{p:04X}{maker}")],
-                    format!("{}\n{}\n{}", dev.name, dev.location, dev.id),
+                    dev.name.clone(),
                 );
                 it.node.link = Link::Usb;
+                it.node.ids = dev_ids(dev, "");
+                it.node.link_ids = usb_port_ids(dev);
                 it.node.edge = dev.address.map(|a| format!("porta {a}")).unwrap_or_default();
                 it.node.order = format!("p{:03}", dev.address.unwrap_or(0));
                 match info::usb_link(&dev.id) {
@@ -636,6 +704,21 @@ fn walk<'a>(chain: &'a [Dev], end: usize, cpu: &str, nvme_disk: bool) -> Walk<'a
         }
     }
     w
+}
+
+/// Identificativi del collegamento USB di un dispositivo: la porta dell'hub e la posizione.
+fn usb_port_ids(dev: &Dev) -> Ids {
+    let mut v = Vec::new();
+    if let Some(a) = dev.address {
+        v.push(("Porta dell'hub".to_string(), a.to_string()));
+    }
+    if !dev.location.is_empty() {
+        v.push(("Posizione".to_string(), dev.location.clone()));
+    }
+    if let Some(p) = dev.paths.iter().find(|p| p.contains("USB(")) {
+        v.push(("Percorso".to_string(), p.clone()));
+    }
+    v
 }
 
 fn virtual_root(tip: String) -> Item {
@@ -690,17 +773,17 @@ fn controller_item(dev: &Dev, port: &mut Option<Port>, uplink: Option<f64>, with
         title,
         lines,
         format!(
-            "{}\n{}{}\n{}",
+            "{}{}",
             dev.name,
-            dev.location,
-            via.as_ref().map(|p| format!(" · dietro la porta PCIe {}", p.addr)).unwrap_or_default(),
-            dev.id
+            via.as_ref().map(|p| format!("\ndietro la porta PCIe {}", p.addr)).unwrap_or_default(),
         ),
     );
     it.node.edge = edge;
     it.node.bw = bw;
     it.node.bw_tip = bw_tip;
     it.node.warn = warn;
+    it.node.ids = dev_ids(dev, "");
+    it.node.link_ids = via.as_ref().map(|p| p.ids.clone()).unwrap_or_default();
     it.node.order = via.map(|p| p.addr).or_else(|| pci_address(&dev.location)).unwrap_or_default();
     it
 }
@@ -806,11 +889,15 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
     n.domain = if virtual_bus { Link::Soft } else { Link::Sata };
     n.link = n.domain;
     let mut port_tip = String::new();
+    // Identificativi del disco, poi del controller NVMe o del dispositivo USB che lo contiene.
+    let mut more_ids: Ids = Vec::new();
     if let Some(nvme) = w.nvme {
         n.domain = Link::Pcie;
         n.link = Link::Pcie;
         let via = w.port.take();
         port_tip = via.as_ref().map(|p| format!("\nporta PCIe {}", p.addr)).unwrap_or_default();
+        n.link_ids = via.as_ref().map(|p| p.ids.clone()).unwrap_or_default();
+        more_ids = dev_ids(nvme, "del controller NVMe");
         n.order = via.map(|p| p.addr).unwrap_or_default();
         match links.pcie.or_else(|| info::pcie_link_node(nvme.node)) {
             Some(l) => {
@@ -849,6 +936,8 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
         }
         n.edge = dev.address.map(|a| format!("porta {a}")).unwrap_or_default();
         n.order = format!("p{:03}", dev.address.unwrap_or(0));
+        n.link_ids = usb_port_ids(dev);
+        more_ids = dev_ids(dev, "del dispositivo USB");
     }
     if let Some(s) = links.sata {
         let (text, slow) = info::sata_short(&s);
@@ -885,6 +974,10 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
             {
                 n.edge = format!("porta {port}");
                 n.order = format!("p{port:03}");
+                n.link_ids = vec![
+                    ("Porta SATA".to_string(), port.to_string()),
+                    ("Posizione".to_string(), disk_dev.location.clone()),
+                ];
             }
         }
     }
@@ -896,11 +989,18 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
         n.bw_tip = "Windows non dichiara la velocità di questo collegamento.".into();
     }
     n.lines = lines;
-    n.tip = format!(
-        "{}\n{}{port_tip}",
-        chain.last().map(|x| x.name.as_str()).unwrap_or_default(),
-        d.instance_id
-    );
+    n.tip = format!("{}{port_tip}", chain.last().map(|x| x.name.as_str()).unwrap_or_default());
+    n.ids = vec![
+        ("Disco di Windows".to_string(), d.device_path()),
+        ("ID istanza del disco".to_string(), d.instance_id.clone()),
+    ];
+    if let Some(disk_dev) = chain.last().filter(|x| !x.location.is_empty()) {
+        n.ids.push(("Posizione del disco".to_string(), disk_dev.location.clone()));
+    }
+    if !d.serial.is_empty() {
+        n.ids.push(("Numero di serie".to_string(), d.serial.clone()));
+    }
+    n.ids.extend(more_ids);
     n.disk = Some(d.number);
     n.letters = d.letters.clone();
     w.items.push(leaf);
@@ -930,8 +1030,9 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
             Icon::Port,
             "Porta PCIe libera".into(),
             vec![format!("{addr} · niente collegato")],
-            format!("{}\n{}\n{}", dev.name, dev.location, dev.id),
+            dev.name.clone(),
         );
+        it.node.ids = dev_ids(dev, "");
         it.node.bw_tip = "Porta PCIe senza dispositivi: uno slot o un connettore M.2 libero, o spento dal BIOS.".into();
         it.node.order = addr;
         w.items.push(it);
@@ -996,17 +1097,17 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
         dev.name.clone(),
         lines,
         format!(
-            "{}\n{}{}\n{}",
+            "{}{}",
             dev.name,
-            dev.location,
-            via.as_ref().map(|p| format!(" · dietro la porta PCIe {}", p.addr)).unwrap_or_default(),
-            dev.id
+            via.as_ref().map(|p| format!("\ndietro la porta PCIe {}", p.addr)).unwrap_or_default(),
         ),
     );
     it.node.edge = edge;
     it.node.bw = bw;
     it.node.bw_tip = bw_tip;
     it.node.warn = warn;
+    it.node.ids = dev_ids(dev, "");
+    it.node.link_ids = via.as_ref().map(|p| p.ids.clone()).unwrap_or_default();
     it.node.order = via.map(|p| p.addr).unwrap_or(at);
     w.items.push(it);
     Some(w.items)
@@ -1096,6 +1197,22 @@ fn dos_device(letter: char) -> String {
     let mut buf = [0u16; 512];
     let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
     if n == 0 { String::new() } else { win::from_wide(&buf) }
+}
+
+/// Identificativi di un volume: il suo nome per Windows, che non dipende dalla lettera, e il
+/// dispositivo dietro la lettera.
+fn volume_ids(letter: char) -> Ids {
+    let root = win::wide(&format!("{letter}:\\"));
+    let mut guid = [0u16; 64];
+    let mut v = Vec::new();
+    if unsafe { GetVolumeNameForVolumeMountPointW(root.as_ptr(), guid.as_mut_ptr(), guid.len() as u32) } != 0 {
+        v.push(("Volume".to_string(), win::from_wide(&guid)));
+    }
+    let device = dos_device(letter);
+    if !device.is_empty() {
+        v.push(("Dispositivo".to_string(), device));
+    }
+    v
 }
 
 /// Nomi dei driver caricati, senza estensione.
@@ -1360,6 +1477,7 @@ pub fn build(inv: &Inventory) -> Graph {
             }
         );
         it.node.letters = vec![v.letter];
+        it.node.ids = volume_ids(v.letter);
         it.node.hosts = hosts;
         let n = g.nodes.len();
         index.insert(it.key, n);
@@ -1395,13 +1513,7 @@ pub fn build(inv: &Inventory) -> Graph {
             if let Some(m) = &maker {
                 tip.push_str(&format!("\nCreato da: {m}"));
             }
-            if !shown.is_empty() {
-                tip.push_str(&format!("\nContenitore: {shown}"));
-            }
-            if !probe.device.is_empty() {
-                tip.push_str(&format!("\nDispositivo: {}", probe.device));
-            }
-            tip.push_str(&format!("\nDriver sul percorso: {}", probe.driver_line().trim_start_matches("driver ")));
+            tip.push_str(&format!("\n{}", probe.driver_line()));
             let mut it = item(
                 format!("vol:{}", v.letter),
                 Kind::Volume,
@@ -1412,6 +1524,17 @@ pub fn build(inv: &Inventory) -> Graph {
             );
             it.node.link = Link::Soft;
             it.node.letters = vec![v.letter];
+            it.node.ids = volume_ids(v.letter);
+            for (d, fs) in &probe.drivers {
+                it.node.ids.push((
+                    if *fs { "Driver di file system".into() } else { "Driver".into() },
+                    format!(r"{}\{d}", if *fs { r"\FileSystem" } else { r"\Driver" }),
+                ));
+            }
+            if !shown.is_empty() {
+                it.node.ids.push(("Contenitore".into(), shown.clone()));
+                it.node.link_ids = vec![("File del contenitore".into(), shown.clone())];
+            }
             it.node.bw_tip = if probe.container.is_some() {
                 format!(
                     "{}: è un contenitore cifrato {} in {shown}: ogni lettura e scrittura passa dalla cifratura, \

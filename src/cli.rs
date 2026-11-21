@@ -180,6 +180,12 @@ fn graph() -> i32 {
         for line in &n.lines {
             println!("{pad}    · {line}");
         }
+        for (k, v) in &n.link_ids {
+            println!("{pad}    ← {k}: {v}");
+        }
+        for (k, v) in &n.ids {
+            println!("{pad}    # {k}: {v}");
+        }
         for &c in &n.children {
             show(g, c, depth + 1);
         }
@@ -195,6 +201,12 @@ fn graph() -> i32 {
             println!("  col {} {:?}/{:?} {} ← {}", n.side_col, n.kind, n.icon, n.title, hosts.join(" + "));
             for line in &n.lines {
                 println!("      · {line}");
+            }
+            for (k, v) in &n.link_ids {
+                println!("      ← {k}: {v}");
+            }
+            for (k, v) in &n.ids {
+                println!("      # {k}: {v}");
             }
             println!("      linea: {}", n.bw_tip.replace('\n', " / "));
         }

@@ -328,6 +328,30 @@ fn one_line(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Ar
     ui.painter().layout_job(job)
 }
 
+/// Identificativi in una tabella: voce a sinistra, valore a destra in carattere a spaziatura fissa.
+fn ids_grid(ui: &mut Ui, id: impl std::hash::Hash + std::fmt::Debug, ids: &[(String, String)]) {
+    if ids.is_empty() {
+        return;
+    }
+    ui.add_space(2.0);
+    egui::Grid::new(id).num_columns(2).spacing([10.0, 1.0]).min_row_height(15.0).show(ui, |ui| {
+        for (k, v) in ids {
+            ui.label(RichText::new(k).color(DIM).size(12.0));
+            ui.label(RichText::new(v).monospace().size(11.5).color(TEXT));
+            ui.end_row();
+        }
+    });
+}
+
+/// Gli stessi identificativi come testo da copiare: un titolo e una riga per voce.
+fn ids_text(title: &str, ids: &[(String, String)]) -> String {
+    let mut s = format!("{title}\n");
+    for (k, v) in ids {
+        s.push_str(&format!("{k}: {v}\n"));
+    }
+    s
+}
+
 /// Solo per le verifiche automatiche: un punto su un collegamento del grafo e il centro di un disco,
 /// annotati dall'ultimo disegno.
 fn graph_probe(ctx: &egui::Context) -> Option<(egui::Pos2, egui::Pos2)> {
@@ -460,12 +484,85 @@ fn draw_graph(
             Some(at)
         })
         .collect();
-    // Scala: quella scelta con Ctrl + rotellina, se c'è; altrimenti il grafo si stringe per stare in
-    // larghezza nella finestra e vedersi tutto, ma non sotto il 60 %.
-    let zoom_id = egui::Id::unique("zoom del grafo storage");
+    // Vista: il grafo sta in un riquadro suo. La rotellina lo ingrandisce attorno al puntatore,
+    // trascinando lo si sposta; + e − ingrandiscono, le frecce spostano (con Maiuscolo di più), 0 torna
+    // alla vista iniziale: tutto il grafo nel riquadro (non sotto il 45 %), che segue la finestra
+    // finché non lo si tocca.
     let natural = col_x_1[ncols - 1] + col_w_1[ncols - 1] + if side_cols > 0 { 36.0 } else { 12.0 };
-    let fit = ((ui.available_width() - 16.0) / natural).clamp(0.6, 1.0);
-    let s = ui.ctx().data(|d| d.get_temp::<f32>(zoom_id)).unwrap_or(fit);
+    let nat = vec2(natural, rows * ROW_1 + 8.0);
+    // Sotto il riquadro resta una riga per la scala e i comandi.
+    let size = vec2(ui.available_width(), (ui.available_height() - 22.0).max(240.0));
+    let (area, area_resp) = ui.allocate_exact_size(size, Sense::CLICK | Sense::DRAG);
+    let view_id = egui::Id::unique("vista del grafo storage");
+    let fitted = GraphView {
+        zoom: ((size.x - 12.0) / nat.x).min((size.y - 8.0) / nat.y).clamp(0.45, 1.0),
+        offset: vec2(4.0, 4.0),
+    };
+    let mut view = ui.ctx().data(|d| d.get_temp::<Option<GraphView>>(view_id)).flatten().unwrap_or(fitted);
+    let keys = !ui.ctx().egui_wants_keyboard_input();
+    let over = area_resp.contains_pointer();
+    let (wheel, pinch, nearer, farther, reset, arrows) = ui.ctx().input_mut(|i| {
+        let wheel = if over { std::mem::take(&mut i.smooth_scroll_delta) } else { Vec2::ZERO };
+        let pinch = if over { i.zoom_delta() } else { 1.0 };
+        let key = |k: egui::Key| keys && i.key_pressed(k);
+        let step = if i.modifiers.shift { 240.0 } else { 60.0 };
+        let mut arrows = Vec2::ZERO;
+        for (k, d) in [
+            (egui::Key::ArrowLeft, vec2(step, 0.0)),
+            (egui::Key::ArrowRight, vec2(-step, 0.0)),
+            (egui::Key::ArrowUp, vec2(0.0, step)),
+            (egui::Key::ArrowDown, vec2(0.0, -step)),
+        ] {
+            if key(k) {
+                arrows += d;
+            }
+        }
+        (
+            wheel,
+            pinch,
+            key(egui::Key::Plus) || key(egui::Key::Equals),
+            key(egui::Key::Minus),
+            key(egui::Key::Num0),
+            arrows,
+        )
+    });
+    // Ingrandisce di `factor` tenendo fermo il punto `at` dello schermo.
+    let zoom_at = |v: &mut GraphView, at: egui::Pos2, factor: f32| {
+        let next = (v.zoom * factor).clamp(0.3, 2.5);
+        let rel = at - area.min;
+        v.offset = rel - (rel - v.offset) * (next / v.zoom);
+        v.zoom = next;
+    };
+    let pointer_at = ui.input(|i| i.pointer.hover_pos()).filter(|p| area.contains(*p));
+    let before = view;
+    let factor = pinch * (wheel.y * 0.004).exp();
+    if factor != 1.0 {
+        zoom_at(&mut view, pointer_at.unwrap_or(area.center()), factor);
+    }
+    view.offset.x += wheel.x;
+    if nearer {
+        zoom_at(&mut view, pointer_at.unwrap_or(area.center()), 1.25);
+    }
+    if farther {
+        zoom_at(&mut view, pointer_at.unwrap_or(area.center()), 0.8);
+    }
+    view.offset += arrows;
+    if area_resp.dragged() {
+        view.offset += area_resp.drag_delta();
+    }
+    if reset {
+        ui.ctx().data_mut(|d| d.insert_temp(view_id, None::<GraphView>));
+        view = fitted;
+        ui.ctx().request_repaint();
+    } else if view != before {
+        // Almeno un pezzo di grafo resta sempre nel riquadro.
+        let content = nat * view.zoom;
+        view.offset.x = view.offset.x.clamp(80.0 - content.x, size.x - 80.0);
+        view.offset.y = view.offset.y.clamp(80.0 - content.y, size.y - 80.0);
+        ui.ctx().data_mut(|d| d.insert_temp(view_id, Some(view)));
+        ui.ctx().request_repaint();
+    }
+    let s = view.zoom;
     let row_h = ROW_1 * s;
     let lines_of = |i: usize| g.nodes[i].lines.len().min(3) as f32;
     let height = |i: usize| (24.0 + 14.5 * lines_of(i)) * s;
@@ -518,23 +615,12 @@ fn draw_graph(
         }
     }
 
-    let total = vec2(natural * s, rows * row_h + 8.0);
     let (mut picked, mut hovered) = (None, None);
-    egui::ScrollArea::both()
-        .id_salt("grafo-storage")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let (area, area_resp) = ui.allocate_exact_size(total, Sense::hover());
-            // Ctrl + rotellina: ingrandisce o rimpicciolisce il grafo, fra il 50 e il 150 %.
-            if area_resp.contains_pointer() {
-                let zoom = ui.input(|i| i.zoom_delta());
-                if zoom != 1.0 {
-                    let next = (s * zoom).clamp(0.5, 1.5);
-                    ui.ctx().data_mut(|d| d.insert_temp(zoom_id, next));
-                    ui.ctx().request_repaint();
-                }
-            }
-            let origin = area.min + vec2(4.0, 4.0);
+    // Riquadro o canale di cui si sono appena copiati gli identificativi.
+    let mut copied: Option<String> = None;
+    {
+        {
+            let origin = area.min + view.offset;
             let rects: Vec<egui::Rect> = (0..n)
                 .map(|i| {
                     let h = height(i);
@@ -542,9 +628,8 @@ fn draw_graph(
                     egui::Rect::from_min_size(egui::pos2(origin.x + col_x_1[col(i)] * s, top), vec2(width(i), h))
                 })
                 .collect();
-            let pointer = ui
-                .input(|i| i.pointer.hover_pos())
-                .filter(|p| area_resp.contains_pointer() && ui.clip_rect().contains(*p));
+            // Durante il trascinamento niente fumetti né evidenziazioni: si sta spostando la vista.
+            let pointer = pointer_at.filter(|_| !area_resp.dragged());
             let over_node = pointer.and_then(|p| (0..n).find(|&i| rects[i].contains(p)));
             let curves: Vec<[egui::Pos2; 4]> = edges
                 .iter()
@@ -614,7 +699,9 @@ fn draw_graph(
                 }
             }
 
-            let painter = ui.painter().clone();
+            // Tutto si disegna dentro il riquadro della vista.
+            let painter = ui.painter_at(area);
+            ui.painter().rect_stroke(area, CornerRadius::same(8), Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
             // Collegamenti, sotto i riquadri: quelli accesi e quello sotto il puntatore per ultimi.
             let mut order: Vec<usize> = (0..edges.len()).collect();
             order.sort_by_key(|&k| (Some(k) == over_edge, lit_edge.contains(&(edges[k].from, edges[k].to))));
@@ -640,6 +727,9 @@ fn draw_graph(
             for i in 0..n {
                 let node = &g.nodes[i];
                 let r = rects[i];
+                if !r.intersects(area) {
+                    continue;
+                }
                 let color = link_color(node.domain);
                 let border = if lit_node[i] {
                     Stroke::new(2.4, TEXT)
@@ -692,19 +782,38 @@ fn draw_graph(
                     let text = one_line(ui, line, font(11.0), DIM, inner);
                     painter.galley(r.min + vec2(pad, (22.0 + 14.5 * k as f32) * s), text, DIM);
                 }
-                let resp = ui.interact(r, ui.scope_id().with(("nodo-grafo", i)), Sense::click());
+                // Non prende il fuoco della tastiera: le frecce restano alla vista del grafo.
+                let resp = ui.interact(r.intersect(area), ui.scope_id().with(("nodo-grafo", i)), Sense::CLICK);
                 let target = graph_click_sel(node);
                 if resp.hovered() && target.is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                let tip = if target.is_some() {
-                    format!("{}\n\nUn clic apre {}.", node.tip, if node.kind == Kind::Disk { "il disco" } else { "il volume" })
-                } else {
-                    node.tip.clone()
-                };
-                let resp = resp.on_hover_text(tip);
+                let resp = resp.on_hover_ui(|ui| {
+                    ui.set_max_width(600.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(bold(node.title.clone(), 13.5).color(TEXT));
+                    if !node.tip.is_empty() {
+                        ui.label(RichText::new(&node.tip).color(TEXT).size(12.5));
+                    }
+                    ids_grid(ui, ("identificativi del riquadro", i), &node.ids);
+                    let mut hint = Vec::new();
+                    if target.is_some() {
+                        hint.push(if node.kind == Kind::Disk { "Un clic apre il disco." } else { "Un clic apre il volume." });
+                    }
+                    if !node.ids.is_empty() {
+                        hint.push("Clic destro: copia gli identificativi.");
+                    }
+                    if !hint.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(dim(hint.join(" ")));
+                    }
+                });
                 if resp.clicked() && target.is_some() {
                     picked = target;
+                }
+                if resp.secondary_clicked() && !node.ids.is_empty() {
+                    ui.ctx().copy_text(ids_text(&node.title, &node.ids));
+                    copied = Some(node.title.clone());
                 }
             }
             // Etichette dei collegamenti: appena a sinistra di chi le riceve, sopra la linea, con uno
@@ -752,10 +861,59 @@ fn draw_graph(
                     }
                     ui.add_space(2.0);
                     ui.label(dim(tip));
+                    if !to.link_ids.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(bold("Canale", 12.5).color(TEXT));
+                        ids_grid(ui, "identificativi del canale", &to.link_ids);
+                        ui.add_space(2.0);
+                        ui.label(dim("Clic destro: copia gli identificativi."));
+                    }
                 });
+                if area_resp.secondary_clicked() && !to.link_ids.is_empty() {
+                    let title = format!("{} → {}", from.title, to.title);
+                    ui.ctx().copy_text(ids_text(&title, &to.link_ids));
+                    copied = Some(format!("del canale {title}"));
+                }
             }
-        });
+            // Sotto il riquadro, a destra: la scala e come cambiarla, o per un momento che cosa si è copiato.
+            let copy_id = egui::Id::unique("identificativi del grafo copiati");
+            let now = ui.input(|i| i.time);
+            if let Some(what) = copied {
+                ui.ctx().data_mut(|d| d.insert_temp(copy_id, (now, what)));
+            }
+            let note = ui.ctx().data(|d| d.get_temp::<(f64, String)>(copy_id)).filter(|(t, _)| now - t < 2.5);
+            let (line, color) = match &note {
+                Some((t, what)) => {
+                    ui.ctx().request_repaint_after(Duration::from_secs_f64((2.5 - (now - t)).max(0.05)));
+                    (format!("Copiati gli identificativi {what}"), TEXT)
+                }
+                None => (
+                    format!(
+                        "{} %  ·  rotellina, + −: zoom  ·  trascina, frecce: sposta  ·  0: vista iniziale  ·  clic destro: copia gli identificativi",
+                        (s * 100.0).round()
+                    ),
+                    DIM,
+                ),
+            };
+            let text = one_line(ui, &line, FontId::proportional(12.0), color, size.x - 8.0);
+            let at = egui::pos2(area.right() - text.size().x - 4.0, area.bottom() + 4.0);
+            ui.painter().galley(at, text, color);
+            if area_resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if pointer_at.is_some() && over_node.is_none() && over_edge.is_none() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+    }
     (picked, hovered)
+}
+
+/// Scala e spostamento della vista del Grafo Storage, scelti con il mouse o con la tastiera.
+#[derive(Clone, Copy, PartialEq)]
+struct GraphView {
+    zoom: f32,
+    /// Posizione del grafo nel suo riquadro.
+    offset: Vec2,
 }
 
 /// Firma dei dischi e dei volumi senza disco: se cambia, il Grafo Storage va ricostruito.
@@ -1976,7 +2134,8 @@ impl App {
              contenitori cifrati, in fondo i volumi senza disco con il driver che li crea. Il colore dice il tipo \
              di collegamento, lo spessore la banda teorica; in giallo i collegamenti più lenti di quanto il \
              dispositivo potrebbe. Passa sopra a un riquadro o a una linea per i dettagli; un clic su un disco lo \
-             apre. Ctrl + rotellina ingrandisce o rimpicciolisce; «Aggiorna» rilegge tutto.",
+             apre. La rotellina (o + e −) ingrandisce, trascinando con il mouse (o con le frecce) ci si sposta, \
+             0 torna alla vista iniziale; «Aggiorna» rilegge tutto.",
         ));
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
@@ -3915,56 +4074,125 @@ impl App {
                 wait(self.script.as_mut().unwrap(), 1500);
             }
             30 => shot(script, "2k-grafo-evidenzia.png"),
+            // Vista del grafo: un passo di rotellina sopra il grafo e il tasto + ingrandiscono, le frecce
+            // spostano; poi 0 torna alla vista iniziale.
             31 => {
+                let press = |key: egui::Key| {
+                    [true, false].map(|pressed| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    })
+                };
+                self.fake_events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                for key in [egui::Key::Plus, egui::Key::ArrowDown, egui::Key::ArrowRight] {
+                    self.fake_events.extend(press(key));
+                }
+                wait(self.script.as_mut().unwrap(), 600);
+            }
+            32 => shot(script, "2l-grafo-ingrandito.png"),
+            33 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.fake_events.extend([true, false].map(|pressed| egui::Event::Key {
+                    key: egui::Key::Num0,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }));
+                wait(self.script.as_mut().unwrap(), 500);
+            }
+            34 => shot(script, "2m-grafo-vista-iniziale.png"),
+            // Trascinamento con il mouse, partendo sopra un disco: sposta la vista e non apre il disco.
+            35 => {
+                self.fake_pointer = graph_probe(ctx).map(|(_, disk)| disk);
+                wait(self.script.as_mut().unwrap(), 300);
+            }
+            36 => {
+                if let Some(pos) = self.fake_pointer {
+                    self.fake_events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                wait(self.script.as_mut().unwrap(), 150);
+            }
+            37 => {
+                self.fake_pointer = self.fake_pointer.map(|p| p + vec2(-260.0, -120.0));
+                wait(self.script.as_mut().unwrap(), 200);
+            }
+            38 => {
+                if let Some(pos) = self.fake_pointer {
+                    self.fake_events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                wait(self.script.as_mut().unwrap(), 400);
+            }
+            39 => shot(script, "2n-grafo-trascinato.png"),
+            40 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.graph_view = false;
                 wait(self.script.as_mut().unwrap(), 300);
             }
             // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
-            32 => {
+            41 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Info;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            33 => {
+            42 => {
                 // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
                 if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 33;
+                    script.step = 42;
                     wait(script, 200);
                 } else {
                     shot(script, "2g-info.png");
                 }
             }
-            34 => {
+            43 => {
                 self.scroll_to_diag = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            35 => shot(script, "2h-info-diagnosi.png"),
-            36 => {
+            44 => shot(script, "2h-info-diagnosi.png"),
+            45 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            37 => shot(script, "3-smart.png"),
-            38 => {
+            46 => shot(script, "3-smart.png"),
+            47 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            39 => {
+            48 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 39;
+                    script.step = 48;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            40 => {
+            49 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            41 => {
+            50 => {
                 // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
                 if rect.is_positive() {
@@ -3972,8 +4200,8 @@ impl App {
                 }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            42 => shot(script, "5-temperatura.png"),
-            43 => {
+            51 => shot(script, "5-temperatura.png"),
+            52 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -3986,8 +4214,8 @@ impl App {
                 self.graph_view = false;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            44 => shot(script, "6-monitoraggio.png"),
-            45 => {
+            53 => shot(script, "6-monitoraggio.png"),
+            54 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
