@@ -1,6 +1,6 @@
 [package]
 name = "mystoragetest"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 description = "Test, diagnosi e monitoraggio dei dischi per Windows 10 e 11"
 license = "MIT"
@@ -35,6 +35,8 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
+    "Win32_System_ProcessStatus",
+    "Wdk_Storage_FileSystem",
 ]
 
 [profile.dev]

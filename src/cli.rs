@@ -19,6 +19,7 @@ Uso:
   mystoragetest --quit              chiude l'istanza in esecuzione
   mystoragetest --list              elenca volumi e dischi
   mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
+  mystoragetest --graph             il Grafo Storage come testo: collegamenti, bande teoriche, driver
   mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
   mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
                                     (da amministratore; senza FILE li stampa)
@@ -63,6 +64,7 @@ pub fn run(args: &[String]) -> Option<i32> {
             | "--export-icon"
             | "--diagnosi"
             | "--info"
+            | "--graph"
     ) {
         return None;
     }
@@ -121,6 +123,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         }
         "--export-icon" => export_icon(args.get(1).map(String::as_str).unwrap_or("icona.png")),
         "--list" => list(),
+        "--graph" => graph(),
         "--smart" => smart_cmd(args.get(1).and_then(|s| s.parse().ok())),
         "--events" => events(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(24)),
         "--test" => test(&args[1..]),
@@ -159,6 +162,42 @@ fn list() -> i32 {
             human_bytes(v.free),
             v.disks
         );
+    }
+    0
+}
+
+/// `--graph`: il Grafo Storage come albero di testo.
+fn graph() -> i32 {
+    use crate::topology;
+    let g = topology::build(&disks::scan());
+    fn show(g: &topology::Graph, i: usize, depth: usize) {
+        let n = &g.nodes[i];
+        let pad = "  ".repeat(depth);
+        let edge = if n.edge.is_empty() { String::new() } else { format!(" [{}]", n.edge) };
+        let bw = n.bw.map(|b| format!(" {{{}}}", info::rate(b))).unwrap_or_default();
+        let warn = if n.warn { " (!)" } else { "" };
+        println!("{pad}{:?}/{:?}/{} {}{edge}{bw}{warn}", n.kind, n.icon, n.link.name(), n.title);
+        for line in &n.lines {
+            println!("{pad}    · {line}");
+        }
+        for &c in &n.children {
+            show(g, c, depth + 1);
+        }
+    }
+    for &r in &g.roots {
+        show(&g, r, 0);
+    }
+    if !g.side.is_empty() {
+        println!("\nA destra dei dischi:");
+        for &s in &g.side {
+            let n = &g.nodes[s];
+            let hosts: Vec<&str> = n.hosts.iter().map(|&h| g.nodes[h].title.as_str()).collect();
+            println!("  col {} {:?}/{:?} {} ← {}", n.side_col, n.kind, n.icon, n.title, hosts.join(" + "));
+            for line in &n.lines {
+                println!("      · {line}");
+            }
+            println!("      linea: {}", n.bw_tip.replace('\n', " / "));
+        }
     }
     0
 }

@@ -5,6 +5,7 @@ mod disks;
 mod errors;
 mod eventlog;
 mod icon;
+mod icons;
 mod info;
 mod monitor;
 mod settings;

@@ -8,22 +8,37 @@ quando si ha un dubbio, e accorgersi subito quando un disco comincia a dare erro
 
 ## Cosa fa
 
-La colonna a sinistra elenca i dischi, ognuno con la temperatura e il pallino dello stato SMART; in cima
-ci sono «Aggiorna», che rilegge dischi, volumi, i dati della scheda Info e il Grafo Storage, la voce
-**Monitoraggio**, con la casella che lo accende e lo spegne, e la voce **Grafo Storage**.
+La colonna a sinistra elenca i dischi, ognuno con un'icona del tipo (NVMe, SSD, disco meccanico,
+chiavetta, scheda SD, disco esterno, disco virtuale, volume su più dischi, volume cifrato, cloud) nel colore
+del suo collegamento, la temperatura e il pallino dello stato SMART; in cima ci sono «Aggiorna», che
+rilegge dischi, volumi, i dati della scheda Info e il Grafo Storage, la voce **Monitoraggio**, con la
+casella che lo accende e lo spegne, e la voce **Grafo Storage**.
 
-**Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi. Da sinistra a destra il
-processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una porta del processore), i
-controller SATA e USB, gli hub USB in cascata, e nell'ultima colonna i dischi, ognuno con dimensione,
-lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, USB 3.2 Gen 1 con il bridge e il protocollo
-UAS o BOT), salute SMART e temperatura. Sui collegamenti le porte (degli hub, del controller SATA) e la
-velocità PCIe degli NVMe; in giallo quelli più lenti di quanto il disco potrebbe. In fondo i dischi
-virtuali e i volumi senza un disco fisico (contenitori cifrati, unità di rete o di cloud). Il grafo si
-stringe per stare in larghezza nella finestra; Ctrl + rotellina lo ingrandisce o lo rimpicciolisce.
-Passando sopra a un riquadro si vedono i nomi completi e gli identificativi di Windows; un clic su un
-disco ne apre la pagina. Il grafo viene dall'albero dei dispositivi di Windows: per ogni disco si
-risale fino al processore, senza privilegi di amministratore e senza svegliare i dischi fermi, e si
-ricostruisce quando i dischi cambiano.
+**Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi e gli altri dispositivi
+PCIe. Da sinistra a destra il processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una
+porta del processore), i controller SATA e USB, gli hub USB in cascata, e in una colonna i dischi, ognuno
+con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, USB 3.2 Gen 1 con il bridge e il
+protocollo UAS o BOT, i giri al minuto dei dischi meccanici quando li dichiarano), salute SMART e
+temperatura. Ci sono anche gli altri canali PCIe: scheda grafica (con l'audio HDMI), schede di rete, audio,
+controller senza dischi, porte libere, e le funzioni interne al processore e al chipset. Ogni riquadro ha
+un'icona (processore, chipset, controller, hub, scheda grafica, rete, tipo di disco…) e il colore del tipo
+di collegamento: PCIe e NVMe, SATA, USB, software (volumi e dischi virtuali, tratteggiati). Lo spessore
+delle linee segue la banda teorica del collegamento; passando sopra a una linea un fumetto la dice e
+spiega da dove viene (per esempio «PCIe 4.0 x4: 16 GT/s per linea × 4 linee, codifica 128b/130b → 7,9 GB/s
+teorici», o che dietro il chipset tutto divide il suo collegamento con il processore). In giallo i
+collegamenti più lenti di quanto il dispositivo potrebbe (un NVMe x4 su una sola linea, una scheda grafica
+x16 che lavora a x8). A destra dei dischi i volumi che ne usano più d'uno, collegati a ciascuno, con il
+modo in cui li usano (a strisce, esteso, in mirroring, chiesto a Windows), e i contenitori cifrati
+VeraCrypt o TrueCrypt, collegati al disco o al volume che contiene il loro file. In fondo i dischi virtuali
+e i volumi senza un disco fisico, ciascuno con il driver che lo crea (per esempio Google Drive con il suo
+driver di file system): Windows dice se un driver sta sul percorso delle richieste di un volume, e lo si
+chiede per ogni driver caricato. Il grafo si stringe per stare in larghezza nella finestra; Ctrl +
+rotellina lo ingrandisce o lo rimpicciolisce. Passando sopra a un riquadro si vedono i nomi completi e
+gli identificativi di Windows, e si accendono il percorso fino al processore e la voce corrispondente
+nella colonna a sinistra; passando sopra a una voce della colonna si accendono i suoi dischi nel grafo.
+Un clic su un disco ne apre la pagina. Il grafo viene dall'albero dei dispositivi di Windows: per ogni
+disco e per ogni dispositivo PCI si risale fino al processore, senza privilegi di amministratore e senza
+svegliare i dischi fermi, e si ricostruisce quando i dischi cambiano.
 
 Ogni disco ha cinque schede.
 
@@ -50,8 +65,12 @@ risposte ricevute, già pronti dalla lettura fatta all'avvio; «Rifai» li ripet
 Le unità ottiche (CD e DVD) non sono fra i dischi che il programma elenca.
 
 **Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze
-(passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore e che cosa
-significa). La distribuzione raccoglie le latenze in intervalli larghi circa il 10 % l'uno e si può
+(passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore, per le
+prove con coda la misura in corso in quell'istante, per esempio «Coda Q8 · blocchi da 256K in sequenza»,
+e che cosa significa). Velocità e latenza stanno una sopra l'altra con lo stesso asse del tempo: il
+puntatore indica lo stesso istante su entrambe, Ctrl + rotellina le ingrandisce insieme, trascinando ci
+si sposta insieme e il doppio clic torna a tutta la prova; a destra la distribuzione della latenza e il
+registro delle attività. La distribuzione raccoglie le latenze in intervalli larghi circa il 10 % l'uno e si può
 guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure lineare, che allarga
 il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
@@ -205,6 +224,7 @@ mystoragetest --monitor           avvia nascosto nell'area di notifica, con il m
 mystoragetest --quit              chiude l'istanza in esecuzione
 mystoragetest --list              elenca volumi e dischi
 mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
+mystoragetest --graph             il Grafo Storage come testo: collegamenti, bande teoriche, driver
 mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
 mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
 mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
@@ -269,14 +289,14 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - storico delle temperature degli SSD interni;
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
-- fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato;
+- fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato; sui grafici di velocità e latenza uno sopra l'altro, il segno e la fascia della misura sullo stesso istante di entrambi e, nelle prove con coda, la coda della misura (Q2 con blocchi da 1M in sequenza, Q4 con blocchi da 256K a caso), confrontata con gli intervalli registrati;
 - «Riavvia come amministratore» e l'avvio diretto da amministratore (`--admin` e «Avvia sempre come amministratore»): la sequenza di rilancio, provata senza elevazione;
 - SMART da amministratore di un SSD NVMe in contenitore USB con bridge JMicron (152D:0581): la lettura riesce (prova fatta a mano dall'interfaccia);
 - SMART da amministratore, dal «Rapporto di diagnosi»: due SATA interni con soglie e registro completo delle autodiagnosi; due dischi a piatti Seagate su USB (0BC2:3322 e 0BC2:61B7, UASP) con SAT a 12 byte, soglie, registro delle autodiagnosi e risposta alla domanda «il disco gira?»; lo stesso bridge JMicron senza un disco riconosciuto, che risponde a ogni comando con un errore dell'hardware e viene riportato come tale;
 - comandi diretti a due chiavette USB (una su UASP, una no), che Windows lascia passare anche senza privilegi: i comandi SAT partono, vengono rifiutati come previsto e le chiavette risultano senza SMART, senza altri tentativi;
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
 - interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
-- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra.
+- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo.
 
 Non ancora verificato:
 
@@ -302,7 +322,8 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 |---|---|
 | `src/disks.rs` | elenco di volumi e dischi fisici, bridge USB |
 | `src/info.rs` | dati di dettaglio di volumi e dischi (partizioni, settori, collegamenti PCIe, SATA e USB) ed espulsione |
-| `src/topology.rs` | Grafo Storage: catena di ogni disco nell'albero dei dispositivi, fino al processore |
+| `src/topology.rs` | Grafo Storage: catena di ogni disco e dispositivo PCI nell'albero dei dispositivi, fino al processore; bande teoriche, volumi su più dischi, contenitori cifrati, driver dei volumi senza disco |
+| `src/icons.rs` | iconcine disegnate a vettori: tipi di disco e componenti del grafo |
 | `src/tester.rs` | motore delle prove di I/O |
 | `src/errors.rs` | classificazione dei codici d'errore |
 | `src/smart.rs` | SMART e autodiagnosi (NVMe, ATA, pass-through USB) |

@@ -342,6 +342,8 @@ pub struct Shared {
     pub queue: Vec<QueueCell>,
     /// Riga della tabella in misura (indice in `QUEUE_ROWS`, scrittura).
     pub queue_live: Option<(usize, bool)>,
+    /// Quando è stata fatta ogni misura con coda, per dire nei grafici a che coda appartiene un punto.
+    pub queue_marks: Vec<QueueMark>,
     pub log: Vec<(f64, LogLevel, String)>,
     pub outcome: Option<Outcome>,
     /// `Some(true)` quando il file temporaneo non è più sul disco.
@@ -365,7 +367,30 @@ pub struct Shared {
     pub surface_before: Vec<Tract>,
 }
 
+/// Intervallo di tempo di una misura con coda, in secondi dall'inizio della prova.
+#[derive(Clone, Copy, Debug)]
+pub struct QueueMark {
+    pub from: f64,
+    pub to: f64,
+    /// Indice in `QUEUE_ROWS`.
+    pub row: usize,
+    pub write: bool,
+    pub depth: usize,
+}
+
 impl Shared {
+    /// La misura con coda in corso all'istante `secs` della prova `phase`, se ce n'era una.
+    pub fn queue_mark_at(&self, phase: Phase, secs: f64) -> Option<&QueueMark> {
+        let (group, write) = match phase {
+            Phase::QueueRead(g) => (g, false),
+            Phase::QueueWrite(g) => (g, true),
+            _ => return None,
+        };
+        self.queue_marks.iter().find(|m| {
+            m.write == write && QUEUE_ROWS[m.row].group == group && secs >= m.from - 1e-3 && secs <= m.to + 1e-3
+        })
+    }
+
     pub fn series_mut(&mut self, phase: Phase) -> &mut PhaseSeries {
         if let Some(i) = self.series.iter().position(|(p, _)| *p == phase) {
             return &mut self.series[i].1;
@@ -1526,8 +1551,19 @@ impl Engine {
                         write,
                     };
                     let progress = (k * QUEUE_DEPTHS.len() + d, cells);
-                    let Some(step) = self.queue_step(&h, &port, path, size, spec, &mut off, &mut rng, &mut s, progress)
-                    else {
+                    let from = self.now();
+                    let step = self.queue_step(&h, &port, path, size, spec, &mut off, &mut rng, &mut s, progress);
+                    // I campioni dei grafici finiscono con la misura, senza mescolarsi con la successiva:
+                    // così ogni punto appartiene a una coda sola.
+                    s.emit(self);
+                    self.shared.lock().unwrap().queue_marks.push(QueueMark {
+                        from,
+                        to: self.now(),
+                        row: r,
+                        write,
+                        depth,
+                    });
+                    let Some(step) = step else {
                         // Richieste rimaste in sospeso dopo l'annullamento: i loro buffer non si
                         // possono liberare, e nemmeno gli handle si possono chiudere.
                         std::mem::forget(h);

@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use crate::disks::{self, Inventory, PhysDisk, Volume, bus_name};
 use crate::eventlog::{self, StorEvent};
 use crate::icon::{self, Tone};
+use crate::icons::{self, Icon};
 use crate::info;
 use crate::monitor::Monitor;
 use crate::settings::{self, Settings};
@@ -255,19 +256,63 @@ fn open_in_explorer(letter: char) {
     }
 }
 
-/// Esegue `work` in un thread e ridisegna la finestra quando il risultato è pronto.
-/// Colore di un riquadro del Grafo Storage.
-fn graph_color(kind: topology::Kind) -> Color32 {
+/// Colore di un tipo di collegamento nel Grafo Storage (e delle icone dei dischi nella colonna).
+fn link_color(link: topology::Link) -> Color32 {
+    use topology::Link;
+    match link {
+        Link::Pcie => Color32::from_rgb(79, 140, 255),
+        Link::Sata => Color32::from_rgb(45, 212, 191),
+        Link::Usb => Color32::from_rgb(192, 132, 252),
+        Link::Soft => Color32::from_rgb(148, 160, 180),
+    }
+}
+
+/// Spessore di una linea del grafo dalla banda teorica del collegamento: cresce con il logaritmo,
+/// da 1 punto per l'USB 2 a 8 per una porta PCIe x16.
+fn bw_width(bw: Option<f64>) -> f32 {
+    match bw {
+        Some(b) => (1.0 + 0.75 * (b / 60.0).max(1.0).log2() as f32).clamp(1.0, 8.0),
+        None => 1.3,
+    }
+}
+
+/// Selezione aperta da un clic su un riquadro del grafo.
+fn graph_click_sel(node: &topology::Node) -> Option<Sel> {
     use topology::Kind;
-    match kind {
-        Kind::Cpu => Color32::from_rgb(79, 140, 255),
-        Kind::Chipset => Color32::from_rgb(245, 158, 11),
-        Kind::SataController => Color32::from_rgb(34, 211, 238),
-        Kind::UsbController => Color32::from_rgb(167, 139, 250),
-        Kind::Hub => Color32::from_rgb(216, 180, 254),
-        Kind::Controller => Color32::from_rgb(163, 177, 198),
-        Kind::Disk => Color32::from_rgb(52, 211, 153),
-        Kind::Virtual | Kind::Volume => Color32::from_rgb(120, 132, 152),
+    match node.kind {
+        Kind::Disk => match node.letters.first() {
+            Some(&l) => Some(Sel::Volume(l)),
+            None => node.disk.map(Sel::Disk),
+        },
+        Kind::Volume | Kind::Span | Kind::Container => node.letters.first().map(|&l| Sel::Volume(l)),
+        _ => None,
+    }
+}
+
+/// Disco o volume indicato da un riquadro del grafo, per evidenziarlo nella colonna a sinistra.
+fn graph_hover_sel(node: &topology::Node) -> Option<Sel> {
+    use topology::Kind;
+    match node.kind {
+        Kind::Disk => node.disk.map(Sel::Disk),
+        Kind::Volume | Kind::Span | Kind::Container => node.letters.first().map(|&l| Sel::Volume(l)),
+        _ => None,
+    }
+}
+
+/// Il riquadro del grafo corrisponde al disco o al volume indicato nella colonna a sinistra.
+fn graph_node_matches(node: &topology::Node, sel: Sel) -> bool {
+    match sel {
+        Sel::Volume(l) => node.letters.contains(&l),
+        Sel::Disk(n) => node.disk == Some(n),
+    }
+}
+
+/// La voce della colonna a sinistra corrisponde al disco o al volume indicato nel grafo.
+fn side_matches(hover: Option<Sel>, letter: Option<char>, disks: &[u32]) -> bool {
+    match hover {
+        Some(Sel::Volume(l)) => letter == Some(l),
+        Some(Sel::Disk(n)) => disks.contains(&n),
+        None => false,
     }
 }
 
@@ -283,39 +328,74 @@ fn one_line(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Ar
     ui.painter().layout_job(job)
 }
 
+/// Solo per le verifiche automatiche: un punto su un collegamento del grafo e il centro di un disco,
+/// annotati dall'ultimo disegno.
+fn graph_probe(ctx: &egui::Context) -> Option<(egui::Pos2, egui::Pos2)> {
+    ctx.data(|d| d.get_temp(egui::Id::unique("punti di prova del grafo")))
+}
+
+fn bezier_at(p: &[egui::Pos2; 4], t: f32) -> egui::Pos2 {
+    let u = 1.0 - t;
+    (p[0].to_vec2() * (u * u * u)
+        + p[1].to_vec2() * (3.0 * u * u * t)
+        + p[2].to_vec2() * (3.0 * u * t * t)
+        + p[3].to_vec2() * (t * t * t))
+        .to_pos2()
+}
+
+/// Distanza di un punto da un segmento.
+fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 { ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
+    (a + ab * t).distance(p)
+}
+
 /// Disegna il Grafo Storage: una colonna per livello, da sinistra (processore) a destra, con tutti i
-/// dischi allineati nell'ultima colonna; ogni riquadro sta all'altezza media dei suoi figli. Restituisce
-/// il disco o il volume su cui si è fatto clic.
-fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport>, warn_at: i32) -> Option<Sel> {
-    use topology::Kind;
+/// dischi allineati in una colonna; ogni riquadro sta all'altezza media dei suoi figli. A destra dei
+/// dischi i volumi su più dischi e i contenitori, collegati a ciò che li ospita. Colori per tipo di
+/// collegamento, spessore delle linee per banda teorica. `lit`: disco o volume indicato nella colonna
+/// a sinistra, da evidenziare. Restituisce il disco o il volume su cui si è fatto clic e quello sotto
+/// il puntatore.
+fn draw_graph(
+    ui: &mut Ui,
+    g: &topology::Graph,
+    smart: &HashMap<u32, SmartReport>,
+    warn_at: i32,
+    lit: Option<Sel>,
+) -> (Option<Sel>, Option<Sel>) {
+    use topology::{Kind, Link};
     // Misure a grandezza naturale: la scala le adatta alla finestra (vedi sotto). Fra una colonna e
     // l'altra c'è lo spazio per le etichette dei collegamenti.
-    const GAP_1: f32 = 46.0;
-    const LEAF_W_1: f32 = 300.0;
+    const GAP_1: f32 = 44.0;
+    const LEAF_W_1: f32 = 284.0;
+    const SIDE_W_1: f32 = 220.0;
     const ROW_1: f32 = 64.0;
     let box_w_1 = |kind: Kind| match kind {
-        Kind::Hub => 128.0,
-        Kind::Cpu => 150.0,
-        _ => 158.0,
+        Kind::Hub => 134.0,
+        Kind::Cpu => 172.0,
+        Kind::Port => 160.0,
+        Kind::Device => 224.0,
+        _ => 174.0,
     };
     let n = g.nodes.len();
     if n == 0 {
         ui.label(dim("Nessun disco trovato."));
-        return None;
+        return (None, None);
     }
-    let leaf = |i: usize| matches!(g.nodes[i].kind, Kind::Disk | Kind::Volume);
-    // Livello di ogni riquadro e altezza: i dischi in fila, gli altri a metà dei loro figli.
+    // Dischi e volumi senza disco nella colonna dei dischi; schede e porte restano nella loro colonna.
+    let aligned = |i: usize| matches!(g.nodes[i].kind, Kind::Disk | Kind::Volume);
+    let side = |i: usize| g.nodes[i].side_col > 0;
+    let mut parent: Vec<Option<usize>> = vec![None; n];
+    for (i, node) in g.nodes.iter().enumerate() {
+        for &c in &node.children {
+            parent[c] = Some(i);
+        }
+    }
+    // Livello di ogni riquadro e altezza: le foglie in fila, gli altri a metà dei loro figli.
     let mut depth = vec![0usize; n];
     let mut y = vec![0.0f32; n];
     let mut row = 0.0f32;
-    fn place(
-        g: &topology::Graph,
-        i: usize,
-        d: usize,
-        depth: &mut [usize],
-        y: &mut [f32],
-        row: &mut f32,
-    ) {
+    fn place(g: &topology::Graph, i: usize, d: usize, depth: &mut [usize], y: &mut [f32], row: &mut f32) {
         depth[i] = d;
         let kids = &g.nodes[i].children;
         if kids.is_empty() {
@@ -334,13 +414,44 @@ fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport
         }
         place(g, r, 0, &mut depth, &mut y, &mut row);
     }
-    // I dischi tutti nell'ultima colonna; ogni colonna larga quanto il suo riquadro più largo.
-    let leaf_col = (0..n).filter(|&i| !leaf(i)).map(|i| depth[i] + 1).max().unwrap_or(0);
-    let mut col_w_1 = vec![0.0f32; leaf_col + 1];
-    for i in (0..n).filter(|&i| !leaf(i)) {
+    let leaf_col = (0..n).filter(|&i| !aligned(i) && !side(i)).map(|i| depth[i] + 1).max().unwrap_or(0);
+    let side_cols = g.side.iter().map(|&s| g.nodes[s].side_col).max().unwrap_or(0);
+    // A destra: all'altezza media di ciò che li ospita, senza sovrapporsi; chi è ospitato da un
+    // riquadro della stessa colonna gli sta subito sotto.
+    let spread = |y: &mut [f32], items: &mut Vec<usize>| {
+        items.sort_by(|a, b| y[*a].total_cmp(&y[*b]));
+        let mut last = f32::NEG_INFINITY;
+        for &s in items.iter() {
+            y[s] = y[s].max(last + 1.0);
+            last = y[s];
+        }
+    };
+    for c in 1..=side_cols {
+        let mut items: Vec<usize> = g.side.iter().copied().filter(|&s| g.nodes[s].side_col == c).collect();
+        let (mut first, stacked): (Vec<usize>, Vec<usize>) =
+            items.iter().partition(|&&s| g.nodes[s].hosts.iter().all(|&h| !side(h)));
+        for &s in &first {
+            let hosts = &g.nodes[s].hosts;
+            y[s] = hosts.iter().map(|&h| y[h]).sum::<f32>() / hosts.len().max(1) as f32;
+        }
+        spread(&mut y, &mut first);
+        for _ in 0..4 {
+            for &s in &stacked {
+                y[s] = g.nodes[s].hosts.iter().map(|&h| y[h]).fold(f32::NEG_INFINITY, f32::max) + 1.0;
+            }
+            spread(&mut y, &mut items);
+        }
+    }
+    let rows = (0..n).filter(|&i| side(i)).map(|i| y[i] + 1.0).fold(row, f32::max);
+    let ncols = leaf_col + 1 + side_cols;
+    let mut col_w_1 = vec![0.0f32; ncols];
+    for i in (0..n).filter(|&i| !aligned(i) && !side(i)) {
         col_w_1[depth[i]] = col_w_1[depth[i]].max(box_w_1(g.nodes[i].kind));
     }
     col_w_1[leaf_col] = LEAF_W_1;
+    for c in 1..=side_cols {
+        col_w_1[leaf_col + c] = SIDE_W_1;
+    }
     let col_x_1: Vec<f32> = col_w_1
         .iter()
         .scan(0.0, |x, w| {
@@ -352,19 +463,63 @@ fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport
     // Scala: quella scelta con Ctrl + rotellina, se c'è; altrimenti il grafo si stringe per stare in
     // larghezza nella finestra e vedersi tutto, ma non sotto il 60 %.
     let zoom_id = egui::Id::unique("zoom del grafo storage");
-    let natural = col_x_1[leaf_col] + LEAF_W_1 + 12.0;
+    let natural = col_x_1[ncols - 1] + col_w_1[ncols - 1] + if side_cols > 0 { 36.0 } else { 12.0 };
     let fit = ((ui.available_width() - 16.0) / natural).clamp(0.6, 1.0);
     let s = ui.ctx().data(|d| d.get_temp::<f32>(zoom_id)).unwrap_or(fit);
     let row_h = ROW_1 * s;
     let lines_of = |i: usize| g.nodes[i].lines.len().min(3) as f32;
     let height = |i: usize| (24.0 + 14.5 * lines_of(i)) * s;
-    let col = |i: usize| if leaf(i) { leaf_col } else { depth[i] };
-    let width = |i: usize| if leaf(i) { LEAF_W_1 * s } else { box_w_1(g.nodes[i].kind) * s };
-    let x_of = |i: usize| col_x_1[col(i)] * s;
+    let col = |i: usize| {
+        if side(i) {
+            leaf_col + g.nodes[i].side_col
+        } else if aligned(i) {
+            leaf_col
+        } else {
+            depth[i]
+        }
+    };
+    let width = |i: usize| col_w_1[col(i)].min(if aligned(i) || side(i) { 1e9 } else { box_w_1(g.nodes[i].kind) }) * s;
     let font = |size: f32| FontId::proportional(size * s);
 
-    let total = vec2(natural * s, row * row_h + 8.0);
-    let mut picked = None;
+    // Collegamenti: da chi a chi, tipo, banda, se frena, tratteggiato (fatti dal software).
+    struct Edge {
+        from: usize,
+        to: usize,
+        link: Link,
+        bw: Option<f64>,
+        warn: bool,
+        dashed: bool,
+    }
+    let mut edges: Vec<Edge> = Vec::new();
+    for (i, node) in g.nodes.iter().enumerate() {
+        for &c in &node.children {
+            let child = &g.nodes[c];
+            edges.push(Edge {
+                from: i,
+                to: c,
+                link: child.link,
+                bw: child.bw,
+                warn: child.warn,
+                dashed: child.link == Link::Soft,
+            });
+        }
+    }
+    for &sd in &g.side {
+        let node = &g.nodes[sd];
+        for &h in &node.hosts {
+            edges.push(Edge {
+                from: h,
+                to: sd,
+                link: Link::Soft,
+                bw: if node.kind == Kind::Span { g.nodes[h].bw } else { None },
+                warn: false,
+                dashed: node.kind == Kind::Container,
+            });
+        }
+    }
+
+    let total = vec2(natural * s, rows * row_h + 8.0);
+    let (mut picked, mut hovered) = (None, None);
     egui::ScrollArea::both()
         .id_salt("grafo-storage")
         .auto_shrink([false, false])
@@ -384,42 +539,133 @@ fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport
                 .map(|i| {
                     let h = height(i);
                     let top = origin.y + y[i] * row_h + (row_h - h) / 2.0;
-                    egui::Rect::from_min_size(egui::pos2(origin.x + x_of(i), top), vec2(width(i), h))
+                    egui::Rect::from_min_size(egui::pos2(origin.x + col_x_1[col(i)] * s, top), vec2(width(i), h))
                 })
                 .collect();
-            let painter = ui.painter().clone();
-            // Collegamenti, sotto i riquadri; le loro etichette si disegnano alla fine, sopra tutto.
-            let mut labels = Vec::new();
-            for i in 0..n {
-                for &c in &g.nodes[i].children {
-                    let (a, b) = (rects[i].right_center(), rects[c].left_center());
+            let pointer = ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| area_resp.contains_pointer() && ui.clip_rect().contains(*p));
+            let over_node = pointer.and_then(|p| (0..n).find(|&i| rects[i].contains(p)));
+            let curves: Vec<[egui::Pos2; 4]> = edges
+                .iter()
+                .map(|e| {
+                    if side(e.from) && side(e.to) {
+                        // Nella stessa colonna: una parentesi sul lato destro, dall'ospite al contenitore.
+                        let (a, b) = (rects[e.from].right_center(), rects[e.to].right_center());
+                        return [a, a + vec2(26.0 * s, 0.0), b + vec2(26.0 * s, 0.0), b];
+                    }
+                    let (a, b) = (rects[e.from].right_center(), rects[e.to].left_center());
                     let dx = ((b.x - a.x) / 2.0).max(20.0);
-                    let warn = g.nodes[c].warn;
-                    let color = if warn { WARN } else { Color32::from_rgb(92, 102, 122) };
+                    [a, a + vec2(dx, 0.0), b - vec2(dx.min(60.0), 0.0), b]
+                })
+                .collect();
+            let samples: Vec<Vec<egui::Pos2>> =
+                curves.iter().map(|c| (0..=28).map(|k| bezier_at(c, k as f32 / 28.0)).collect()).collect();
+            // Per le verifiche automatiche: il collegamento verso il chipset e un disco con lettera.
+            let probe_edge = edges
+                .iter()
+                .position(|e| g.nodes[e.to].kind == Kind::Chipset)
+                .or((!edges.is_empty()).then_some(0));
+            let probe_disk = (0..n).find(|&i| g.nodes[i].kind == Kind::Disk && !g.nodes[i].letters.is_empty());
+            if let (Some(k), Some(i)) = (probe_edge, probe_disk) {
+                let at = (samples[k][16], rects[i].center());
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("punti di prova del grafo"), at));
+            }
+            // Il collegamento sotto il puntatore, se non si è sopra un riquadro.
+            let over_edge = pointer.filter(|_| over_node.is_none()).and_then(|p| {
+                edges
+                    .iter()
+                    .enumerate()
+                    .map(|(k, e)| {
+                        let d = samples[k].windows(2).map(|w| segment_distance(p, w[0], w[1])).fold(f32::MAX, f32::min);
+                        (k, d - bw_width(e.bw) * s / 2.0)
+                    })
+                    .filter(|(_, d)| *d <= 5.0)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(k, _)| k)
+            });
+            // Riquadri evidenziati: quello sotto il puntatore e quelli indicati nella colonna a
+            // sinistra; con loro si accende il percorso fino al processore.
+            let mut lit_node = vec![false; n];
+            if let Some(i) = over_node.filter(|&i| graph_hover_sel(&g.nodes[i]).is_some()) {
+                lit_node[i] = true;
+                hovered = graph_hover_sel(&g.nodes[i]);
+            }
+            if let Some(sel) = lit {
+                for i in 0..n {
+                    lit_node[i] |= graph_node_matches(&g.nodes[i], sel);
+                }
+            }
+            let mut lit_edge: HashSet<(usize, usize)> = HashSet::new();
+            let mut stack: Vec<usize> = (0..n).filter(|&i| lit_node[i]).collect();
+            let mut seen = vec![false; n];
+            while let Some(x) = stack.pop() {
+                if std::mem::replace(&mut seen[x], true) {
+                    continue;
+                }
+                if side(x) {
+                    for &h in &g.nodes[x].hosts {
+                        lit_edge.insert((h, x));
+                        stack.push(h);
+                    }
+                } else if let Some(p) = parent[x] {
+                    lit_edge.insert((p, x));
+                    stack.push(p);
+                }
+            }
+
+            let painter = ui.painter().clone();
+            // Collegamenti, sotto i riquadri: quelli accesi e quello sotto il puntatore per ultimi.
+            let mut order: Vec<usize> = (0..edges.len()).collect();
+            order.sort_by_key(|&k| (Some(k) == over_edge, lit_edge.contains(&(edges[k].from, edges[k].to))));
+            for k in order {
+                let e = &edges[k];
+                let on = Some(k) == over_edge || lit_edge.contains(&(e.from, e.to));
+                let base = if e.warn { WARN } else { link_color(e.link) };
+                let color = if on { base } else { base.gamma_multiply(0.62) };
+                let width = (bw_width(e.bw) + if Some(k) == over_edge { 1.6 } else { 0.0 }) * s;
+                let stroke = Stroke::new(width.max(1.0), color);
+                if e.dashed {
+                    painter.add(egui::Shape::dashed_line(&samples[k], stroke, 6.0 * s, 4.0 * s));
+                } else {
                     painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
-                        [a, a + vec2(dx, 0.0), b - vec2(dx.min(60.0), 0.0), b],
+                        curves[k],
                         false,
                         Color32::TRANSPARENT,
-                        Stroke::new(if warn { 2.0 } else { 1.4 }, color),
+                        stroke,
                     ));
-                    if !g.nodes[c].edge.is_empty() {
-                        labels.push((c, b, warn));
-                    }
                 }
             }
             // Riquadri.
             for i in 0..n {
                 let node = &g.nodes[i];
                 let r = rects[i];
-                let color = graph_color(node.kind);
-                let stroke = if node.warn { WARN } else { color };
-                painter.rect(r, CornerRadius::same(8), CARD, Stroke::new(1.4, stroke), egui::StrokeKind::Inside);
+                let color = link_color(node.domain);
+                let border = if lit_node[i] {
+                    Stroke::new(2.4, TEXT)
+                } else {
+                    Stroke::new(1.4, if node.warn { WARN } else { color })
+                };
+                painter.rect(
+                    r,
+                    CornerRadius::same(8),
+                    if lit_node[i] { CARD_HI } else { CARD },
+                    border,
+                    egui::StrokeKind::Inside,
+                );
                 painter.rect_filled(
                     egui::Rect::from_min_size(r.min + vec2(0.0, 6.0 * s), vec2(4.0 * s, r.height() - 12.0 * s)),
                     CornerRadius::same(2),
                     color,
                 );
                 let pad = 10.0 * s;
+                let icon = 17.0 * s;
+                icons::paint(
+                    &painter,
+                    egui::Rect::from_min_size(r.min + vec2(pad, 4.0 * s), vec2(icon, icon)),
+                    node.icon,
+                    color,
+                );
                 let inner = r.width() - 2.0 * pad;
                 // Per i dischi, a destra del titolo: temperatura e salute dallo SMART.
                 let mut right = 0.0;
@@ -439,40 +685,77 @@ fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport
                     &node.title,
                     FontId::new(12.5 * s, FontFamily::Name("semibold".into())),
                     TEXT,
-                    inner - right,
+                    inner - right - icon - 5.0 * s,
                 );
-                painter.galley(r.min + vec2(pad, 4.0 * s), title, TEXT);
+                painter.galley(r.min + vec2(pad + icon + 5.0 * s, 4.0 * s), title, TEXT);
                 for (k, line) in node.lines.iter().take(3).enumerate() {
                     let text = one_line(ui, line, font(11.0), DIM, inner);
                     painter.galley(r.min + vec2(pad, (22.0 + 14.5 * k as f32) * s), text, DIM);
                 }
                 let resp = ui.interact(r, ui.scope_id().with(("nodo-grafo", i)), Sense::click());
-                let clickable = node.disk.is_some() || node.letter.is_some();
-                if resp.hovered() && clickable {
+                let target = graph_click_sel(node);
+                if resp.hovered() && target.is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                let tip = if clickable { format!("{}\n\nUn clic apre il disco.", node.tip) } else { node.tip.clone() };
+                let tip = if target.is_some() {
+                    format!("{}\n\nUn clic apre {}.", node.tip, if node.kind == Kind::Disk { "il disco" } else { "il volume" })
+                } else {
+                    node.tip.clone()
+                };
                 let resp = resp.on_hover_text(tip);
-                if resp.clicked() && clickable {
-                    picked = match (node.letter, node.disk) {
-                        (Some(l), _) => Some(Sel::Volume(l)),
-                        (None, Some(d)) => Some(Sel::Disk(d)),
-                        _ => None,
-                    };
+                if resp.clicked() && target.is_some() {
+                    picked = target;
                 }
             }
             // Etichette dei collegamenti: appena a sinistra di chi le riceve, sopra la linea, con uno
             // sfondo che le stacca da linee e riquadri che passano lì sotto.
-            for (c, b, warn) in labels {
-                let color = if warn { WARN } else { DIM };
-                let text = one_line(ui, &g.nodes[c].edge, font(11.0), color, 170.0 * s);
-                let at = b + vec2(-6.0 * s - text.size().x, -text.size().y - 2.0 * s);
+            for e in edges.iter().filter(|e| !side(e.to) && !g.nodes[e.to].edge.is_empty()) {
+                let b = rects[e.to].left_center();
+                let color = if e.warn { WARN } else { DIM };
+                let text = one_line(ui, &g.nodes[e.to].edge, font(11.0), color, 170.0 * s);
+                let at = b + vec2(-6.0 * s - text.size().x, -text.size().y - 2.0 - bw_width(e.bw) * s / 2.0);
                 let back = egui::Rect::from_min_size(at, text.size()).expand2(vec2(3.0 * s, 1.0));
                 painter.rect_filled(back, CornerRadius::same(3), BG);
                 painter.galley(at, text, color);
             }
+            // Fumetto del collegamento sotto il puntatore: banda teorica e da dove viene.
+            if let Some(k) = over_edge {
+                let e = &edges[k];
+                let (from, to) = (&g.nodes[e.from], &g.nodes[e.to]);
+                let tip = if to.bw_tip.is_empty() {
+                    "Windows non dichiara la velocità di questo collegamento.".to_string()
+                } else {
+                    to.bw_tip.clone()
+                };
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    area_resp.id.with("collegamento"),
+                    egui::PopupAnchor::Pointer,
+                )
+                .width(360.0)
+                .show(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(bold(format!("{} → {}", from.title, to.title), 13.5).color(TEXT));
+                    let mut what = e.link.name().to_string();
+                    if !to.edge.is_empty() && !side(e.to) {
+                        what = if to.edge.starts_with(&what) { to.edge.clone() } else { format!("{what} · {}", to.edge) };
+                    }
+                    ui.label(RichText::new(what).color(link_color(e.link)).size(12.5));
+                    match e.bw {
+                        Some(bw) => {
+                            ui.label(bold(format!("{} teorici", info::rate(bw)), 18.0).color(TEXT));
+                        }
+                        None => {
+                            ui.label(dim("Banda teorica non nota"));
+                        }
+                    }
+                    ui.add_space(2.0);
+                    ui.label(dim(tip));
+                });
+            }
         });
-    picked
+    (picked, hovered)
 }
 
 /// Firma dei dischi e dei volumi senza disco: se cambia, il Grafo Storage va ricostruito.
@@ -487,6 +770,7 @@ fn graph_signature(inv: &Inventory) -> String {
     key
 }
 
+/// Esegue `work` in un thread e ridisegna la finestra quando il risultato è pronto.
 fn background<T: Send + 'static>(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
     let (tx, rx) = channel();
     let ctx = ctx.clone();
@@ -693,6 +977,10 @@ pub struct App {
     graph_key: String,
     /// «Aggiorna» chiede di ricostruire il grafo alla prossima lettura dei dischi.
     graph_dirty: bool,
+    /// Disco o volume sotto il puntatore nel grafo (si evidenzia nella colonna a sinistra) e nella
+    /// colonna a sinistra (si evidenzia nel grafo).
+    graph_hover: Option<Sel>,
+    side_hover: Option<Sel>,
     smart: HashMap<u32, SmartReport>,
     smart_rx: Option<Receiver<SmartBatch>>,
     /// Dischi trovati fermi all'ultima lettura periodica e lasciati stare: da che ora.
@@ -842,6 +1130,8 @@ impl App {
             graph_rx: None,
             graph_key: String::new(),
             graph_dirty: true,
+            graph_hover: None,
+            side_hover: None,
             temps: HashMap::new(),
             session_start: Instant::now(),
             session_start_ft: win::now_filetime(),
@@ -1339,6 +1629,37 @@ impl App {
     // Colonna dei dischi
     // -----------------------------------------------------------------------------------------
 
+    /// Icona e colore di un disco nella colonna: gli stessi del grafo (che conosce anche la velocità
+    /// di rotazione dei dischi USB, quando il disco la dice).
+    fn disk_icon(&self, d: &PhysDisk) -> (Icon, Color32) {
+        let icon = self
+            .graph
+            .as_ref()
+            .and_then(|(_, g)| g.icon_of_disk(d.number))
+            .unwrap_or_else(|| topology::disk_icon(d, None));
+        (icon, link_color(topology::disk_link(d)))
+    }
+
+    /// Icona e colore di un volume: quella del suo disco, del volume su più dischi, o di chi crea il
+    /// volume senza disco (cifrato, cloud…).
+    fn volume_icon(&self, v: &Volume) -> (Icon, Color32) {
+        let soft = link_color(topology::Link::Soft);
+        match v.disks.as_slice() {
+            [n] => match self.inventory.disk(*n) {
+                Some(d) => self.disk_icon(d),
+                None => (Icon::Volume, soft),
+            },
+            [] => (
+                self.graph
+                    .as_ref()
+                    .and_then(|(_, g)| g.icon_of_volume(v.letter))
+                    .unwrap_or(Icon::Volume),
+                soft,
+            ),
+            _ => (Icon::Raid, soft),
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -1362,6 +1683,21 @@ impl App {
         let warn_at = self.settings.temp_warn_c;
         let mut pick: Option<Sel> = None;
         let bottom = if self.elevated { 62.0 } else { 114.0 };
+        // Disco o volume sotto il puntatore nel grafo: qui si evidenzia la sua voce.
+        let lit = self.graph_hover;
+        let mut hover: Option<Sel> = None;
+        let card_stroke = |selected: bool, hot: bool| {
+            Stroke::new(
+                if hot && !selected { 1.6 } else { 1.0 },
+                if selected {
+                    ACCENT
+                } else if hot {
+                    TEXT.gamma_multiply(0.8)
+                } else {
+                    Color32::TRANSPARENT
+                },
+            )
+        };
         egui::ScrollArea::vertical()
             .id_salt("dischi")
             .auto_shrink([false, false])
@@ -1371,31 +1707,42 @@ impl App {
                 for v in &self.inventory.volumes {
                     let selected =
                         !self.monitor_view && !self.graph_view && self.selected == Some(Sel::Volume(v.letter));
+                    let hot = side_matches(lit, Some(v.letter), &v.disks);
                     let disk = v.disks.first().and_then(|n| self.inventory.disk(*n));
                     let reports = || v.disks.iter().filter_map(|n| self.smart.get(n));
                     let health = reports().map(|r| r.health).max();
                     let temp = reports().filter_map(|r| r.temperature).max();
                     let testing = self.runs.get(&v.letter).is_some_and(|r| r.running());
                     let frame = Frame::new()
-                        .fill(if selected { CARD_HI } else { CARD })
-                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
+                        .fill(if selected || hot { CARD_HI } else { CARD })
+                        .stroke(card_stroke(selected, hot))
                         .corner_radius(CornerRadius::same(10))
                         .inner_margin(Margin::symmetric(10, 8));
+                    // Per i volumi senza disco il grafo sa chi li crea (VeraCrypt, Google Drive…).
+                    let loose = self.graph.as_ref().and_then(|(_, g)| g.volume_node(v.letter));
                     let model = match disk {
                         Some(d) if v.disks.len() == 1 => format!("{} · {}", d.title(), bus_name(d.bus)),
                         Some(_) => format!("Volume distribuito su {} dischi", v.disks.len()),
-                        None => "Volume virtuale o non identificato".to_string(),
+                        None => loose.map(|n| n.tip.clone()).unwrap_or_else(|| "Volume virtuale o non identificato".into()),
                     };
                     let kind = match disk {
                         Some(d) if v.disks.len() == 1 => bus_name(d.bus).to_string(),
                         Some(_) => format!("{} dischi", v.disks.len()),
-                        None => "virtuale".to_string(),
+                        None => loose
+                            .and_then(|n| n.lines.first())
+                            .and_then(|l| l.split(" · ").next())
+                            .filter(|l| !l.starts_with("driver"))
+                            .unwrap_or("virtuale")
+                            .to_string(),
                     };
+                    let (vicon, vcolor) = self.volume_icon(v);
                     let resp = frame
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.spacing_mut().item_spacing.y = 5.0;
                             ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                                icons::paint(ui.painter(), r, vicon, vcolor);
                                 ui.label(bold(format!("{}:", v.letter), 16.0));
                                 let label = if v.label.is_empty() {
                                     "Senza nome"
@@ -1423,6 +1770,7 @@ impl App {
                     }
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        hover = Some(Sel::Volume(v.letter));
                     }
                     if resp.clicked() {
                         pick = Some(Sel::Volume(v.letter));
@@ -1435,16 +1783,20 @@ impl App {
                     for d in others {
                         let selected =
                             !self.monitor_view && !self.graph_view && self.selected == Some(Sel::Disk(d.number));
+                        let hot = side_matches(lit, None, &[d.number]);
                         let report = self.smart.get(&d.number);
                         let frame = Frame::new()
-                            .fill(if selected { CARD_HI } else { CARD })
-                            .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
+                            .fill(if selected || hot { CARD_HI } else { CARD })
+                            .stroke(card_stroke(selected, hot))
                             .corner_radius(CornerRadius::same(10))
                             .inner_margin(Margin::same(10));
+                        let (dicon, dcolor) = self.disk_icon(d);
                         let resp = frame
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                                    icons::paint(ui.painter(), r, dicon, dcolor);
                                     title_with_status(
                                         ui,
                                         RichText::new(format!("Disco {} · {}", d.number, d.title())).size(13.5),
@@ -1460,6 +1812,7 @@ impl App {
                         let resp = ui.interact(resp.rect, ui.scope_id().with(("disk", d.number)), Sense::click());
                         if resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            hover = Some(Sel::Disk(d.number));
                         }
                         if resp.clicked() {
                             pick = Some(Sel::Disk(d.number));
@@ -1467,6 +1820,7 @@ impl App {
                     }
                 }
             });
+        self.side_hover = hover;
         self.scroll_to_selected = false;
         if let Some(p) = pick {
             self.selected = Some(p);
@@ -1617,25 +1971,62 @@ impl App {
             }
         });
         ui.label(dim(
-            "Come sono collegati i dischi: dal processore e dal chipset, attraverso le porte PCIe, i controller \
-             SATA e USB e gli hub, fino ai dischi. Sui collegamenti le porte e le velocità; in giallo quelli più \
-             lenti di quanto il disco potrebbe. Passa sopra a un riquadro per i dettagli; un clic su un disco \
-             lo apre. Ctrl + rotellina ingrandisce o rimpicciolisce; «Aggiorna» rilegge tutto.",
+            "Come sono collegati i dischi e gli altri dispositivi PCIe: dal processore e dal chipset, attraverso \
+             le porte PCIe, i controller SATA e USB e gli hub, fino ai dischi; a destra i volumi su più dischi e i \
+             contenitori cifrati, in fondo i volumi senza disco con il driver che li crea. Il colore dice il tipo \
+             di collegamento, lo spessore la banda teorica; in giallo i collegamenti più lenti di quanto il \
+             dispositivo potrebbe. Passa sopra a un riquadro o a una linea per i dettagli; un clic su un disco lo \
+             apre. Ctrl + rotellina ingrandisce o rimpicciolisce; «Aggiorna» rilegge tutto.",
         ));
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            for (kind, name) in [
-                (topology::Kind::Cpu, "processore"),
-                (topology::Kind::Chipset, "chipset"),
-                (topology::Kind::SataController, "controller SATA"),
-                (topology::Kind::UsbController, "controller USB"),
-                (topology::Kind::Hub, "hub USB"),
-                (topology::Kind::Disk, "disco"),
-                (topology::Kind::Virtual, "virtuale"),
+            use topology::Link;
+            for (link, name) in [
+                (Link::Pcie, "PCIe e NVMe"),
+                (Link::Sata, "SATA"),
+                (Link::Usb, "USB"),
+                (Link::Soft, "software (volumi, dischi virtuali)"),
             ] {
-                ui.label(RichText::new("●").color(graph_color(kind)).size(11.0));
+                let (r, _) = ui.allocate_exact_size(vec2(18.0, 14.0), Sense::hover());
+                ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(3.0, link_color(link)));
                 ui.label(RichText::new(format!("{name}   ")).color(DIM).size(12.5));
+            }
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 14.0), Sense::hover());
+            ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(3.0, WARN));
+            ui.label(RichText::new("più lento del possibile   ").color(DIM).size(12.5));
+            let (r, _) = ui.allocate_exact_size(vec2(40.0, 14.0), Sense::hover());
+            for (k, w) in [1.0f32, 3.5, 6.3].into_iter().enumerate() {
+                let x = r.left() + 4.0 + k as f32 * 13.0;
+                ui.painter().line_segment([egui::pos2(x, r.top() + 1.0), egui::pos2(x, r.bottom() - 1.0)], Stroke::new(w, DIM));
+            }
+            ui.label(RichText::new("spessore = banda teorica").color(DIM).size(12.5));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for (icon, name) in [
+                (Icon::Cpu, "processore"),
+                (Icon::Chipset, "chipset"),
+                (Icon::SataController, "controller"),
+                (Icon::UsbController, "USB"),
+                (Icon::Hub, "hub"),
+                (Icon::Gpu, "scheda grafica"),
+                (Icon::Network, "rete"),
+                (Icon::Audio, "audio"),
+                (Icon::Nvme, "NVMe"),
+                (Icon::Ssd, "SSD"),
+                (Icon::Hdd, "disco meccanico"),
+                (Icon::UsbStick, "chiavetta"),
+                (Icon::UsbDrive, "disco esterno"),
+                (Icon::SdCard, "scheda SD"),
+                (Icon::VirtualDisk, "disco virtuale"),
+                (Icon::Raid, "volume su più dischi"),
+                (Icon::Locked, "cifrato"),
+                (Icon::Cloud, "cloud"),
+            ] {
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                icons::paint(ui.painter(), r, icon, DIM);
+                ui.label(RichText::new(format!("{name}  ")).color(DIM).size(12.0));
             }
         });
         ui.add_space(4.0);
@@ -1646,7 +2037,12 @@ impl App {
             });
             return;
         };
-        if let Some(sel) = draw_graph(ui, graph, &self.smart, self.settings.temp_warn_c) {
+        let (clicked, hovered) = draw_graph(ui, graph, &self.smart, self.settings.temp_warn_c, self.side_hover);
+        if hovered != self.graph_hover {
+            self.graph_hover = hovered;
+            ui.ctx().request_repaint();
+        }
+        if let Some(sel) = clicked {
             self.selected = Some(sel);
             self.graph_view = false;
             self.monitor_view = false;
@@ -1661,6 +2057,7 @@ impl App {
             self.page_graph(ui);
             return;
         }
+        self.graph_hover = None;
         if self.monitor_view {
             ui.label(bold("Monitoraggio", 26.0));
             ui.label(dim(
@@ -2418,6 +2815,9 @@ impl App {
         let (log_speed, log_latency, log_hist) = (self.opt.log_speed, self.opt.log_latency, self.opt.log_hist);
         let (mut toggle_speed, mut toggle_latency, mut toggle_hist) = (false, false, false);
         let mut rects = [egui::Rect::NOTHING; 4];
+        // Velocità e latenza si indicano a vicenda l'istante sotto il puntatore: ciascuno ha bisogno del
+        // rettangolo dell'altro (quello del fotogramma prima, che non si sposta).
+        let (speed_rect, latency_rect_before) = (self.chart_rects[0], self.chart_rects[1]);
         // Grafici della superficie: scala della latenza, tratto scelto con il mouse e che cosa farne.
         let log_surface = self.opt.log_surface;
         let can_surface = self.can_surface;
@@ -2444,31 +2844,34 @@ impl App {
                     ui.add_space(10.0);
                 }
                 if !only_surface {
+                    // A sinistra velocità e latenza nel tempo, una sopra l'altra, con lo stesso asse del
+                    // tempo: puntatore, zoom e spostamento valgono per entrambi. A destra la
+                    // distribuzione della latenza e il registro.
                     ui.columns(2, |cols| {
                         chart_frame(
                             &mut cols[0],
                             "Velocità (MB/s)",
                             chart_h,
-                            |ui| toggle_speed = log_toggle(ui, log_speed),
+                            |ui| {
+                                toggle_speed = log_toggle(ui, log_speed);
+                                time_zoom_hint(ui);
+                            },
                             |ui| {
                                 legend_row(ui, timed(|s| !s.speed.is_empty()), "");
-                                rects[0] = speed_chart(ui, &sh, log_speed);
+                                rects[0] = speed_chart(ui, &sh, log_speed, latency_rect_before);
                             },
+                        );
+                        chart_frame(
+                            &mut cols[0],
+                            "Latenza (linea tenue = massimo · colori come sopra)",
+                            chart_h,
+                            |ui| toggle_latency = log_toggle(ui, log_latency),
+                            // Le prove sono le stesse del grafico della velocità, con gli stessi colori:
+                            // la legenda sta solo lì e qui l'altezza va tutta al grafico.
+                            |ui| rects[1] = latency_chart(ui, &sh, log_latency, speed_rect),
                         );
                         chart_frame(
                             &mut cols[1],
-                            "Latenza (linea tenue = massimo)",
-                            chart_h,
-                            |ui| toggle_latency = log_toggle(ui, log_latency),
-                            |ui| {
-                                legend_row(ui, timed(|s| !s.lat_avg.is_empty()), "");
-                                rects[1] = latency_chart(ui, &sh, log_latency);
-                            },
-                        );
-                    });
-                    ui.columns(2, |cols| {
-                        chart_frame(
-                            &mut cols[0],
                             "Distribuzione della latenza (% delle operazioni)",
                             chart_h,
                             |ui| toggle_hist = log_toggle(ui, log_hist),
@@ -3404,9 +3807,11 @@ impl App {
             3 if autotest => shot(script, "2-test-finito.png"),
             // Fumetti dei grafici: il puntatore è simulato, il mouse vero non viene toccato.
             4 | 6 | 8 if autotest => {
+                // Velocità durante le letture con coda, latenza durante le scritture con coda: il
+                // fumetto dice anche la coda della misura.
                 let (rect, fx) = match step {
-                    4 => (self.chart_rects[0], 0.55),
-                    6 => (self.chart_rects[1], 0.55),
+                    4 => (self.chart_rects[0], 0.28),
+                    6 => (self.chart_rects[1], 0.78),
                     _ => (self.chart_rects[2], 0.30),
                 };
                 self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * fx, rect.height() * 0.45));
@@ -3498,55 +3903,68 @@ impl App {
                     shot(script, "2i-grafo-storage.png");
                 }
             }
+            // Fumetto di un collegamento (banda teorica) e disco sotto il puntatore, evidenziato anche
+            // nella colonna a sinistra.
             27 => {
+                self.fake_pointer = graph_probe(ctx).map(|(edge, _)| edge);
+                wait(self.script.as_mut().unwrap(), 700);
+            }
+            28 => shot(script, "2j-grafo-collegamento.png"),
+            29 => {
+                self.fake_pointer = graph_probe(ctx).map(|(_, disk)| disk);
+                wait(self.script.as_mut().unwrap(), 1500);
+            }
+            30 => shot(script, "2k-grafo-evidenzia.png"),
+            31 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.graph_view = false;
                 wait(self.script.as_mut().unwrap(), 300);
             }
             // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
-            28 => {
+            32 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Info;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            29 => {
+            33 => {
                 // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
                 if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 29;
+                    script.step = 33;
                     wait(script, 200);
                 } else {
                     shot(script, "2g-info.png");
                 }
             }
-            30 => {
+            34 => {
                 self.scroll_to_diag = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            31 => shot(script, "2h-info-diagnosi.png"),
-            32 => {
+            35 => shot(script, "2h-info-diagnosi.png"),
+            36 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            33 => shot(script, "3-smart.png"),
-            34 => {
+            37 => shot(script, "3-smart.png"),
+            38 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            35 => {
+            39 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 35;
+                    script.step = 39;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            36 => {
+            40 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            37 => {
+            41 => {
                 // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
                 if rect.is_positive() {
@@ -3554,8 +3972,8 @@ impl App {
                 }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            38 => shot(script, "5-temperatura.png"),
-            39 => {
+            42 => shot(script, "5-temperatura.png"),
+            43 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -3568,8 +3986,8 @@ impl App {
                 self.graph_view = false;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            40 => shot(script, "6-monitoraggio.png"),
-            41 => {
+            44 => shot(script, "6-monitoraggio.png"),
+            45 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -4669,10 +5087,84 @@ fn title_with_status(ui: &mut Ui, title: RichText, temp: Option<i32>, health: Op
     });
 }
 
-/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
-fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
+/// Grafico con l'asse del tempo condiviso da velocità e latenza: Ctrl + rotellina ingrandisce,
+/// trascinando ci si sposta, il doppio clic torna a tutta la prova; vale per entrambi.
+fn time_plot<'a>(id: &'static str, height: f32) -> Plot<'a> {
+    base_plot(id, height)
+        .allow_zoom(egui::Vec2b::new(true, false))
+        .allow_drag(egui::Vec2b::new(true, false))
+        .allow_double_click_reset(true)
+        .link_axis(egui::Id::unique("asse del tempo delle prove"), egui::Vec2b::new(true, false))
+        .y_axis_min_width(64.0)
+        .x_axis_formatter(|m, _| format!("{} s", num(m.value, if m.step_size < 0.999 { 1 } else { 0 })))
+}
+
+/// Suggerimento accanto al titolo dei grafici nel tempo: una lente.
+fn time_zoom_hint(ui: &mut Ui) {
+    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+    let p = ui.painter();
+    let c = r.center() - vec2(1.5, 1.5);
+    p.circle_stroke(c, 4.5, Stroke::new(1.4, DIM));
+    p.line_segment([c + vec2(3.3, 3.3), c + vec2(7.0, 7.0)], Stroke::new(1.8, DIM));
+    resp.on_hover_text(
+        "Velocità e latenza hanno lo stesso asse del tempo: il puntatore indica lo stesso istante su \
+         entrambi. Ctrl + rotellina ingrandisce, trascinando ci si sposta, il doppio clic torna a tutta la prova.",
+    );
+}
+
+/// Istante indicato sui grafici nel tempo: dal puntatore sopra questo grafico (vero) o sopra l'altro
+/// (falso), che ha lo stesso asse del tempo e la stessa posizione orizzontale: basta convertire la
+/// posizione del puntatore. `other`: rettangolo dell'altro grafico.
+fn linked_hover_x(p: &egui_plot::PlotUi<'_>, other: egui::Rect) -> Option<(f64, bool)> {
+    if let Some(x) = hover_x(p) {
+        return Some((x, true));
+    }
+    let pos = p.ctx().pointer_hover_pos()?;
+    other.contains(pos).then(|| (p.plot_from_screen(pos).x, false))
+}
+
+/// La misura con coda a cui appartiene un punto: «Coda Q8 · blocchi da 256K in sequenza».
+fn queue_mark_text(m: &tester::QueueMark) -> String {
+    let row = &tester::QUEUE_ROWS[m.row];
+    format!(
+        "Coda Q{} · blocchi da {} {}",
+        m.depth,
+        tester::block_name(row.block),
+        if row.random { "in punti a caso" } else { "in sequenza" }
+    )
+}
+
+/// Nel fumetto: la coda della misura in corso in quell'istante, per le prove con coda.
+fn tip_queue(ui: &mut Ui, sh: &tester::Shared, phase: Phase, secs: f64) {
+    if let Some(m) = sh.queue_mark_at(phase, secs) {
+        ui.label(RichText::new(queue_mark_text(m)).color(TEXT).size(13.5));
+        ui.label(dim(format!(
+            "{} {} in volo insieme, misura da {} a {} s",
+            m.depth,
+            if m.depth == 1 { "richiesta" } else { "richieste" },
+            num(m.from, 1),
+            num(m.to, 1)
+        )));
+    }
+}
+
+/// Fascia della misura con coda sotto il puntatore, sui due grafici nel tempo.
+fn queue_band(p: &mut egui_plot::PlotUi<'_>, sh: &tester::Shared, phase: Phase, secs: f64) {
+    if let Some(m) = sh.queue_mark_at(phase, secs) {
+        let color = phase_color(phase);
+        p.span(
+            Span::new("", m.from..=m.to)
+                .fill(color.gamma_multiply(0.10))
+                .border(Stroke::new(1.0, color.gamma_multiply(0.5))),
+        );
+    }
+}
+
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche e al
+/// collegamento con il grafico della latenza, `other`).
+fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -> egui::Rect {
     let y_of = move |v: f64| if log { v.max(0.1).log10() } else { v };
-    let plot = base_plot("velocita", ui.available_height()).x_axis_formatter(|m, _| format!("{} s", num(m.value, 0)));
+    let plot = time_plot("velocita", ui.available_height());
     let plot = if log {
         plot.y_grid_spacer(decade_marks(1.0))
             .y_axis_formatter(|m, _| int(10f64.powf(m.value).round() as u64))
@@ -4680,7 +5172,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
         plot.include_y(0.0)
             .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
     };
-    let out = plot.show(ui, |p| -> Option<(Phase, [f64; 2])> {
+    let out = plot.show(ui, |p| -> Option<(Phase, [f64; 2], bool)> {
         for (phase, s) in timed_series(sh) {
             if s.speed.is_empty() {
                 continue;
@@ -4688,14 +5180,16 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             let pts: Vec<[f64; 2]> = s.speed.iter().map(|q| [q[0], y_of(q[1])]).collect();
             draw_series(p, phase.short(), pts, phase_color(*phase), 2.0);
         }
-        // Sotto il puntatore: il campione più vicino, con la linea verticale sulla sua posizione.
-        let x = hover_x(p)?;
+        // Sotto il puntatore (qui o sul grafico della latenza): il campione più vicino, con la linea
+        // verticale sulla sua posizione.
+        let (x, own) = linked_hover_x(p, other)?;
         let (phase, i) = nearest_sample(timed_series(sh).map(|(ph, s)| (*ph, s.speed.as_slice())), x)?;
         let q = sh.series.iter().find(|(ph, _)| *ph == phase)?.1.speed[i];
+        queue_band(p, sh, phase, q[0]);
         hover_marks(p, q[0], &[(y_of(q[1]), phase_color(phase))]);
-        Some((phase, q))
+        Some((phase, q, own))
     });
-    if let Some((phase, q)) = out.inner {
+    if let Some((phase, q, true)) = out.inner {
         chart_tip(&out.response, out.transform.position_from_point_x(q[0]), |ui| {
             tip_head(ui, phase, q[0]);
             let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
@@ -4711,6 +5205,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
                 let iops = (q[1] * 1e6 / tester::BLOCK as f64).round() as u64;
                 ui.label(RichText::new(format!("circa {} operazioni al secondo", int(iops))).color(TEXT).size(13.0));
             }
+            tip_queue(ui, sh, phase, q[0]);
             tip_note(
                 ui,
                 "Velocità: quanti dati passano ogni secondo in questo momento della prova. Più alta è meglio.",
@@ -4721,11 +5216,12 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
     out.response.rect
 }
 
-/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche).
-fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
+/// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche e al
+/// collegamento con il grafico della velocità, `other`).
+fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -> egui::Rect {
     let y_of = move |v: f64| if log { v.max(1e-4).log10() } else { v };
     let map = move |pts: &[[f64; 2]]| -> Vec<[f64; 2]> { pts.iter().map(|p| [p[0], y_of(p[1])]).collect() };
-    let plot = base_plot("latenza", ui.available_height()).x_axis_formatter(|m, _| format!("{} s", num(m.value, 0)));
+    let plot = time_plot("latenza", ui.available_height());
     let plot = if log {
         plot.y_grid_spacer(decade_marks(1.0))
             .y_axis_formatter(|m, _| fmt_decade(10f64.powf(m.value)))
@@ -4734,7 +5230,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             .y_axis_formatter(|m, _| format!("{} ms", num(m.value, 1)))
     };
     // Istante, latenza media e latenza massima del campione sotto il puntatore.
-    let out = plot.show(ui, |p| -> Option<(Phase, f64, f64, Option<f64>)> {
+    let out = plot.show(ui, |p| -> Option<(Phase, f64, f64, Option<f64>, bool)> {
         for (phase, s) in timed_series(sh) {
             if s.lat_avg.is_empty() {
                 continue;
@@ -4744,7 +5240,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             draw_series(p, &name, map(&s.lat_max), color.gamma_multiply(0.35), 1.0);
             draw_series(p, phase.short(), map(&s.lat_avg), color, 2.0);
         }
-        let x = hover_x(p)?;
+        let (x, own) = linked_hover_x(p, other)?;
         let (phase, i) = nearest_sample(timed_series(sh).map(|(ph, s)| (*ph, s.lat_avg.as_slice())), x)?;
         let s = &sh.series.iter().find(|(ph, _)| *ph == phase)?.1;
         let avg = s.lat_avg[i];
@@ -4754,10 +5250,11 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
         if let Some(max) = max {
             marks.insert(0, (y_of(max), color.gamma_multiply(0.55)));
         }
+        queue_band(p, sh, phase, avg[0]);
         hover_marks(p, avg[0], &marks);
-        Some((phase, avg[0], avg[1], max))
+        Some((phase, avg[0], avg[1], max, own))
     });
-    if let Some((phase, secs, avg, max)) = out.inner {
+    if let Some((phase, secs, avg, max, true)) = out.inner {
         chart_tip(&out.response, out.transform.position_from_point_x(secs), |ui| {
             tip_head(ui, phase, secs);
             tip_value(ui, fmt_ms(avg));
@@ -4766,6 +5263,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
                 None => "in media".to_string(),
             };
             ui.label(RichText::new(detail).color(TEXT).size(13.0));
+            tip_queue(ui, sh, phase, secs);
             tip_note(
                 ui,
                 "Latenza: il tempo che il disco impiega a completare una singola operazione. \

@@ -105,7 +105,7 @@ pub struct SataLink {
     pub generation: u8,
 }
 
-fn pcie_label(generation: u32, width: u32) -> String {
+pub fn pcie_label(generation: u32, width: u32) -> String {
     let version = match generation {
         1 => "1.0",
         2 => "2.0",
@@ -118,17 +118,33 @@ fn pcie_label(generation: u32, width: u32) -> String {
     format!("PCIe {version} x{width}")
 }
 
-/// Banda massima di un collegamento PCIe, al netto della codifica: "7,9 GB/s".
-fn pcie_bandwidth(generation: u32, width: u32) -> String {
-    let lane_mb = match generation {
+/// Banda di una linea PCIe in MB/s, al netto della codifica (8b/10b fino alla 2.0, 128b/130b dopo).
+pub fn pcie_lane_mb(generation: u32) -> f64 {
+    match generation {
         1 => 250.0,
         2 => 500.0,
         3 => 984.6,
         4 => 1969.2,
         5 => 3938.5,
         _ => 7563.0,
-    };
-    let gb = lane_mb * width as f64 / 1000.0;
+    }
+}
+
+/// Una banda in MB/s scritta per esteso: "600 MB/s", "7,9 GB/s".
+pub fn rate(mb: f64) -> String {
+    let gb = mb / 1000.0;
+    if gb < 1.0 {
+        format!("{mb:.0} MB/s")
+    } else if gb < 10.0 {
+        format!("{gb:.1} GB/s").replace('.', ",")
+    } else {
+        format!("{gb:.0} GB/s")
+    }
+}
+
+/// Banda massima di un collegamento PCIe, al netto della codifica: "7,9 GB/s".
+fn pcie_bandwidth(generation: u32, width: u32) -> String {
+    let gb = pcie_lane_mb(generation) * width as f64 / 1000.0;
     if gb < 1.0 {
         format!("{:.0} MB/s", gb * 1000.0)
     } else {
@@ -136,7 +152,7 @@ fn pcie_bandwidth(generation: u32, width: u32) -> String {
     }
 }
 
-fn pcie_gts(generation: u32) -> &'static str {
+pub fn pcie_gts(generation: u32) -> &'static str {
     match generation {
         1 => "2,5 GT/s",
         2 => "5 GT/s",
@@ -216,8 +232,6 @@ fn devnode_u32(node: u32, key: &DEVPROPKEY) -> Option<u32> {
 
 /// Collegamento PCIe del controller da cui dipende il disco (per gli NVMe è il disco stesso).
 fn pcie_link(instance_id: &str) -> Option<PcieLink> {
-    const PCI: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x3ab22e31_8264_4b4e_9af5_a8d2d8e33e62);
-    let key = |pid: u32| DEVPROPKEY { fmtid: PCI, pid };
     let id = win::wide(instance_id);
     let (mut node, mut parent) = (0u32, 0u32);
     unsafe {
@@ -231,13 +245,21 @@ fn pcie_link(instance_id: &str) -> Option<PcieLink> {
     {
         return None;
     }
+    pcie_link_node(parent)
+}
+
+/// Collegamento PCIe di un dispositivo PCI dell'albero di Windows: Windows lo dichiara solo per i
+/// dispositivi finali, non per le porte e i bridge.
+pub fn pcie_link_node(node: u32) -> Option<PcieLink> {
+    const PCI: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x3ab22e31_8264_4b4e_9af5_a8d2d8e33e62);
+    let key = |pid: u32| DEVPROPKEY { fmtid: PCI, pid };
     let link = PcieLink {
-        generation: devnode_u32(parent, &key(9))?,
-        width: devnode_u32(parent, &key(10))?,
-        max_gen: devnode_u32(parent, &key(11))?,
-        max_width: devnode_u32(parent, &key(12))?,
+        generation: devnode_u32(node, &key(9))?,
+        width: devnode_u32(node, &key(10))?,
+        max_gen: devnode_u32(node, &key(11))?,
+        max_width: devnode_u32(node, &key(12))?,
     };
-    (link.max_gen > 0 && link.max_width > 0).then_some(link)
+    (link.max_gen > 0 && link.max_width > 0 && link.generation > 0 && link.width > 0).then_some(link)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -346,17 +368,33 @@ fn extents(letter: char) -> Vec<(u32, u64, u64)> {
         .collect()
 }
 
+/// Collegamenti di un disco per il grafo.
+pub struct Links {
+    pub pcie: Option<PcieLink>,
+    pub usb: Option<UsbLink>,
+    pub sata: Option<SataLink>,
+    /// Velocità di rotazione dichiarata nei dati di IDENTIFY: `Some(0)` = SSD, altrimenti giri al
+    /// minuto; `None` se il disco non la dice.
+    pub rpm: Option<u16>,
+}
+
 /// Collegamenti di un disco per il grafo: PCIe (NVMe interni), USB, SATA. Solo domande che non
 /// svegliano i dischi fermi: lo SATA viene dai dati di IDENTIFY che Windows conserva.
-pub fn links(d: &PhysDisk) -> (Option<PcieLink>, Option<UsbLink>, Option<SataLink>) {
+pub fn links(d: &PhysDisk) -> Links {
     let usb = usb_link(&d.usb_node);
     let pcie = if d.bus == disks::BUS_NVME && !d.is_usb() { pcie_link(&d.instance_id) } else { None };
-    let sata = if matches!(d.bus, 14 | 15 | 16) {
-        None
-    } else {
-        smart::identity(d).0.as_deref().and_then(sata_link)
-    };
-    (pcie, usb, sata)
+    let id = if matches!(d.bus, 14 | 15 | 16) { None } else { smart::identity(d).0 };
+    let rpm = id.as_deref().and_then(|id| match rd_u16(id, 217 * 2) {
+        1 => Some(0),
+        r @ 0x0401..=0xFFFE => Some(r),
+        _ => None,
+    });
+    Links {
+        pcie,
+        usb,
+        sata: id.as_deref().and_then(sata_link),
+        rpm,
+    }
 }
 
 /// Collegamento PCIe in breve, e se va più piano di quanto il disco potrebbe: «PCIe 4.0 x1 (il
@@ -560,7 +598,7 @@ fn gpt_kind(guid: &[u8]) -> String {
 
 /// Velocità del collegamento USB: la si chiede all'hub a cui il dispositivo è attaccato, per la
 /// porta che occupa.
-fn usb_link(usb_node: &str) -> Option<UsbLink> {
+pub fn usb_link(usb_node: &str) -> Option<UsbLink> {
     const CM_DRP_ADDRESS: u32 = 0x1D;
     if usb_node.is_empty() {
         return None;
