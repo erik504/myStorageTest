@@ -10,6 +10,7 @@ mod monitor;
 mod settings;
 mod smart;
 mod tester;
+mod topology;
 mod tray;
 mod ui;
 mod win;

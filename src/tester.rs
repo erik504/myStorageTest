@@ -39,15 +39,61 @@ const MAX_STORED_ERRORS: usize = 2000;
 /// Un'operazione più lenta di così viene segnalata come stallo.
 const STALL_SECS: f64 = 2.0;
 const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+/// Gruppo di prove con coda, per dimensione del blocco: ognuno è una prova a sé, con la sua fase, e
+/// si può scegliere nelle opzioni.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum QueueGroup {
+    K4,
+    K256,
+    M1,
+}
+
+impl QueueGroup {
+    pub const ALL: [QueueGroup; 3] = [QueueGroup::K4, QueueGroup::K256, QueueGroup::M1];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            QueueGroup::K4 => "4K",
+            QueueGroup::K256 => "256K",
+            QueueGroup::M1 => "1M",
+        }
+    }
+
+    /// Che cosa comprende il gruppo, per le opzioni e i fumetti.
+    pub fn content(self) -> &'static str {
+        match self {
+            QueueGroup::K4 => "blocchi da 4K in punti a caso",
+            QueueGroup::K256 => "blocchi da 256K in sequenza e in punti a caso",
+            QueueGroup::M1 => "blocchi da 1M in sequenza e in punti a caso",
+        }
+    }
+
+    /// Dal nome usato in riga di comando: «4k», «256K», «1m».
+    pub fn parse(s: &str) -> Option<QueueGroup> {
+        QueueGroup::ALL.into_iter().find(|g| g.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 /// Una riga della tabella «velocità per blocco e profondità della coda».
 pub struct QueueRow {
-    pub name: &'static str,
+    pub group: QueueGroup,
+    /// «Sequenziale» o «Casuale».
+    pub pattern: &'static str,
     pub block: usize,
     /// In punti a caso del file; altrimenti in sequenza.
     pub random: bool,
 }
 
 impl QueueRow {
+    /// Nome completo: «Sequenziale 1M», «Casuale 4K».
+    pub fn title(&self) -> String {
+        format!("{} {}", self.pattern, self.group.name())
+    }
+
     /// I blocchi piccoli si leggono in operazioni al secondo, gli altri in MB/s.
     pub fn in_iops(&self) -> bool {
         self.block <= 64 << 10
@@ -63,23 +109,22 @@ impl QueueRow {
     }
 }
 
-/// Le prove della tabella: blocchi da 1M e 256K in sequenza e in punti a caso, e 4K a caso.
+/// Le prove della tabella, raggruppate per dimensione del blocco: 4K a caso; 256K e 1M in sequenza
+/// e in punti a caso.
 pub const QUEUE_ROWS: [QueueRow; 5] = [
-    QueueRow { name: "Sequenziale 1M", block: 1 << 20, random: false },
-    QueueRow { name: "Sequenziale 256K", block: 256 << 10, random: false },
-    QueueRow { name: "Casuale 1M", block: 1 << 20, random: true },
-    QueueRow { name: "Casuale 256K", block: 256 << 10, random: true },
-    QueueRow { name: "Casuale 4K", block: 4 << 10, random: true },
+    QueueRow { group: QueueGroup::K4, pattern: "Casuale", block: 4 << 10, random: true },
+    QueueRow { group: QueueGroup::K256, pattern: "Sequenziale", block: 256 << 10, random: false },
+    QueueRow { group: QueueGroup::K256, pattern: "Casuale", block: 256 << 10, random: true },
+    QueueRow { group: QueueGroup::M1, pattern: "Sequenziale", block: 1 << 20, random: false },
+    QueueRow { group: QueueGroup::M1, pattern: "Casuale", block: 1 << 20, random: true },
 ];
 /// Profondità della coda provate: quante richieste in volo insieme, tutte da un solo thread. I
 /// dischi veloci (NVMe, RAID) arrivano al massimo solo con molte richieste in volo; quelli lenti ci
 /// arrivano subito, e alcuni bridge USB vanno più piano con più richieste insieme.
 pub const QUEUE_DEPTHS: [usize; 6] = [1, 2, 4, 8, 16, 32];
-/// Durata di ciascuna misura della tabella.
-const QUEUE_STEP_SECS: f64 = 0.5;
-/// Tetto dei dati scritti da una misura in scrittura: sui dischi veloci mezzo secondo vorrebbe dire
-/// diversi GB, e con trenta misure decine di GB scritti a ogni prova. Così sono al più circa 15 GB.
-const QUEUE_WRITE_STEP_BYTES: u64 = 512 << 20;
+/// Durate proposte per ciascuna misura della tabella, in millisecondi: le misure lunghe fanno pesare
+/// meno la cache dei dischi e le pause di un istante. Con tutti i gruppi le misure sono 60.
+pub const QUEUE_STEP_CHOICES_MS: [u32; 5] = [500, 1000, 2000, 5000, 10000];
 /// Dopo l'annullamento, attesa massima per le richieste ancora in volo.
 const QUEUE_CANCEL_SECS: f64 = 30.0;
 
@@ -104,10 +149,11 @@ pub fn block_name(block: usize) -> String {
 pub enum Phase {
     SeqWrite,
     SeqRead,
-    /// Letture della tabella per blocco e profondità della coda (da 1 a 32 richieste in volo).
-    QueueRead,
-    /// Scritture della stessa tabella.
-    QueueWrite,
+    /// Letture di un gruppo della tabella per blocco e profondità della coda (da 1 a 32 richieste
+    /// in volo).
+    QueueRead(QueueGroup),
+    /// Scritture di un gruppo della stessa tabella.
+    QueueWrite(QueueGroup),
     RandRead,
     RandWrite,
     Flush,
@@ -122,8 +168,12 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura sequenziale",
             Phase::SeqRead => "Lettura sequenziale e verifica",
-            Phase::QueueRead => "Lettura con coda da 1 a 32 (1M, 256K, 4K)",
-            Phase::QueueWrite => "Scrittura con coda da 1 a 32 (1M, 256K, 4K)",
+            Phase::QueueRead(QueueGroup::K4) => "Lettura 4K con coda da 1 a 32 (a caso)",
+            Phase::QueueRead(QueueGroup::K256) => "Lettura 256K con coda da 1 a 32 (in sequenza e a caso)",
+            Phase::QueueRead(QueueGroup::M1) => "Lettura 1M con coda da 1 a 32 (in sequenza e a caso)",
+            Phase::QueueWrite(QueueGroup::K4) => "Scrittura 4K con coda da 1 a 32 (a caso)",
+            Phase::QueueWrite(QueueGroup::K256) => "Scrittura 256K con coda da 1 a 32 (in sequenza e a caso)",
+            Phase::QueueWrite(QueueGroup::M1) => "Scrittura 1M con coda da 1 a 32 (in sequenza e a caso)",
             Phase::RandRead => "Lettura casuale 4K",
             Phase::RandWrite => "Scrittura casuale 4K",
             Phase::Flush => "Flush su disco",
@@ -137,8 +187,12 @@ impl Phase {
         match self {
             Phase::SeqWrite => "Scrittura seq.",
             Phase::SeqRead => "Lettura seq.",
-            Phase::QueueRead => "Lettura Q1–32",
-            Phase::QueueWrite => "Scrittura Q1–32",
+            Phase::QueueRead(QueueGroup::K4) => "Lettura 4K Q1–32",
+            Phase::QueueRead(QueueGroup::K256) => "Lettura 256K Q1–32",
+            Phase::QueueRead(QueueGroup::M1) => "Lettura 1M Q1–32",
+            Phase::QueueWrite(QueueGroup::K4) => "Scrittura 4K Q1–32",
+            Phase::QueueWrite(QueueGroup::K256) => "Scrittura 256K Q1–32",
+            Phase::QueueWrite(QueueGroup::M1) => "Scrittura 1M Q1–32",
             Phase::RandRead => "Lettura 4K",
             Phase::RandWrite => "Scrittura 4K",
             Phase::Flush => "Flush",
@@ -161,8 +215,11 @@ pub struct TestConfig {
     pub file_tests: bool,
     pub file_size: u64,
     pub seq_read: bool,
-    /// Tabella per blocco e profondità della coda, in lettura e in scrittura.
-    pub queue: bool,
+    /// Gruppi della tabella per blocco e profondità della coda da provare (indice: `QueueGroup`),
+    /// in lettura e in scrittura.
+    pub queue: [bool; 3],
+    /// Durata di ciascuna misura della tabella con coda, in secondi.
+    pub queue_secs: f64,
     pub rand_read: bool,
     pub rand_write: bool,
     pub flush: bool,
@@ -1184,7 +1241,7 @@ impl Engine {
         if self.cfg.seq_read && !self.halted() {
             self.seq_read(&h, &path, size, &map);
         }
-        if self.cfg.queue && !self.halted() {
+        if self.cfg.queue.contains(&true) && !self.halted() {
             self.queue_tests(&h, &path, size, folder.as_mut(), false);
         }
         if self.cfg.rand_read && !self.halted() {
@@ -1211,7 +1268,7 @@ impl Engine {
         }
         // Per ultime le scritture con coda: scrivono senza verificare, quindi dopo tutte le prove
         // che controllano il contenuto del file.
-        if self.cfg.queue && !self.halted() {
+        if self.cfg.queue.contains(&true) && !self.halted() {
             self.queue_tests(&h, &path, size, folder.as_mut(), true);
         }
 
@@ -1386,20 +1443,19 @@ impl Engine {
         s.finish(self, completed, note);
     }
 
-    /// Tabella «velocità per blocco e profondità della coda», in lettura o in scrittura: per
-    /// ciascuna riga di `QUEUE_ROWS` (blocchi da 1M e 256K in sequenza e a caso, 4K a caso) e per
-    /// ciascuna profondità di `QUEUE_DEPTHS` (richieste tenute in volo insieme, da un solo thread)
-    /// mezzo secondo di richieste. I dati letti non si controllano e quelli scritti non si
-    /// verificano: generarli e confrontarli costerebbe più dell'I/O e abbasserebbe la misura. Le
-    /// letture girano subito dopo la rilettura sequenziale, sul file appena scritto in ordine (come
-    /// nei programmi di benchmark: dopo le scritture casuali i blocchi sono sparpagliati dentro
+    /// Tabella «velocità per blocco e profondità della coda», in lettura o in scrittura. Ogni gruppo
+    /// scelto (4K, 256K, 1M) è una prova a sé, con la sua fase: per ciascuna sua riga (in sequenza o
+    /// a caso) e per ciascuna profondità di `QUEUE_DEPTHS` (richieste tenute in volo insieme, da un
+    /// solo thread) `TestConfig::queue_secs` di richieste. I dati letti non si controllano e quelli scritti
+    /// non si verificano: generarli e confrontarli costerebbe più dell'I/O e abbasserebbe la misura.
+    /// Le letture girano subito dopo la rilettura sequenziale, sul file appena scritto in ordine
+    /// (come nei programmi di benchmark: dopo le scritture casuali i blocchi sono sparpagliati dentro
     /// l'SSD e le letture rallentano); le scritture per ultime, dopo tutte le verifiche.
     fn queue_tests(&self, main: &Handle, path: &str, size: u64, folder: Option<&mut TempDir>, write: bool) {
-        let phase = if write { Phase::QueueWrite } else { Phase::QueueRead };
+        let groups: Vec<QueueGroup> = QueueGroup::ALL.into_iter().filter(|g| self.cfg.queue[g.index()]).collect();
+        let Some(&first) = groups.first() else { return };
         let verb = if write { "Scrittura" } else { "Lettura" };
-        self.begin(phase);
-        let mut s = Sampler::new(phase);
-        s.wall = true;
+        let phase_of = |g: QueueGroup| if write { Phase::QueueWrite(g) } else { Phase::QueueRead(g) };
         // Un secondo handle, asincrono, sullo stesso file (quello delle altre prove è sincrono e
         // Windows lo serializza), legato a una completion port: raccoglie molte richieste concluse
         // con una sola chiamata, e un thread solo regge code lunghe di blocchi piccoli.
@@ -1422,6 +1478,9 @@ impl Engine {
         let (h, port) = match opened {
             Ok(x) => x,
             Err(code) => {
+                let phase = phase_of(first);
+                self.begin(phase);
+                let mut s = Sampler::new(phase);
                 s.errors += 1;
                 self.error(phase, "apertura", path, 0, 0, code);
                 s.finish(self, false, String::new());
@@ -1436,82 +1495,104 @@ impl Engine {
             }
         }
         let mut rng = self.seed ^ if write { 0x7E57_C0DA_51DE_0002 } else { 0x7E57_C0DA_51DE_0001 };
-        let mut completed = true;
-        'rows: for (r, row) in QUEUE_ROWS.iter().enumerate() {
-            let mut off = 0u64;
-            let mut parts: Vec<String> = Vec::new();
-            for (d, &depth) in QUEUE_DEPTHS.iter().enumerate() {
-                if self.halted() {
-                    completed = false;
-                    break 'rows;
-                }
-                self.shared.lock().unwrap().queue_live = Some((r, write));
-                let spec = StepSpec {
-                    block: row.block,
-                    depth,
-                    random: row.random,
-                    write,
-                };
-                let index = r * QUEUE_DEPTHS.len() + d;
-                let Some(step) = self.queue_step(&h, &port, path, size, spec, &mut off, &mut rng, &mut s, index) else {
-                    // Richieste rimaste in sospeso dopo l'annullamento: i loro buffer non si
-                    // possono liberare, e nemmeno gli handle si possono chiudere.
-                    std::mem::forget(h);
-                    std::mem::forget(port);
-                    self.op_started.store(0, Ordering::Relaxed);
-                    self.shared.lock().unwrap().queue_live = None;
-                    s.finish(self, false, "richieste rimaste in sospeso".into());
-                    return;
-                };
-                // Una misura interrotta a metà non va in tabella.
-                if step.ops > 0 && step.secs > 0.0 && !step.stop {
-                    let cell = QueueCell {
-                        row: r,
-                        write,
-                        depth,
-                        mbps: step.bytes as f64 / step.secs / 1e6,
-                        iops: step.ops as f64 / step.secs,
-                        lat_ms: step.lat / step.ops as f64 * 1000.0,
-                    };
-                    parts.push(format!("Q{depth} {}", row.value(&cell)));
-                    if !row.random && s.peak.is_none_or(|p| cell.mbps > p.0) {
-                        s.peak = Some((cell.mbps, cell.iops, depth as u32, row.block as u32));
+        for group in groups {
+            if self.halted() {
+                break;
+            }
+            let phase = phase_of(group);
+            self.begin(phase);
+            let mut s = Sampler::new(phase);
+            s.wall = true;
+            let mut completed = true;
+            let rows: Vec<usize> = (0..QUEUE_ROWS.len()).filter(|&r| QUEUE_ROWS[r].group == group).collect();
+            let cells = rows.len() * QUEUE_DEPTHS.len();
+            // Il risultato della prova è la misura in sequenza più veloce; il gruppo 4K, che ha solo
+            // misure a caso, ha la più veloce di quelle.
+            let has_seq = rows.iter().any(|&r| !QUEUE_ROWS[r].random);
+            'rows: for (k, &r) in rows.iter().enumerate() {
+                let row = &QUEUE_ROWS[r];
+                let mut off = 0u64;
+                let mut parts: Vec<String> = Vec::new();
+                for (d, &depth) in QUEUE_DEPTHS.iter().enumerate() {
+                    if self.halted() {
+                        completed = false;
+                        break 'rows;
                     }
-                    self.shared.lock().unwrap().queue.push(cell);
+                    self.shared.lock().unwrap().queue_live = Some((r, write));
+                    let spec = StepSpec {
+                        block: row.block,
+                        depth,
+                        random: row.random,
+                        write,
+                    };
+                    let progress = (k * QUEUE_DEPTHS.len() + d, cells);
+                    let Some(step) = self.queue_step(&h, &port, path, size, spec, &mut off, &mut rng, &mut s, progress)
+                    else {
+                        // Richieste rimaste in sospeso dopo l'annullamento: i loro buffer non si
+                        // possono liberare, e nemmeno gli handle si possono chiudere.
+                        std::mem::forget(h);
+                        std::mem::forget(port);
+                        self.op_started.store(0, Ordering::Relaxed);
+                        self.shared.lock().unwrap().queue_live = None;
+                        s.finish(self, false, "richieste rimaste in sospeso".into());
+                        return;
+                    };
+                    // Una misura interrotta a metà non va in tabella.
+                    if step.ops > 0 && step.secs > 0.0 && !step.stop {
+                        let cell = QueueCell {
+                            row: r,
+                            write,
+                            depth,
+                            mbps: step.bytes as f64 / step.secs / 1e6,
+                            iops: step.ops as f64 / step.secs,
+                            lat_ms: step.lat / step.ops as f64 * 1000.0,
+                        };
+                        parts.push(format!("Q{depth} {}", row.value(&cell)));
+                        if (!row.random || !has_seq) && s.peak.is_none_or(|p| cell.mbps > p.0) {
+                            s.peak = Some((cell.mbps, cell.iops, depth as u32, row.block as u32));
+                        }
+                        self.shared.lock().unwrap().queue.push(cell);
+                    }
+                    if step.stop {
+                        completed = false;
+                        break 'rows;
+                    }
                 }
-                if step.stop {
-                    completed = false;
-                    break 'rows;
+                if !parts.is_empty() {
+                    self.log(
+                        LogLevel::Info,
+                        format!("{verb} {}: {}", row.title().to_lowercase(), parts.join(" · ")),
+                    );
                 }
             }
-            if !parts.is_empty() {
-                self.log(
-                    LogLevel::Info,
-                    format!("{verb} {}: {}", row.name.to_lowercase(), parts.join(" · ")),
-                );
+            let note = match s.peak {
+                Some((mbps, _, depth, _)) if has_seq => format!(
+                    "migliore in sequenza: {} MB/s con Q{depth}",
+                    win::thousands(mbps.round() as u64)
+                ),
+                Some((_, iops, depth, _)) => format!(
+                    "migliore: {} IOPS con Q{depth}",
+                    win::thousands(iops.round() as u64)
+                ),
+                None => String::new(),
+            };
+            if !note.is_empty() {
+                self.log(LogLevel::Good, format!("{verb} {} con coda da 1 a 32, {note}", group.name()));
+            }
+            s.finish(self, completed, note);
+            if !completed {
+                break;
             }
         }
-        let note = match s.peak {
-            Some((mbps, _, depth, block)) => format!(
-                "migliore in sequenza: {} MB/s con Q{depth} e blocchi da {}",
-                win::thousands(mbps.round() as u64),
-                block_name(block as usize)
-            ),
-            None => String::new(),
-        };
-        if !note.is_empty() {
-            self.log(LogLevel::Good, format!("{verb} con coda da 1 a 32, {note}"));
-        }
-        s.finish(self, completed, note);
         self.shared.lock().unwrap().queue_live = None;
         drop(h);
         drop(port);
         self.op_started.store(0, Ordering::Relaxed);
     }
 
-    /// Una casella della tabella con coda: per `QUEUE_STEP_SECS` tiene `depth` richieste da `block`
-    /// byte sempre in volo (in sequenza o in punti a caso), poi aspetta che finiscano. In scrittura
-    /// si ferma prima se ha già scritto `QUEUE_WRITE_STEP_BYTES`. `None` se dopo l'annullamento
+    /// Una casella della tabella con coda: per `TestConfig::queue_secs` tiene `depth` richieste da `block`
+    /// byte sempre in volo (in sequenza o in punti a caso), poi aspetta che finiscano. `progress`:
+    /// posizione della casella nella prova e numero delle caselle. `None` se dopo l'annullamento
     /// alcune richieste non si concludono: allora i buffer restano allocati (lo fa sapere il
     /// chiamante).
     #[allow(clippy::too_many_arguments)]
@@ -1525,8 +1606,9 @@ impl Engine {
         off: &mut u64,
         rng: &mut u64,
         s: &mut Sampler,
-        index: usize,
+        progress: (usize, usize),
     ) -> Option<StepResult> {
+        let (index, cells) = (progress.0, progress.1.max(1) as f64);
         let StepSpec {
             block,
             depth,
@@ -1543,8 +1625,6 @@ impl Engine {
                 next_block(off, block as u64, size)
             }
         };
-        let byte_limit = if write { QUEUE_WRITE_STEP_BYTES } else { u64::MAX };
-        let cells = (QUEUE_ROWS.len() * QUEUE_DEPTHS.len()) as f64;
         let mut out = StepResult {
             bytes: 0,
             ops: 0,
@@ -1565,7 +1645,6 @@ impl Engine {
         let mut cancelled_at: Option<Instant> = None;
         let mut ui_tick = Instant::now();
         let mut in_flight = 0usize;
-        let mut issued = 0u64;
         let waiting_since = |t: Instant| t.duration_since(self.t0).as_micros() as u64 + 1;
         self.op_started.store(waiting_since(step_start), Ordering::Relaxed);
 
@@ -1573,7 +1652,6 @@ impl Engine {
             match slot.issue(h, next()) {
                 Ok(()) => {
                     in_flight += 1;
-                    issued += block as u64;
                 }
                 Err(code) => {
                     s.errors += 1;
@@ -1653,12 +1731,11 @@ impl Engine {
                         }
                     }
                 }
-                let in_time = step_start.elapsed().as_secs_f64() < QUEUE_STEP_SECS && issued < byte_limit;
+                let in_time = step_start.elapsed().as_secs_f64() < self.cfg.queue_secs;
                 if in_time && !out.stop && !self.halted() {
                     match slot.issue(h, next()) {
                         Ok(()) => {
                             in_flight += 1;
-                            issued += block as u64;
                         }
                         Err(code) => {
                             s.errors += 1;
@@ -1682,7 +1759,7 @@ impl Engine {
             }
             if ui_tick.elapsed() >= Duration::from_millis(100) {
                 ui_tick = Instant::now();
-                let within = (step_start.elapsed().as_secs_f64() / QUEUE_STEP_SECS).min(1.0);
+                let within = (step_start.elapsed().as_secs_f64() / self.cfg.queue_secs).min(1.0);
                 self.progress((index as f64 + within) / cells);
                 self.op_started.store(waiting_since(last_done), Ordering::Relaxed);
             }

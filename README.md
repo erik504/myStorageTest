@@ -9,7 +9,23 @@ quando si ha un dubbio, e accorgersi subito quando un disco comincia a dare erro
 ## Cosa fa
 
 La colonna a sinistra elenca i dischi, ognuno con la temperatura e il pallino dello stato SMART; in cima
-c'è la voce **Monitoraggio**, con la casella che lo accende e lo spegne. Ogni disco ha cinque schede.
+ci sono «Aggiorna», che rilegge dischi, volumi, i dati della scheda Info e il Grafo Storage, la voce
+**Monitoraggio**, con la casella che lo accende e lo spegne, e la voce **Grafo Storage**.
+
+**Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi. Da sinistra a destra il
+processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una porta del processore), i
+controller SATA e USB, gli hub USB in cascata, e nell'ultima colonna i dischi, ognuno con dimensione,
+lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, USB 3.2 Gen 1 con il bridge e il protocollo
+UAS o BOT), salute SMART e temperatura. Sui collegamenti le porte (degli hub, del controller SATA) e la
+velocità PCIe degli NVMe; in giallo quelli più lenti di quanto il disco potrebbe. In fondo i dischi
+virtuali e i volumi senza un disco fisico (contenitori cifrati, unità di rete o di cloud). Il grafo si
+stringe per stare in larghezza nella finestra; Ctrl + rotellina lo ingrandisce o lo rimpicciolisce.
+Passando sopra a un riquadro si vedono i nomi completi e gli identificativi di Windows; un clic su un
+disco ne apre la pagina. Il grafo viene dall'albero dei dispositivi di Windows: per ogni disco si
+risale fino al processore, senza privilegi di amministratore e senza svegliare i dischi fermi, e si
+ricostruisce quando i dischi cambiano.
+
+Ogni disco ha cinque schede.
 
 **Info**, la prima: tutti i dati del volume e dei dischi su cui sta. Del volume lo spazio occupato e
 libero, il file system con le sue funzioni, l'unità di allocazione, il numero di serie e la partizione che
@@ -40,18 +56,22 @@ guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure
 il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
 - scrittura e lettura sequenziale, con verifica che i dati riletti siano identici a quelli scritti;
-- lettura e scrittura con coda da 1 a 32, in una tabella «velocità per blocco e profondità della
-  coda»: blocchi da 1M e 256K in sequenza e in punti a caso, e da 4K a caso, ciascuno con 1, 2, 4, 8, 16
-  e 32 richieste in volo insieme (la profondità della coda, Q), tutte da un solo thread, come nei
-  programmi di benchmark; mezzo secondo per misura, circa 30 secondi in tutto. Per ogni riga la tabella
-  mostra il valore a Q1 e il migliore fra Q1 e Q32 con la Q a cui è arrivato; passando sopra a un
-  valore si vedono tutte le Q, con la latenza media. Il riquadro «Lettura Q1–32» riporta la lettura in
-  sequenza più veloce. Le prove con una richiesta alla volta su NVMe e RAID restano a metà o meno di
-  quello che il disco fa con più richieste insieme. Le letture girano subito dopo la rilettura
-  sequenziale, sul file appena scritto in ordine (dopo le scritture casuali i blocchi sono sparpagliati
-  dentro l'SSD e le letture rallentano); le scritture per ultime. I dati letti non vengono controllati
-  e quelli scritti non vengono verificati, e ogni misura in scrittura si ferma a 512 MB: sui dischi più
-  veloci la prova scrive al più circa 15 GB. Con blocchi da 4K e code lunghe un solo thread arriva a
+- lettura e scrittura con coda da 1 a 32, in tre gruppi che si scelgono uno per uno: 4K (in punti a
+  caso), 256K e 1M (in sequenza e in punti a caso). Ogni gruppo è una prova a sé, in lettura e in
+  scrittura, con 1, 2, 4, 8, 16 e 32 richieste in volo insieme (la profondità della coda, Q), tutte da
+  un solo thread, come nei programmi di benchmark. La durata di ogni misura si sceglie fra 0,5, 1, 2, 5
+  e 10 secondi (1 s di partenza, ricordata): con tutti i gruppi le misure sono 60, circa un minuto a
+  1 s. La tabella «velocità per blocco e profondità della coda» le raccoglie per gruppo: per ogni riga
+  il valore a Q1 e il migliore fra Q1 e Q32 con la Q a cui è arrivato; passando sopra a un valore si
+  vedono tutte le Q, con la latenza media. Il riquadro «Lettura Q1–32» riporta la lettura in sequenza
+  più veloce. Le prove con una richiesta alla volta su NVMe e RAID restano a metà o meno di quello che
+  il disco fa con più richieste insieme: a Q1 il disco resta fermo fra una richiesta e la successiva,
+  mentre la risposta risale e la nuova richiesta scende. Le letture girano subito dopo la rilettura
+  sequenziale, sul file appena scritto in ordine (dopo le scritture casuali i blocchi sono
+  sparpagliati dentro l'SSD e le letture rallentano); le scritture per ultime. I dati letti non vengono
+  controllati e quelli scritti non vengono verificati; con misure lunghe, sui dischi veloci la prova in
+  scrittura scrive molti GB (circa 6 GB al secondo di misura su un NVMe PCIe 4.0) e mostra anche il calo
+  quando finisce la cache veloce dell'SSD. Con blocchi da 4K e code lunghe un solo thread arriva a
   circa 100.000 operazioni al secondo su un NVMe PCIe 4.0: sui dischi più veloci quel limite può
   essere il programma;
 - lettura e scrittura casuale a blocchi da 4 KiB (operazioni al secondo, latenza media, percentili, massimo);
@@ -201,7 +221,9 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
     --from P     inizio della scansione della superficie, in percentuale (predefinito 0)
     --to P       fine della scansione della superficie, in percentuale (predefinito 100)
     --no-write   salta le prove in scrittura
-    --no-queue   salta la tabella per blocco (1M, 256K, 4K) e profondità della coda (Q1-Q32)
+    --queue LISTA      gruppi della tabella con coda Q1-Q32, per esempio 4K,256K,1M (predefinito: tutti)
+    --queue-secs S     durata di ogni misura della tabella con coda, in secondi (predefinito 1)
+    --no-queue         salta la tabella per blocco e profondità della coda
 ```
 
 `--test` esce con 0 se non ci sono errori, 1 con avvisi, 2 con errori, 3 se interrotto.
@@ -253,7 +275,8 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - SMART da amministratore, dal «Rapporto di diagnosi»: due SATA interni con soglie e registro completo delle autodiagnosi; due dischi a piatti Seagate su USB (0BC2:3322 e 0BC2:61B7, UASP) con SAT a 12 byte, soglie, registro delle autodiagnosi e risposta alla domanda «il disco gira?»; lo stesso bridge JMicron senza un disco riconosciuto, che risponde a ogni comando con un errore dell'hardware e viene riportato come tale;
 - comandi diretti a due chiavette USB (una su UASP, una no), che Windows lascia passare anche senza privilegi: i comandi SAT partono, vengono rifiutati come previsto e le chiavette risultano senza SMART, senza altri tentativi;
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
-- interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C).
+- interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
+- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra.
 
 Non ancora verificato:
 
@@ -279,6 +302,7 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 |---|---|
 | `src/disks.rs` | elenco di volumi e dischi fisici, bridge USB |
 | `src/info.rs` | dati di dettaglio di volumi e dischi (partizioni, settori, collegamenti PCIe, SATA e USB) ed espulsione |
+| `src/topology.rs` | Grafo Storage: catena di ogni disco nell'albero dei dispositivi, fino al processore |
 | `src/tester.rs` | motore delle prove di I/O |
 | `src/errors.rs` | classificazione dei codici d'errore |
 | `src/smart.rs` | SMART e autodiagnosi (NVMe, ATA, pass-through USB) |

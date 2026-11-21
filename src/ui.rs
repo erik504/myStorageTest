@@ -22,7 +22,8 @@ use crate::info;
 use crate::monitor::Monitor;
 use crate::settings::{self, Settings};
 use crate::smart::{self, Health, SelfTestCmd, SmartReport};
-use crate::tester::{self, HIST_BUCKETS, LogLevel, Outcome, Phase, TestConfig, TestRun};
+use crate::tester::{self, HIST_BUCKETS, LogLevel, Outcome, Phase, QueueGroup, TestConfig, TestRun};
+use crate::topology;
 use crate::tray::{self, Tray, TrayEvent};
 use crate::win::{self, human_bytes};
 
@@ -45,8 +46,13 @@ fn phase_color(p: Phase) -> Color32 {
     match p {
         Phase::SeqWrite => Color32::from_rgb(245, 158, 11),
         Phase::SeqRead => Color32::from_rgb(79, 140, 255),
-        Phase::QueueRead => Color32::from_rgb(163, 230, 53),
-        Phase::QueueWrite => Color32::from_rgb(217, 70, 239),
+        // Letture con coda nei verdi chiari, scritture nei fucsia: più scuro il blocco più grande.
+        Phase::QueueRead(QueueGroup::K4) => Color32::from_rgb(217, 249, 157),
+        Phase::QueueRead(QueueGroup::K256) => Color32::from_rgb(163, 230, 53),
+        Phase::QueueRead(QueueGroup::M1) => Color32::from_rgb(101, 163, 13),
+        Phase::QueueWrite(QueueGroup::K4) => Color32::from_rgb(240, 171, 252),
+        Phase::QueueWrite(QueueGroup::K256) => Color32::from_rgb(217, 70, 239),
+        Phase::QueueWrite(QueueGroup::M1) => Color32::from_rgb(162, 28, 175),
         Phase::RandRead => Color32::from_rgb(34, 211, 238),
         Phase::RandWrite => Color32::from_rgb(244, 114, 182),
         Phase::Flush => Color32::from_rgb(167, 139, 250),
@@ -75,6 +81,15 @@ fn int(n: u64) -> String {
 }
 
 /// Durata leggibile a partire dai millisecondi: "85 µs", "1,2 ms", "3,4 s".
+/// Durata in parole: «45 secondi», «12 minuti».
+fn fmt_duration(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{} secondi", secs.round() as u64)
+    } else {
+        format!("{} minuti", (secs / 60.0).round() as u64)
+    }
+}
+
 fn fmt_ms(ms: f64) -> String {
     if ms < 1.0 {
         format!("{} µs", num(ms * 1000.0, 0))
@@ -241,6 +256,237 @@ fn open_in_explorer(letter: char) {
 }
 
 /// Esegue `work` in un thread e ridisegna la finestra quando il risultato è pronto.
+/// Colore di un riquadro del Grafo Storage.
+fn graph_color(kind: topology::Kind) -> Color32 {
+    use topology::Kind;
+    match kind {
+        Kind::Cpu => Color32::from_rgb(79, 140, 255),
+        Kind::Chipset => Color32::from_rgb(245, 158, 11),
+        Kind::SataController => Color32::from_rgb(34, 211, 238),
+        Kind::UsbController => Color32::from_rgb(167, 139, 250),
+        Kind::Hub => Color32::from_rgb(216, 180, 254),
+        Kind::Controller => Color32::from_rgb(163, 177, 198),
+        Kind::Disk => Color32::from_rgb(52, 211, 153),
+        Kind::Virtual | Kind::Volume => Color32::from_rgb(120, 132, 152),
+    }
+}
+
+/// Una riga di testo che non va a capo: se non ci sta, finisce con i puntini.
+fn one_line(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(text.to_string(), egui::TextFormat::simple(font, color));
+    job.wrap = egui::text::TextWrapping {
+        max_width: width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.painter().layout_job(job)
+}
+
+/// Disegna il Grafo Storage: una colonna per livello, da sinistra (processore) a destra, con tutti i
+/// dischi allineati nell'ultima colonna; ogni riquadro sta all'altezza media dei suoi figli. Restituisce
+/// il disco o il volume su cui si è fatto clic.
+fn draw_graph(ui: &mut Ui, g: &topology::Graph, smart: &HashMap<u32, SmartReport>, warn_at: i32) -> Option<Sel> {
+    use topology::Kind;
+    // Misure a grandezza naturale: la scala le adatta alla finestra (vedi sotto). Fra una colonna e
+    // l'altra c'è lo spazio per le etichette dei collegamenti.
+    const GAP_1: f32 = 46.0;
+    const LEAF_W_1: f32 = 300.0;
+    const ROW_1: f32 = 64.0;
+    let box_w_1 = |kind: Kind| match kind {
+        Kind::Hub => 128.0,
+        Kind::Cpu => 150.0,
+        _ => 158.0,
+    };
+    let n = g.nodes.len();
+    if n == 0 {
+        ui.label(dim("Nessun disco trovato."));
+        return None;
+    }
+    let leaf = |i: usize| matches!(g.nodes[i].kind, Kind::Disk | Kind::Volume);
+    // Livello di ogni riquadro e altezza: i dischi in fila, gli altri a metà dei loro figli.
+    let mut depth = vec![0usize; n];
+    let mut y = vec![0.0f32; n];
+    let mut row = 0.0f32;
+    fn place(
+        g: &topology::Graph,
+        i: usize,
+        d: usize,
+        depth: &mut [usize],
+        y: &mut [f32],
+        row: &mut f32,
+    ) {
+        depth[i] = d;
+        let kids = &g.nodes[i].children;
+        if kids.is_empty() {
+            y[i] = *row;
+            *row += 1.0;
+            return;
+        }
+        for &c in kids {
+            place(g, c, d + 1, depth, y, row);
+        }
+        y[i] = (y[kids[0]] + y[kids[kids.len() - 1]]) / 2.0;
+    }
+    for (k, &r) in g.roots.iter().enumerate() {
+        if k > 0 {
+            row += 0.35; // un po' d'aria fra un albero e l'altro
+        }
+        place(g, r, 0, &mut depth, &mut y, &mut row);
+    }
+    // I dischi tutti nell'ultima colonna; ogni colonna larga quanto il suo riquadro più largo.
+    let leaf_col = (0..n).filter(|&i| !leaf(i)).map(|i| depth[i] + 1).max().unwrap_or(0);
+    let mut col_w_1 = vec![0.0f32; leaf_col + 1];
+    for i in (0..n).filter(|&i| !leaf(i)) {
+        col_w_1[depth[i]] = col_w_1[depth[i]].max(box_w_1(g.nodes[i].kind));
+    }
+    col_w_1[leaf_col] = LEAF_W_1;
+    let col_x_1: Vec<f32> = col_w_1
+        .iter()
+        .scan(0.0, |x, w| {
+            let at = *x;
+            *x += w + GAP_1;
+            Some(at)
+        })
+        .collect();
+    // Scala: quella scelta con Ctrl + rotellina, se c'è; altrimenti il grafo si stringe per stare in
+    // larghezza nella finestra e vedersi tutto, ma non sotto il 60 %.
+    let zoom_id = egui::Id::unique("zoom del grafo storage");
+    let natural = col_x_1[leaf_col] + LEAF_W_1 + 12.0;
+    let fit = ((ui.available_width() - 16.0) / natural).clamp(0.6, 1.0);
+    let s = ui.ctx().data(|d| d.get_temp::<f32>(zoom_id)).unwrap_or(fit);
+    let row_h = ROW_1 * s;
+    let lines_of = |i: usize| g.nodes[i].lines.len().min(3) as f32;
+    let height = |i: usize| (24.0 + 14.5 * lines_of(i)) * s;
+    let col = |i: usize| if leaf(i) { leaf_col } else { depth[i] };
+    let width = |i: usize| if leaf(i) { LEAF_W_1 * s } else { box_w_1(g.nodes[i].kind) * s };
+    let x_of = |i: usize| col_x_1[col(i)] * s;
+    let font = |size: f32| FontId::proportional(size * s);
+
+    let total = vec2(natural * s, row * row_h + 8.0);
+    let mut picked = None;
+    egui::ScrollArea::both()
+        .id_salt("grafo-storage")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (area, area_resp) = ui.allocate_exact_size(total, Sense::hover());
+            // Ctrl + rotellina: ingrandisce o rimpicciolisce il grafo, fra il 50 e il 150 %.
+            if area_resp.contains_pointer() {
+                let zoom = ui.input(|i| i.zoom_delta());
+                if zoom != 1.0 {
+                    let next = (s * zoom).clamp(0.5, 1.5);
+                    ui.ctx().data_mut(|d| d.insert_temp(zoom_id, next));
+                    ui.ctx().request_repaint();
+                }
+            }
+            let origin = area.min + vec2(4.0, 4.0);
+            let rects: Vec<egui::Rect> = (0..n)
+                .map(|i| {
+                    let h = height(i);
+                    let top = origin.y + y[i] * row_h + (row_h - h) / 2.0;
+                    egui::Rect::from_min_size(egui::pos2(origin.x + x_of(i), top), vec2(width(i), h))
+                })
+                .collect();
+            let painter = ui.painter().clone();
+            // Collegamenti, sotto i riquadri; le loro etichette si disegnano alla fine, sopra tutto.
+            let mut labels = Vec::new();
+            for i in 0..n {
+                for &c in &g.nodes[i].children {
+                    let (a, b) = (rects[i].right_center(), rects[c].left_center());
+                    let dx = ((b.x - a.x) / 2.0).max(20.0);
+                    let warn = g.nodes[c].warn;
+                    let color = if warn { WARN } else { Color32::from_rgb(92, 102, 122) };
+                    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                        [a, a + vec2(dx, 0.0), b - vec2(dx.min(60.0), 0.0), b],
+                        false,
+                        Color32::TRANSPARENT,
+                        Stroke::new(if warn { 2.0 } else { 1.4 }, color),
+                    ));
+                    if !g.nodes[c].edge.is_empty() {
+                        labels.push((c, b, warn));
+                    }
+                }
+            }
+            // Riquadri.
+            for i in 0..n {
+                let node = &g.nodes[i];
+                let r = rects[i];
+                let color = graph_color(node.kind);
+                let stroke = if node.warn { WARN } else { color };
+                painter.rect(r, CornerRadius::same(8), CARD, Stroke::new(1.4, stroke), egui::StrokeKind::Inside);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(r.min + vec2(0.0, 6.0 * s), vec2(4.0 * s, r.height() - 12.0 * s)),
+                    CornerRadius::same(2),
+                    color,
+                );
+                let pad = 10.0 * s;
+                let inner = r.width() - 2.0 * pad;
+                // Per i dischi, a destra del titolo: temperatura e salute dallo SMART.
+                let mut right = 0.0;
+                if let Some(rep) = node.disk.and_then(|d| smart.get(&d)) {
+                    let dot = r.right_top() + vec2(-pad, 12.0 * s);
+                    painter.circle_filled(dot, 4.0 * s, health_color(rep.health));
+                    right += 12.0 * s;
+                    if let Some(t) = rep.temperature {
+                        let c = if t as i32 >= warn_at { WARN } else { DIM };
+                        let text = one_line(ui, &format!("{t} °C"), font(11.0), c, 60.0 * s);
+                        right += text.size().x + 6.0 * s;
+                        painter.galley(r.right_top() + vec2(-pad - 12.0 * s - text.size().x, 5.0 * s), text, c);
+                    }
+                }
+                let title = one_line(
+                    ui,
+                    &node.title,
+                    FontId::new(12.5 * s, FontFamily::Name("semibold".into())),
+                    TEXT,
+                    inner - right,
+                );
+                painter.galley(r.min + vec2(pad, 4.0 * s), title, TEXT);
+                for (k, line) in node.lines.iter().take(3).enumerate() {
+                    let text = one_line(ui, line, font(11.0), DIM, inner);
+                    painter.galley(r.min + vec2(pad, (22.0 + 14.5 * k as f32) * s), text, DIM);
+                }
+                let resp = ui.interact(r, ui.scope_id().with(("nodo-grafo", i)), Sense::click());
+                let clickable = node.disk.is_some() || node.letter.is_some();
+                if resp.hovered() && clickable {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let tip = if clickable { format!("{}\n\nUn clic apre il disco.", node.tip) } else { node.tip.clone() };
+                let resp = resp.on_hover_text(tip);
+                if resp.clicked() && clickable {
+                    picked = match (node.letter, node.disk) {
+                        (Some(l), _) => Some(Sel::Volume(l)),
+                        (None, Some(d)) => Some(Sel::Disk(d)),
+                        _ => None,
+                    };
+                }
+            }
+            // Etichette dei collegamenti: appena a sinistra di chi le riceve, sopra la linea, con uno
+            // sfondo che le stacca da linee e riquadri che passano lì sotto.
+            for (c, b, warn) in labels {
+                let color = if warn { WARN } else { DIM };
+                let text = one_line(ui, &g.nodes[c].edge, font(11.0), color, 170.0 * s);
+                let at = b + vec2(-6.0 * s - text.size().x, -text.size().y - 2.0 * s);
+                let back = egui::Rect::from_min_size(at, text.size()).expand2(vec2(3.0 * s, 1.0));
+                painter.rect_filled(back, CornerRadius::same(3), BG);
+                painter.galley(at, text, color);
+            }
+        });
+    picked
+}
+
+/// Firma dei dischi e dei volumi senza disco: se cambia, il Grafo Storage va ricostruito.
+fn graph_signature(inv: &Inventory) -> String {
+    let mut key = String::new();
+    for d in &inv.disks {
+        key.push_str(&format!("{}|{}|{}|{:?};", d.number, d.instance_id, d.usb_node, d.letters));
+    }
+    for v in inv.volumes.iter().filter(|v| v.disks.is_empty()) {
+        key.push_str(&format!("{}:{};", v.letter, v.label));
+    }
+    key
+}
+
 fn background<T: Send + 'static>(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
     let (tx, rx) = channel();
     let ctx = ctx.clone();
@@ -262,6 +508,7 @@ enum Tab {
 
 /// Nome sulla riga di comando della pagina del monitoraggio, che non appartiene a un disco.
 const MONITOR_KEY: &str = "monitoraggio";
+const GRAPH_KEY: &str = "grafo";
 
 impl Tab {
     /// Nome usato sulla riga di comando per riaprire la stessa scheda dopo un riavvio.
@@ -351,6 +598,8 @@ struct Startup {
     tab: Option<Tab>,
     /// `--tab monitoraggio`: apre la pagina del monitoraggio.
     monitor_view: bool,
+    /// `--tab grafo`: apre il Grafo Storage.
+    graph_view: bool,
 }
 
 impl Startup {
@@ -365,6 +614,7 @@ impl Startup {
                 .or_else(|| value("--disk").and_then(|s| s.parse().ok()).map(Sel::Disk)),
             tab: value("--tab").and_then(|s| Tab::from_key(s)),
             monitor_view: value("--tab").is_some_and(|s| s == MONITOR_KEY),
+            graph_view: value("--tab").is_some_and(|s| s == GRAPH_KEY),
         }
     }
 }
@@ -372,7 +622,8 @@ impl Startup {
 struct TestOptions {
     file_tests: bool,
     seq_read: bool,
-    queue: bool,
+    /// Gruppi della tabella con coda (indice: `QueueGroup`).
+    queue: [bool; 3],
     rand_read: bool,
     rand_write: bool,
     flush: bool,
@@ -433,6 +684,15 @@ pub struct App {
     runs: HashMap<char, TestRun>,
     /// Vero quando l'area principale mostra il monitoraggio invece di un disco.
     monitor_view: bool,
+    /// Vero quando l'area principale mostra il Grafo Storage.
+    graph_view: bool,
+    /// Grafo dei collegamenti dei dischi, con l'ora in cui è stato costruito; in costruzione.
+    graph: Option<(String, topology::Graph)>,
+    graph_rx: Option<Receiver<topology::Graph>>,
+    /// Firma dei dischi da cui è stato costruito il grafo: se cambia, si ricostruisce.
+    graph_key: String,
+    /// «Aggiorna» chiede di ricostruire il grafo alla prossima lettura dei dischi.
+    graph_dirty: bool,
     smart: HashMap<u32, SmartReport>,
     smart_rx: Option<Receiver<SmartBatch>>,
     /// Dischi trovati fermi all'ultima lettura periodica e lasciati stare: da che ora.
@@ -574,6 +834,14 @@ impl App {
                 .tab
                 .unwrap_or(if script.as_ref().is_some_and(|s| s.autotest) { Tab::Test } else { Tab::Info }),
             monitor_view: startup.monitor_view,
+            // Il Grafo Storage è la prima pagina, se la riga di comando o una verifica automatica
+            // non chiedono un disco o una scheda.
+            graph_view: startup.graph_view
+                || (!scripted && !startup.monitor_view && startup.tab.is_none() && startup.selected.is_none()),
+            graph: None,
+            graph_rx: None,
+            graph_key: String::new(),
+            graph_dirty: true,
             temps: HashMap::new(),
             session_start: Instant::now(),
             session_start_ft: win::now_filetime(),
@@ -593,7 +861,7 @@ impl App {
             opt: TestOptions {
                 file_tests: true,
                 seq_read: true,
-                queue: true,
+                queue: [true; 3],
                 rand_read: true,
                 rand_write: true,
                 flush: true,
@@ -999,6 +1267,7 @@ impl App {
             file_size: (self.settings.test_size_mb << 20).min(max),
             seq_read: self.opt.seq_read,
             queue: self.opt.queue,
+            queue_secs: self.settings.queue_step_ms.max(100) as f64 / 1000.0,
             rand_read: self.opt.rand_read,
             rand_write: self.opt.rand_write,
             flush: self.opt.flush,
@@ -1047,7 +1316,13 @@ impl App {
 
     fn restart_elevated(&mut self, ctx: &egui::Context) {
         // La nuova istanza riapre lo stesso disco e la stessa scheda.
-        let tab = if self.monitor_view { MONITOR_KEY } else { self.tab.key() };
+        let tab = if self.monitor_view {
+            MONITOR_KEY
+        } else if self.graph_view {
+            GRAPH_KEY
+        } else {
+            self.tab.key()
+        };
         let mut params = format!("--tab {tab}");
         match self.selected {
             Some(Sel::Volume(l)) => params.push_str(&format!(" --vol {l}")),
@@ -1066,19 +1341,22 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(bold("myStorageTest", 20.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Aggiorna").clicked() {
-                    self.last_scan = Instant::now() - Duration::from_secs(60);
-                    // Anche i dati di dettaglio della scheda Info si rileggono.
-                    self.info = None;
-                }
-            });
+            if ui
+                .button("Aggiorna")
+                .on_hover_text("Rilegge dischi e volumi, i dati della scheda Info e il Grafo Storage")
+                .clicked()
+            {
+                self.last_scan = Instant::now() - Duration::from_secs(60);
+                // Anche i dati di dettaglio della scheda Info e il grafo si rileggono.
+                self.info = None;
+                self.graph_dirty = true;
+            }
         });
-        ui.label(dim("Test, diagnosi e monitoraggio dei dischi"));
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
         self.sidebar_monitor(ui);
+        ui.add_space(2.0);
+        self.sidebar_graph(ui);
         ui.add_space(2.0);
 
         let warn_at = self.settings.temp_warn_c;
@@ -1091,7 +1369,8 @@ impl App {
             .show(ui, |ui| {
                 ui.label(dim("VOLUMI"));
                 for v in &self.inventory.volumes {
-                    let selected = !self.monitor_view && self.selected == Some(Sel::Volume(v.letter));
+                    let selected =
+                        !self.monitor_view && !self.graph_view && self.selected == Some(Sel::Volume(v.letter));
                     let disk = v.disks.first().and_then(|n| self.inventory.disk(*n));
                     let reports = || v.disks.iter().filter_map(|n| self.smart.get(n));
                     let health = reports().map(|r| r.health).max();
@@ -1154,7 +1433,8 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(dim("DISCHI SENZA LETTERA"));
                     for d in others {
-                        let selected = !self.monitor_view && self.selected == Some(Sel::Disk(d.number));
+                        let selected =
+                            !self.monitor_view && !self.graph_view && self.selected == Some(Sel::Disk(d.number));
                         let report = self.smart.get(&d.number);
                         let frame = Frame::new()
                             .fill(if selected { CARD_HI } else { CARD })
@@ -1191,6 +1471,7 @@ impl App {
         if let Some(p) = pick {
             self.selected = Some(p);
             self.monitor_view = false;
+            self.graph_view = false;
             self.eject_note = None;
         }
 
@@ -1276,6 +1557,7 @@ impl App {
         }
         if resp.clicked() {
             self.monitor_view = true;
+            self.graph_view = false;
         }
         if enabled != self.settings.monitor_enabled {
             self.settings.monitor_enabled = enabled;
@@ -1287,11 +1569,98 @@ impl App {
         }
     }
 
+    /// Voce «Grafo Storage» sotto il monitoraggio: apre la pagina con i collegamenti dei dischi.
+    fn sidebar_graph(&mut self, ui: &mut Ui) {
+        let selected = self.graph_view;
+        let frame = Frame::new()
+            .fill(if selected { CARD_HI } else { CARD })
+            .stroke(Stroke::new(1.0, if selected { ACCENT } else { Color32::TRANSPARENT }))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(10, 8));
+        let resp = frame
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(bold("Grafo Storage", 15.0));
+                ui.label(dim(if self.graph_rx.is_some() {
+                    "Lettura dei collegamenti…"
+                } else {
+                    "Come sono collegati i dischi"
+                }));
+            })
+            .response;
+        let resp = ui.interact(resp.rect, ui.scope_id().with("grafo"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            self.graph_view = true;
+            self.monitor_view = false;
+        }
+    }
+
     // -----------------------------------------------------------------------------------------
     // Area principale
     // -----------------------------------------------------------------------------------------
 
+    /// Pagina «Grafo Storage»: come sono collegati i dischi, dal processore fino a loro.
+    fn page_graph(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(bold("Grafo Storage", 26.0));
+            if self.graph_rx.is_some() {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label(dim("lettura dei collegamenti…"));
+            } else if let Some((at, _)) = &self.graph {
+                ui.add_space(8.0);
+                ui.label(dim(format!("letto il {at}")));
+            }
+        });
+        ui.label(dim(
+            "Come sono collegati i dischi: dal processore e dal chipset, attraverso le porte PCIe, i controller \
+             SATA e USB e gli hub, fino ai dischi. Sui collegamenti le porte e le velocità; in giallo quelli più \
+             lenti di quanto il disco potrebbe. Passa sopra a un riquadro per i dettagli; un clic su un disco \
+             lo apre. Ctrl + rotellina ingrandisce o rimpicciolisce; «Aggiorna» rilegge tutto.",
+        ));
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (kind, name) in [
+                (topology::Kind::Cpu, "processore"),
+                (topology::Kind::Chipset, "chipset"),
+                (topology::Kind::SataController, "controller SATA"),
+                (topology::Kind::UsbController, "controller USB"),
+                (topology::Kind::Hub, "hub USB"),
+                (topology::Kind::Disk, "disco"),
+                (topology::Kind::Virtual, "virtuale"),
+            ] {
+                ui.label(RichText::new("●").color(graph_color(kind)).size(11.0));
+                ui.label(RichText::new(format!("{name}   ")).color(DIM).size(12.5));
+            }
+        });
+        ui.add_space(4.0);
+        let Some((_, graph)) = &self.graph else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(dim("Lettura dei collegamenti dei dischi…"));
+            });
+            return;
+        };
+        if let Some(sel) = draw_graph(ui, graph, &self.smart, self.settings.temp_warn_c) {
+            self.selected = Some(sel);
+            self.graph_view = false;
+            self.monitor_view = false;
+            self.tab = Tab::Info;
+            self.scroll_to_selected = true;
+            self.eject_note = None;
+        }
+    }
+
     fn main(&mut self, ui: &mut Ui) {
+        if self.graph_view {
+            self.page_graph(ui);
+            return;
+        }
         if self.monitor_view {
             ui.label(bold("Monitoraggio", 26.0));
             ui.label(dim(
@@ -1665,15 +2034,56 @@ impl App {
                                 ui.checkbox(&mut self.opt.rand_read, "Lettura casuale 4K");
                                 ui.checkbox(&mut self.opt.rand_write, "Scrittura casuale 4K");
                                 ui.checkbox(&mut self.opt.flush, "Flush su disco");
-                                ui.checkbox(&mut self.opt.queue, "Lettura e scrittura con coda 1–32")
+                            });
+                            // Gruppi della tabella con coda: ognuno è una prova a sé e si sceglie da solo.
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(22.0);
+                                ui.label(dim("Lettura e scrittura con coda Q1–32:")).on_hover_text(
+                                    "Lettura e scrittura con da 1 a 32 richieste in volo insieme (profondità della \
+                                     coda, Q1–Q32, da un solo thread), come nei programmi di benchmark. Le prove qui \
+                                     sopra fanno una richiesta alla volta e su NVMe e RAID restano molto sotto quello \
+                                     che il disco fa con più richieste insieme. I dati scritti qui non vengono \
+                                     verificati.",
+                                );
+                                let step_ms = self.settings.queue_step_ms;
+                                for g in QueueGroup::ALL {
+                                    let rows = tester::QUEUE_ROWS.iter().filter(|r| r.group == g).count();
+                                    // Righe × profondità × lettura e scrittura.
+                                    let secs = (rows * tester::QUEUE_DEPTHS.len() * 2) as f64 * step_ms as f64 / 1000.0;
+                                    ui.checkbox(&mut self.opt.queue[g.index()], g.name()).on_hover_text(format!(
+                                        "{}: {}, in lettura e in scrittura, da Q1 a Q32. Circa {}.",
+                                        g.name(),
+                                        g.content(),
+                                        fmt_duration(secs)
+                                    ));
+                                }
+                                ui.label(dim("ogni misura"));
+                                let label = |ms: u32| {
+                                    if ms < 1000 { format!("{} s", num(ms as f64 / 1000.0, 1)) } else { format!("{} s", ms / 1000) }
+                                };
+                                egui::ComboBox::from_id_salt("durata-coda")
+                                    .width(60.0)
+                                    .selected_text(label(step_ms))
+                                    .show_ui(ui, |ui| {
+                                        for ms in tester::QUEUE_STEP_CHOICES_MS {
+                                            ui.selectable_value(&mut self.settings.queue_step_ms, ms, label(ms));
+                                        }
+                                    })
+                                    .response
                                     .on_hover_text(
-                                        "Lettura e scrittura a blocchi da 1M e 256K, in sequenza e in punti a caso, e \
-                                         da 4K a caso, con da 1 a 32 richieste in volo insieme (profondità della coda, \
-                                         Q1–Q32, da un solo thread), come nei programmi di benchmark. Le prove qui \
-                                         accanto fanno una richiesta alla volta: su NVMe e RAID restano molto sotto \
-                                         quello che il disco fa con più richieste insieme. Mezzo secondo per misura, \
-                                         circa 35 secondi in tutto. I dati scritti qui non vengono verificati.",
+                                        "Quanto dura ogni misura: ogni gruppo prova sei profondità della coda, in \
+                                         lettura e in scrittura. Le misure lunghe fanno pesare meno la cache del \
+                                         disco e le pause di un istante; sui dischi veloci, in scrittura, \
+                                         scrivono di più.",
                                     );
+                                let groups = QueueGroup::ALL.iter().filter(|g| self.opt.queue[g.index()]);
+                                let rows: usize = groups
+                                    .map(|g| tester::QUEUE_ROWS.iter().filter(|r| r.group == *g).count())
+                                    .sum();
+                                if rows > 0 {
+                                    let secs = (rows * tester::QUEUE_DEPTHS.len() * 2) as f64 * step_ms as f64 / 1000.0;
+                                    ui.label(dim(format!("circa {} in tutto", fmt_duration(secs))));
+                                }
                             });
                         });
                         ui.horizontal_wrapped(|ui| {
@@ -1866,24 +2276,34 @@ impl App {
                 };
                 tiles.push(TileData::new(p.short(), value, "MB/s", sub, phase_color(p)));
             }
-            // Lettura con coda: la misura in sequenza più veloce della tabella; tutte le altre sono
-            // nella tabella sotto i riquadri.
-            let p = Phase::QueueRead;
-            let (value, sub, note) = match (r(p), last_speed(p)) {
-                (Some(res), _) if res.peak.is_some() => {
+            // Lettura con coda: la misura in sequenza più veloce fra i gruppi 256K e 1M; tutte le altre
+            // sono nella tabella sotto i riquadri.
+            let seq_groups = [Phase::QueueRead(QueueGroup::M1), Phase::QueueRead(QueueGroup::K256)];
+            let best = seq_groups
+                .iter()
+                .filter_map(|&p| r(p).filter(|res| res.peak.is_some()).map(|res| (p, res)))
+                .max_by(|a, b| a.1.mbps.total_cmp(&b.1.mbps));
+            let running = seq_groups.iter().find(|&&p| live(p)).copied();
+            let (value, sub, note, color) = match (best, running) {
+                (Some((p, res)), _) => {
                     let (depth, block) = res.peak.unwrap_or_default();
                     (
                         num(res.mbps, 0),
                         // Corto, per stare nel riquadro: il fumetto lo dice per esteso.
                         format!("seq. {} · Q{depth}", tester::block_name(block as usize)),
-                        res.note.clone(),
+                        format!("{}: {}", p.short(), res.note),
+                        phase_color(p),
                     )
                 }
-                (Some(res), _) if res.errors > 0 => ("—".into(), format!("{} errori", res.errors), String::new()),
-                (None, Some(v)) if live(p) => (num(v, 0), "in corso…".into(), String::new()),
-                _ => ("—".into(), String::new(), String::new()),
+                (None, Some(p)) => (
+                    last_speed(p).map(|v| num(v, 0)).unwrap_or_else(|| "—".into()),
+                    "in corso…".into(),
+                    String::new(),
+                    phase_color(p),
+                ),
+                _ => ("—".into(), String::new(), String::new(), phase_color(seq_groups[1])),
             };
-            let mut peak = TileData::new(p.short(), value, "MB/s", sub, phase_color(p));
+            let mut peak = TileData::new("Lettura Q1–32", value, "MB/s", sub, color);
             peak.peak_note = Some(note);
             tiles.push(peak);
             for p in [Phase::RandRead, Phase::RandWrite] {
@@ -3063,51 +3483,70 @@ impl App {
                 wait(self.script.as_mut().unwrap(), 400);
             }
             24 if autotest => shot(script, "2f-ritorno.png"),
-            // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
+            // Grafo Storage: attende che sia costruito, poi la schermata.
             25 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.graph_view = true;
+                wait(self.script.as_mut().unwrap(), 800);
+            }
+            26 => {
+                if self.graph.is_none() || self.graph_rx.is_some() {
+                    let script = self.script.as_mut().unwrap();
+                    script.step = 26;
+                    wait(script, 200);
+                } else {
+                    shot(script, "2i-grafo-storage.png");
+                }
+            }
+            27 => {
+                self.graph_view = false;
+                wait(self.script.as_mut().unwrap(), 300);
+            }
+            // Scheda Info: in alto i dati, in fondo il rapporto di diagnosi.
+            28 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.tab = Tab::Info;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            26 => {
+            29 => {
                 // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
                 if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 26;
+                    script.step = 29;
                     wait(script, 200);
                 } else {
                     shot(script, "2g-info.png");
                 }
             }
-            27 => {
+            30 => {
                 self.scroll_to_diag = true;
                 wait(self.script.as_mut().unwrap(), 500);
             }
-            28 => shot(script, "2h-info-diagnosi.png"),
-            29 => {
+            31 => shot(script, "2h-info-diagnosi.png"),
+            32 => {
                 self.tab = Tab::Smart;
                 wait(self.script.as_mut().unwrap(), 1500);
             }
-            30 => shot(script, "3-smart.png"),
-            31 => {
+            33 => shot(script, "3-smart.png"),
+            34 => {
                 self.tab = Tab::Events;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            32 => {
+            35 => {
                 // Attende che il registro eventi sia stato letto.
                 if self.events_rx.is_some() || self.events_loaded.is_none() {
                     let script = self.script.as_mut().unwrap();
-                    script.step = 32;
+                    script.step = 35;
                     wait(script, 200);
                 } else {
                     shot(script, "4-eventi.png");
                 }
             }
-            33 => {
+            36 => {
                 self.tab = Tab::Temp;
                 wait(self.script.as_mut().unwrap(), 800);
             }
-            34 => {
+            37 => {
                 // Un disco senza temperatura non ha il grafico su cui portare il puntatore.
                 let rect = self.chart_rects[4];
                 if rect.is_positive() {
@@ -3115,8 +3554,8 @@ impl App {
                 }
                 wait(self.script.as_mut().unwrap(), 400);
             }
-            35 => shot(script, "5-temperatura.png"),
-            36 => {
+            38 => shot(script, "5-temperatura.png"),
+            39 => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 self.settings.monitor_enabled = true;
                 // Una verifica automatica non deve mandare notifiche vere sul desktop, salvo quando
@@ -3126,10 +3565,11 @@ impl App {
                 }
                 self.start_monitor(ctx);
                 self.monitor_view = true;
+                self.graph_view = false;
                 wait(self.script.as_mut().unwrap(), 5000);
             }
-            37 => shot(script, "6-monitoraggio.png"),
-            38 => {
+            40 => shot(script, "6-monitoraggio.png"),
+            41 => {
                 self.settings = self.saved.clone();
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -3166,12 +3606,17 @@ fn fake_surface(sh: &mut tester::Shared) {
     sh.surface_bad = vec![(0.751 * len) as u64, (0.757 * len) as u64];
 }
 
-/// Tabella delle prove con coda: per ogni riga (dimensione del blocco, in sequenza o a caso) la
-/// misura con una richiesta alla volta (Q1) e la migliore fra Q1 e Q32, in lettura e in scrittura.
-/// Passando sopra a un valore si vedono tutte le profondità. Restituisce il rettangolo della
-/// casella «Lettura migliore» della prima riga, per le verifiche automatiche.
+/// Tabella delle prove con coda, raggruppata per dimensione del blocco (4K, 256K, 1M): per ogni
+/// riga (in sequenza o a caso) la misura con una richiesta alla volta (Q1) e la migliore fra Q1 e
+/// Q32, in lettura e in scrittura. Ci sono solo i gruppi provati. Passando sopra a un valore si
+/// vedono tutte le profondità. Restituisce il rettangolo della prima casella «Lettura migliore»,
+/// per le verifiche automatiche.
 fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
     let mut target = egui::Rect::NOTHING;
+    let shown = |g: QueueGroup| {
+        let rows = |r: usize| tester::QUEUE_ROWS[r].group == g;
+        sh.queue.iter().any(|c| rows(c.row)) || sh.queue_live.is_some_and(|(r, _)| rows(r))
+    };
     card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 3.0;
@@ -3183,10 +3628,11 @@ fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
             ));
         });
         egui::Grid::new("tabella-coda")
-            .num_columns(5)
-            .spacing([26.0, 2.0])
-            .min_col_width(96.0)
+            .num_columns(6)
+            .spacing([22.0, 2.0])
+            .min_col_width(40.0)
             .show(ui, |ui| {
+                ui.label("");
                 ui.label("");
                 for (write, title) in [
                     (false, "Lettura Q1"),
@@ -3194,15 +3640,31 @@ fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
                     (true, "Scrittura Q1"),
                     (true, "Scrittura migliore"),
                 ] {
-                    let phase = if write { Phase::QueueWrite } else { Phase::QueueRead };
+                    let phase = if write {
+                        Phase::QueueWrite(QueueGroup::K256)
+                    } else {
+                        Phase::QueueRead(QueueGroup::K256)
+                    };
                     ui.horizontal(|ui| {
+                        ui.set_min_width(110.0);
                         ui.label(RichText::new("●").color(phase_color(phase)).size(10.0));
                         ui.label(dim(title));
                     });
                 }
                 ui.end_row();
+                let mut last_group = None;
                 for (r, row) in tester::QUEUE_ROWS.iter().enumerate() {
-                    ui.label(row.name);
+                    if !shown(row.group) {
+                        continue;
+                    }
+                    // Il nome del gruppo solo sulla sua prima riga: le righe si leggono raggruppate.
+                    if last_group != Some(row.group) {
+                        ui.label(bold(row.group.name(), 14.0));
+                        last_group = Some(row.group);
+                    } else {
+                        ui.label("");
+                    }
+                    ui.label(row.pattern);
                     for write in [false, true] {
                         let cells: Vec<&tester::QueueCell> =
                             sh.queue.iter().filter(|c| c.row == r && c.write == write).collect();
@@ -3218,7 +3680,7 @@ fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
                             })
                             .unwrap_or_else(|| pending.into()),
                         );
-                        if r == 0 && !write {
+                        if target == egui::Rect::NOTHING && !write {
                             target = second.rect;
                         }
                         if !cells.is_empty() {
@@ -3238,7 +3700,7 @@ fn queue_table(ui: &mut Ui, sh: &tester::Shared) -> egui::Rect {
 fn queue_tip(ui: &mut Ui, row: &tester::QueueRow, write: bool, cells: &[&tester::QueueCell]) {
     ui.set_max_width(400.0);
     ui.label(bold(
-        format!("{} — {}", row.name, if write { "scrittura" } else { "lettura" }),
+        format!("{} — {}", row.title(), if write { "scrittura" } else { "lettura" }),
         14.0,
     ));
     for c in cells {
@@ -3495,14 +3957,31 @@ fn phase_meaning(p: Phase) -> &'static str {
         Phase::SeqRead => {
             "La prova rilegge il file di prova dall'inizio alla fine e controlla che i dati siano quelli scritti."
         }
-        Phase::QueueRead => {
-            "La prova legge il file di prova a blocchi da 1M e 256K, in sequenza e in punti a caso, e da 4K a caso, \
-             con da 1 a 32 richieste in volo insieme (profondità della coda): mezzo secondo per ogni combinazione."
+        Phase::QueueRead(QueueGroup::K4) => {
+            "La prova legge blocchi da 4K in punti a caso del file di prova, con da 1 a 32 richieste in volo insieme \
+             (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità."
         }
-        Phase::QueueWrite => {
-            "La prova scrive sul file di prova a blocchi da 1M e 256K, in sequenza e in punti a caso, e da 4K a caso, \
-             con da 1 a 32 richieste in volo insieme (profondità della coda): mezzo secondo per ogni combinazione. \
-             I dati scritti qui non vengono verificati."
+        Phase::QueueRead(QueueGroup::K256) => {
+            "La prova legge il file di prova a blocchi da 256K, prima in sequenza e poi in punti a caso, con da 1 a 32 \
+             richieste in volo insieme (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità."
+        }
+        Phase::QueueRead(QueueGroup::M1) => {
+            "La prova legge il file di prova a blocchi da 1M, prima in sequenza e poi in punti a caso, con da 1 a 32 \
+             richieste in volo insieme (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità."
+        }
+        Phase::QueueWrite(QueueGroup::K4) => {
+            "La prova scrive blocchi da 4K in punti a caso del file di prova, con da 1 a 32 richieste in volo insieme \
+             (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità. I dati scritti qui non vengono verificati."
+        }
+        Phase::QueueWrite(QueueGroup::K256) => {
+            "La prova scrive sul file di prova a blocchi da 256K, prima in sequenza e poi in punti a caso, con da 1 a \
+             32 richieste in volo insieme (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità. I dati scritti qui \
+             non vengono verificati."
+        }
+        Phase::QueueWrite(QueueGroup::M1) => {
+            "La prova scrive sul file di prova a blocchi da 1M, prima in sequenza e poi in punti a caso, con da 1 a 32 \
+             richieste in volo insieme (profondità della coda), per il tempo scelto nelle opzioni a ogni profondità. I dati scritti qui \
+             non vengono verificati."
         }
         Phase::RandRead => "La prova legge blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
         Phase::RandWrite => "La prova scrive blocchi da 4 KB in punti a caso del file di prova, uno alla volta.",
@@ -4221,7 +4700,14 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool) -> egui::Rect {
             tip_head(ui, phase, q[0]);
             let speed = if q[1] >= 100.0 { int(q[1].round() as u64) } else { num(q[1], 1) };
             tip_value(ui, format!("{speed} MB/s"));
-            if matches!(phase, Phase::RandRead | Phase::RandWrite | Phase::Verify) {
+            if matches!(
+                phase,
+                Phase::RandRead
+                    | Phase::RandWrite
+                    | Phase::Verify
+                    | Phase::QueueRead(QueueGroup::K4)
+                    | Phase::QueueWrite(QueueGroup::K4)
+            ) {
                 let iops = (q[1] * 1e6 / tester::BLOCK as f64).round() as u64;
                 ui.label(RichText::new(format!("circa {} operazioni al secondo", int(iops))).color(TEXT).size(13.0));
             }
@@ -4564,6 +5050,7 @@ impl eframe::App for App {
                         .is_some_and(|m| m.shared.lock().unwrap().unread > 0)
                     {
                         self.monitor_view = true;
+                        self.graph_view = false;
                     }
                 }
                 TrayEvent::Quit => {
@@ -4636,6 +5123,24 @@ impl eframe::App for App {
             if let Ok(loaded) = rx.try_recv() {
                 self.info_rx = None;
                 self.info = Some(loaded);
+            }
+        }
+        // Grafo Storage: si ricostruisce quando cambiano i dischi o dopo «Aggiorna», sempre con
+        // l'elenco dei dischi appena riletto (non mentre una nuova lettura sta per partire).
+        if let Some(rx) = &self.graph_rx {
+            if let Ok(g) = rx.try_recv() {
+                self.graph_rx = None;
+                self.graph = Some((win::now_string(), g));
+            }
+        }
+        let scan_due = self.last_scan.elapsed() > Duration::from_secs(4) && !self.testing();
+        if self.graph_rx.is_none() && self.inventory_rx.is_none() && !scan_due {
+            let key = graph_signature(&self.inventory);
+            if self.graph_dirty || key != self.graph_key {
+                self.graph_dirty = false;
+                self.graph_key = key;
+                let inv = self.inventory.clone();
+                self.graph_rx = Some(background(ctx, move || topology::build(&inv)));
             }
         }
         if let Some(rx) = &self.eject_rx {

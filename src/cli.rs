@@ -5,7 +5,7 @@ use std::time::Duration;
 use windows_sys::Win32::System::Console::AttachConsole;
 
 use crate::disks::{self, bus_name};
-use crate::tester::{LogLevel, Outcome, Phase, QUEUE_DEPTHS, QUEUE_ROWS, TestConfig, TestRun};
+use crate::tester::{LogLevel, Outcome, Phase, QUEUE_DEPTHS, QUEUE_ROWS, QueueGroup, TestConfig, TestRun};
 use crate::win::human_bytes;
 use crate::{eventlog, info, smart};
 
@@ -38,7 +38,9 @@ Opzioni di --test:
   --from P       inizio della scansione della superficie, in percentuale (predefinito 0)
   --to P         fine della scansione della superficie, in percentuale (predefinito 100)
   --no-write     salta le prove in scrittura
-  --no-queue     salta la tabella per blocco (1M, 256K, 4K) e profondità della coda (Q1-Q32)
+  --queue LISTA  gruppi della tabella con coda Q1-Q32 da provare, per esempio 4K,256K,1M (predefinito: tutti)
+  --queue-secs S durata di ogni misura della tabella con coda, in secondi (predefinito 1)
+  --no-queue     salta la tabella per blocco e profondità della coda
 
 Codice di uscita di --test: 0 nessun errore, 1 avvisi, 2 errori, 3 interrotto.
 ";
@@ -279,6 +281,24 @@ fn events(hours: u64) -> i32 {
     0
 }
 
+/// Gruppi della tabella con coda da provare: tutti, nessuno con `--no-queue` (o `--no-peak`, il nome
+/// della 0.1.8), oppure quelli elencati dopo `--queue`, per esempio `--queue 4K,1M`.
+fn queue_groups(args: &[String]) -> [bool; 3] {
+    if args.iter().any(|a| a == "--no-queue" || a == "--no-peak") {
+        return [false; 3];
+    }
+    match args.iter().position(|a| a == "--queue").and_then(|i| args.get(i + 1)) {
+        Some(list) => {
+            let mut chosen = [false; 3];
+            for g in list.split(',').filter_map(QueueGroup::parse) {
+                chosen[g.index()] = true;
+            }
+            chosen
+        }
+        None => [true; 3],
+    }
+}
+
 fn test(args: &[String]) -> i32 {
     let Some(letter) = args
         .first()
@@ -320,8 +340,14 @@ fn test(args: &[String]) -> i32 {
         file_tests: !flag("--no-write"),
         file_size: size,
         seq_read: true,
-        // `--no-peak` è il nome della 0.1.8, quando c'era solo la lettura con coda.
-        queue: !flag("--no-queue") && !flag("--no-peak"),
+        queue: queue_groups(args),
+        queue_secs: args
+            .iter()
+            .position(|a| a == "--queue-secs")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.replace(',', ".").parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.1, 60.0),
         rand_read: true,
         rand_write: true,
         flush: true,
@@ -373,7 +399,11 @@ fn test(args: &[String]) -> i32 {
     println!("\nRisultati:");
     for r in &sh.results {
         let speed = match r.phase {
-            Phase::RandRead | Phase::RandWrite | Phase::Verify => format!("{:>9.0} IOPS", r.iops),
+            Phase::RandRead
+            | Phase::RandWrite
+            | Phase::Verify
+            | Phase::QueueRead(QueueGroup::K4)
+            | Phase::QueueWrite(QueueGroup::K4) => format!("{:>9.0} IOPS", r.iops),
             Phase::Flush => format!("{:>9} flush", r.ops),
             _ => format!("{:>9.1} MB/s", r.mbps),
         };
@@ -415,7 +445,7 @@ fn test(args: &[String]) -> i32 {
                     continue;
                 }
                 let line: String = cells.iter().map(|c| format!("{c:>14}")).collect();
-                println!("    {:<16}{line}", row.name);
+                println!("    {:<16}{line}", row.title());
             }
         }
     }

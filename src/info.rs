@@ -346,6 +346,57 @@ fn extents(letter: char) -> Vec<(u32, u64, u64)> {
         .collect()
 }
 
+/// Collegamenti di un disco per il grafo: PCIe (NVMe interni), USB, SATA. Solo domande che non
+/// svegliano i dischi fermi: lo SATA viene dai dati di IDENTIFY che Windows conserva.
+pub fn links(d: &PhysDisk) -> (Option<PcieLink>, Option<UsbLink>, Option<SataLink>) {
+    let usb = usb_link(&d.usb_node);
+    let pcie = if d.bus == disks::BUS_NVME && !d.is_usb() { pcie_link(&d.instance_id) } else { None };
+    let sata = if matches!(d.bus, 14 | 15 | 16) {
+        None
+    } else {
+        smart::identity(d).0.as_deref().and_then(sata_link)
+    };
+    (pcie, usb, sata)
+}
+
+/// Collegamento PCIe in breve, e se va più piano di quanto il disco potrebbe: «PCIe 4.0 x1 (il
+/// disco arriverebbe a x4)».
+pub fn pcie_short(p: &PcieLink) -> (String, bool) {
+    let now = pcie_label(p.generation, p.width);
+    if p.generation < p.max_gen || p.width < p.max_width {
+        (format!("{now} (il disco arriverebbe a {})", pcie_label(p.max_gen, p.max_width)), true)
+    } else {
+        (now, false)
+    }
+}
+
+/// Collegamento USB in breve: «USB 3.2 Gen 1 (5 Gbit/s)», con la velocità a cui il dispositivo
+/// arriverebbe se il collegamento lo frena.
+pub fn usb_short(u: &UsbLink) -> (String, bool) {
+    let now = usb_speed_label(u.speed).to_string();
+    if u.capable > u.speed {
+        (format!("{now}, arriverebbe a {}", usb_speed_label(u.capable)), true)
+    } else {
+        (now, false)
+    }
+}
+
+/// Collegamento SATA in breve: «SATA 6 Gbit/s».
+pub fn sata_short(s: &SataLink) -> (String, bool) {
+    let name = |g: u8| match g {
+        1 => "1,5 Gbit/s",
+        2 => "3 Gbit/s",
+        _ => "6 Gbit/s",
+    };
+    if s.generation > 0 && s.generation < s.max_gen {
+        (format!("SATA {} (il disco arriverebbe a {})", name(s.generation), name(s.max_gen)), true)
+    } else if s.generation > 0 {
+        (format!("SATA {}", name(s.generation)), false)
+    } else {
+        (format!("SATA, fino a {}", name(s.max_gen)), false)
+    }
+}
+
 fn disk_details(d: &PhysDisk) -> DiskDetails {
     let mut out = DiskDetails {
         number: d.number,

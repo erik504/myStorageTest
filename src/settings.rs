@@ -23,6 +23,8 @@ pub struct Settings {
     pub temp_warn_c: i32,
     pub test_size_mb: u64,
     pub rand_secs: u32,
+    /// Durata di ogni misura delle prove con coda (Q1–Q32), in millisecondi.
+    pub queue_step_ms: u32,
     /// Limite della scansione dei file esistenti in GB; 0 = tutto il volume.
     pub scan_limit_gb: u32,
     /// Per ogni volume, la percentuale a cui si è fermata l'ultima scansione della superficie
@@ -45,6 +47,7 @@ impl Default for Settings {
             temp_warn_c: 70,
             test_size_mb: 1024,
             rand_secs: 10,
+            queue_step_ms: 1000,
             scan_limit_gb: 8,
             surface_reached: std::collections::BTreeMap::new(),
             always_admin: false,
