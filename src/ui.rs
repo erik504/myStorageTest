@@ -2278,6 +2278,8 @@ impl App {
         });
         ui.add_space(4.0);
 
+        // «Esplora» sta a destra, nella riga delle schede: vale per tutte.
+        let explore_letter = self.sel_volume().map(|v| v.letter);
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Info, "Info"),
@@ -2299,6 +2301,19 @@ impl App {
                     self.tab = tab;
                 }
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let explore = ui
+                    .add_enabled(
+                        explore_letter.is_some(),
+                        egui::Button::new(RichText::new("Esplora").size(14.5)).corner_radius(CornerRadius::same(8)),
+                    )
+                    .on_hover_text("Apre il volume in Esplora risorse.")
+                    .on_disabled_hover_text("Questo disco non ha un volume con una lettera di unità da aprire.")
+                    .clicked();
+                if let Some(letter) = explore_letter.filter(|_| explore) {
+                    open_in_explorer(letter);
+                }
+            });
         });
         ui.add_space(2.0);
 
@@ -2358,32 +2373,30 @@ impl App {
             _ => None,
         };
         let ejecting = self.eject_rx.is_some();
-        let (mut explore, mut eject, mut rerun, mut copy) = (false, false, false, false);
-        ui.horizontal(|ui| {
-            explore = ui
-                .add_enabled(vol.is_some(), egui::Button::new("Esplora"))
-                .on_hover_text("Apre il volume in Esplora risorse.")
-                .on_disabled_hover_text("Questo disco non ha un volume con una lettera di unità da aprire.")
-                .clicked();
-            if let Some(plan) = &plan {
-                let testing = plan.letters().iter().any(|l| self.runs.get(l).is_some_and(|r| r.running()));
-                eject = ui
-                    .add_enabled(!ejecting && !testing, egui::Button::new("Espelli"))
-                    .on_hover_text(plan.describe())
-                    .on_disabled_hover_text(if testing {
-                        "È in corso una prova su questo disco: fermala prima di espellerlo."
-                    } else {
-                        "Espulsione in corso…"
-                    })
-                    .clicked();
-            }
-            if ejecting {
-                ui.spinner();
-                ui.label(dim("Espulsione in corso…"));
-            } else if let Some((ok, text)) = &self.eject_note {
-                ui.add(egui::Label::new(RichText::new(text).color(if *ok { GOOD } else { WARN })).wrap());
-            }
-        });
+        let (mut eject, mut rerun, mut copy) = (false, false, false);
+        // La riga c'è solo se c'è qualcosa da espellere o un esito da mostrare.
+        if plan.is_some() || ejecting || self.eject_note.is_some() {
+            ui.horizontal(|ui| {
+                if let Some(plan) = &plan {
+                    let testing = plan.letters().iter().any(|l| self.runs.get(l).is_some_and(|r| r.running()));
+                    eject = ui
+                        .add_enabled(!ejecting && !testing, egui::Button::new("Espelli"))
+                        .on_hover_text(plan.describe())
+                        .on_disabled_hover_text(if testing {
+                            "È in corso una prova su questo disco: fermala prima di espellerlo."
+                        } else {
+                            "Espulsione in corso…"
+                        })
+                        .clicked();
+                }
+                if ejecting {
+                    ui.spinner();
+                    ui.label(dim("Espulsione in corso…"));
+                } else if let Some((ok, text)) = &self.eject_note {
+                    ui.add(egui::Label::new(RichText::new(text).color(if *ok { GOOD } else { WARN })).wrap());
+                }
+            });
+        }
 
         let scroll_to_diag = std::mem::take(&mut self.scroll_to_diag);
         egui::ScrollArea::vertical().id_salt("info").auto_shrink([false, false]).show(ui, |ui| {
@@ -2508,11 +2521,6 @@ impl App {
             }
         });
 
-        if explore {
-            if let Some(v) = &vol {
-                open_in_explorer(v.letter);
-            }
-        }
         if let Some(plan) = plan.filter(|_| eject) {
             self.start_eject(&ctx, plan);
         }

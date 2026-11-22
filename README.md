@@ -68,9 +68,10 @@ di che cosa è capace, e il collegamento attuale, cioè a che cosa lavora davver
   USB, anche il collegamento SATA fra il bridge e il disco.
 
 Quando il collegamento è più lento di quanto il disco saprebbe fare la riga è evidenziata, con le cause
-possibili (un NVMe x4 che usa una sola linea, un disco USB 3 su una porta USB 2, un SATA a 3 Gbit/s). In alto
-«Esplora» apre il volume in Esplora risorse e, per i dispositivi USB e i supporti rimovibili, «Espelli»
-chiede a Windows la rimozione sicura; di una scheda in un lettore con più alloggiamenti espelle solo il
+possibili (un NVMe x4 che usa una sola linea, un disco USB 3 su una porta USB 2, un SATA a 3 Gbit/s).
+«Esplora», a destra nella riga delle schede e quindi disponibile da tutte, apre il volume in Esplora
+risorse. In alto nella scheda, per i dispositivi USB e i supporti rimovibili, «Espelli» chiede a Windows
+la rimozione sicura; di una scheda in un lettore con più alloggiamenti espelle solo il
 supporto. In fondo c'è il rapporto di diagnosi del disco: i comandi inviati per leggerne lo SMART e le
 risposte ricevute, già pronti dalla lettura fatta all'avvio; «Rifai» li ripete riprovando tutte le strade.
 Le unità ottiche (CD e DVD) non sono fra i dischi che il programma elenca.
