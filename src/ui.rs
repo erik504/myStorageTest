@@ -1200,6 +1200,9 @@ pub struct App {
     /// senza toccare il mouse vero.
     fake_pointer: Option<egui::Pos2>,
     fake_pointer_gone: bool,
+    /// Prove automatiche: riquadro dei grafici (indice di `chart_rects`) da tenere in vista nell'area
+    /// che scorre, perché il puntatore simulato lo possa raggiungere.
+    script_scroll: Option<usize>,
     /// Ultima posizione del puntatore simulato comunicata a egui.
     fake_pointer_sent: Option<egui::Pos2>,
     /// Al prossimo disegno porta in vista il grafico della superficie.
@@ -1343,6 +1346,7 @@ impl App {
             chart_rects: [egui::Rect::NOTHING; 7],
             fake_pointer: None,
             fake_pointer_gone: false,
+            script_scroll: None,
             fake_pointer_sent: None,
             scroll_to_surface: false,
             can_surface: win::is_elevated() || std::env::var_os("MYSTORAGETEST_SURFACE_FILE").is_some(),
@@ -2962,6 +2966,8 @@ impl App {
         let surface = sh.surface_len > 0 || !sh.surface.is_empty() || !sh.surface_before.is_empty();
         // Se si è scandita solo la superficie, il suo grafico prende il posto di quelli vuoti.
         let only_surface = surface && !timed_series(&sh).any(|(_, s)| !s.lat_avg.is_empty());
+        // I riquadri stanno uno sotto l'altro, a piena larghezza: velocità e latenza riempiono l'altezza
+        // visibile, distribuzione e attività (alte uguali) seguono sotto e ci si arriva scorrendo.
         let rows = if surface { 3.0 } else { 2.0 };
         // La tabella per blocco e coda sta in cima all'area che scorre, sopra i grafici: i grafici si
         // stringono per lasciarle posto finché possono, poi si scorre. La sua altezza è quella del
@@ -2975,7 +2981,7 @@ impl App {
         };
         let mut queue_rect = egui::Rect::NOTHING;
         let avail = ui.available_height() - queue_h;
-        let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 120.0 });
+        let chart_h = ((avail - 10.0 * (rows - 1.0)) / rows).max(if surface { 190.0 } else { 160.0 });
         let log_h = if only_surface { (avail * 0.24).max(100.0) } else { chart_h };
         // La superficie ha due grafici uno sopra l'altro: le serve più altezza che agli altri riquadri.
         let surface_h = if only_surface { (avail - log_h - 10.0).max(300.0) } else { chart_h.max(320.0) };
@@ -2992,6 +2998,12 @@ impl App {
         let picked = surface_gesture(ui.ctx(), vol.letter).pick.filter(|_| surface_len > 0.0);
         let (mut toggle_surface, mut unpick, mut rescan) = (false, false, None::<(f64, f64)>);
         let (mut latency_rect, mut rescan_rect) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
+        let script_scroll = self.script_scroll;
+        let keep_in_view = |ui: &Ui, which: usize, rect: egui::Rect| {
+            if script_scroll == Some(which) {
+                ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
+            }
+        };
         // Le prove che stanno sui grafici nel tempo: tutte tranne la scansione della superficie.
         let timed = |has_data: fn(&tester::PhaseSeries) -> bool| {
             sh.series
@@ -3006,61 +3018,55 @@ impl App {
                 if show_queue {
                     let top = ui.cursor().top();
                     queue_rect = queue_table(ui, &sh);
+                    keep_in_view(ui, 6, queue_rect);
                     let h = ui.cursor().top() - top;
                     ui.ctx().data_mut(|d| d.insert_temp(queue_h_id, h));
                     ui.add_space(10.0);
                 }
                 if !only_surface {
-                    // A sinistra velocità e latenza nel tempo, una sopra l'altra, con lo stesso asse del
-                    // tempo: puntatore, zoom e spostamento valgono per entrambi. A destra la
-                    // distribuzione della latenza e il registro.
-                    ui.columns(2, |cols| {
-                        chart_frame(
-                            &mut cols[0],
-                            "Velocità (MB/s)",
-                            chart_h,
-                            |ui| {
-                                toggle_speed = log_toggle(ui, log_speed);
-                                time_zoom_hint(ui);
-                            },
-                            |ui| {
-                                legend_row(ui, timed(|s| !s.speed.is_empty()), "");
-                                rects[0] = speed_chart(ui, &sh, log_speed, latency_rect_before);
-                            },
-                        );
-                        chart_frame(
-                            &mut cols[0],
-                            "Latenza (linea tenue = massimo · colori come sopra)",
-                            chart_h,
-                            |ui| toggle_latency = log_toggle(ui, log_latency),
-                            // Le prove sono le stesse del grafico della velocità, con gli stessi colori:
-                            // la legenda sta solo lì e qui l'altezza va tutta al grafico.
-                            |ui| rects[1] = latency_chart(ui, &sh, log_latency, speed_rect),
-                        );
-                        chart_frame(
-                            &mut cols[1],
-                            "Distribuzione della latenza (% delle operazioni)",
-                            chart_h,
-                            |ui| toggle_hist = log_toggle(ui, log_hist),
-                            |ui| {
-                                let view = hist_view(&sh, log_hist);
-                                let note = if view.beyond >= 0.05 {
-                                    format!("· oltre il bordo destro: {} % delle più lente", num(view.beyond, 1))
-                                } else {
-                                    String::new()
-                                };
-                                legend_row(ui, timed(|s| s.hist.iter().any(|c| *c > 0)), &note);
-                                rects[2] = histogram_chart(ui, &view);
-                            },
-                        );
-                        chart_frame(
-                            &mut cols[1],
-                            "Attività ed errori",
-                            chart_h,
-                            |_| {},
-                            |ui| log_list(ui, &sh),
-                        );
-                    });
+                    // Tutti i riquadri a piena larghezza, uno sotto l'altro: velocità e latenza nel tempo,
+                    // con lo stesso asse del tempo (puntatore, zoom e spostamento valgono per entrambi),
+                    // poi la distribuzione della latenza e il registro.
+                    chart_frame(
+                        ui,
+                        "Velocità (MB/s)",
+                        chart_h,
+                        |ui| {
+                            toggle_speed = log_toggle(ui, log_speed);
+                            time_zoom_hint(ui);
+                        },
+                        |ui| {
+                            legend_row(ui, timed(|s| !s.speed.is_empty()), "");
+                            rects[0] = speed_chart(ui, &sh, log_speed, latency_rect_before);
+                        },
+                    );
+                    chart_frame(
+                        ui,
+                        "Latenza (linea tenue = massimo · colori come sopra)",
+                        chart_h,
+                        |ui| toggle_latency = log_toggle(ui, log_latency),
+                        // Le prove sono le stesse del grafico della velocità, con gli stessi colori:
+                        // la legenda sta solo lì e qui l'altezza va tutta al grafico.
+                        |ui| rects[1] = latency_chart(ui, &sh, log_latency, speed_rect),
+                    );
+                    chart_frame(
+                        ui,
+                        "Distribuzione della latenza (% delle operazioni)",
+                        chart_h,
+                        |ui| toggle_hist = log_toggle(ui, log_hist),
+                        |ui| {
+                            let view = hist_view(&sh, log_hist);
+                            let note = if view.beyond >= 0.05 {
+                                format!("· oltre il bordo destro: {} % delle più lente", num(view.beyond, 1))
+                            } else {
+                                String::new()
+                            };
+                            legend_row(ui, timed(|s| s.hist.iter().any(|c| *c > 0)), &note);
+                            rects[2] = histogram_chart(ui, &view);
+                        },
+                    );
+                    keep_in_view(ui, 2, rects[2]);
+                    chart_frame(ui, "Attività ed errori", chart_h, |_| {}, |ui| log_list(ui, &sh));
                 }
                 if surface {
                     chart_frame(
@@ -3981,7 +3987,16 @@ impl App {
                     6 => (self.chart_rects[1], 0.78),
                     _ => (self.chart_rects[2], 0.30),
                 };
-                self.fake_pointer = Some(rect.left_top() + vec2(rect.width() * fx, rect.height() * 0.45));
+                let point = rect.left_top() + vec2(rect.width() * fx, rect.height() * 0.45);
+                // La distribuzione sta sotto velocità e latenza: prima si scorre fino a lei.
+                if step == 8 && !ctx.content_rect().contains(point) {
+                    self.script_scroll = Some(2);
+                    let script = self.script.as_mut().unwrap();
+                    script.step = 8;
+                    wait(script, 150);
+                    return;
+                }
+                self.fake_pointer = Some(point);
                 wait(self.script.as_mut().unwrap(), 400);
             }
             5 if autotest => shot(script, "2a-fumetto-velocita.png"),
@@ -4008,10 +4023,19 @@ impl App {
             // Fumetto di una casella della tabella per blocco e profondità della coda.
             15 if autotest => {
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                // La tabella sta in cima all'area che scorre: si torna su.
+                self.script_scroll = Some(6);
                 wait(self.script.as_mut().unwrap(), 300);
             }
             16 if autotest => {
-                self.fake_pointer = Some(self.chart_rects[6].center());
+                let point = self.chart_rects[6].center();
+                if !ctx.content_rect().contains(point) {
+                    let script = self.script.as_mut().unwrap();
+                    script.step = 16;
+                    wait(script, 150);
+                    return;
+                }
+                self.fake_pointer = Some(point);
                 wait(self.script.as_mut().unwrap(), 1200);
             }
             17 if autotest => shot(script, "2c4-tabella-coda.png"),
@@ -4019,6 +4043,7 @@ impl App {
             // prova solo il disegno, con dati inventati.
             18 if autotest => {
                 self.opt.log_hist = true;
+                self.script_scroll = None;
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
                 if let Some(Sel::Volume(l)) = self.selected {
                     if let Some(run) = self.runs.get(&l) {

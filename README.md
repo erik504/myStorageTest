@@ -79,10 +79,10 @@ Le unità ottiche (CD e DVD) non sono fra i dischi che il programma elenca.
 **Test** sul volume scelto, con grafici in tempo reale di velocità, latenza e distribuzione delle latenze
 (passando il mouse su un grafico un fumetto dice a quale prova appartiene il punto, il valore, per le
 prove con coda la misura in corso in quell'istante, per esempio «Coda Q8 · blocchi da 256K in sequenza»,
-e che cosa significa). Velocità e latenza stanno una sopra l'altra con lo stesso asse del tempo: il
-puntatore indica lo stesso istante su entrambe, Ctrl + rotellina le ingrandisce insieme, trascinando ci
-si sposta insieme e il doppio clic torna a tutta la prova; a destra la distribuzione della latenza e il
-registro delle attività. La distribuzione raccoglie le latenze in intervalli larghi circa il 10 % l'uno e si può
+e che cosa significa). I riquadri occupano tutta la larghezza, uno sotto l'altro: velocità e latenza,
+con lo stesso asse del tempo (il puntatore indica lo stesso istante su entrambe, Ctrl + rotellina le
+ingrandisce insieme, trascinando ci si sposta insieme e il doppio clic torna a tutta la prova), poi la
+distribuzione della latenza e il registro delle attività. La distribuzione raccoglie le latenze in intervalli larghi circa il 10 % l'uno e si può
 guardare su scala logaritmica, che mostra insieme microsecondi e secondi, oppure lineare, che allarga
 il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 
