@@ -1,6 +1,6 @@
 [package]
 name = "mystoragetest"
-version = "0.1.17"
+version = "0.1.19"
 edition = "2024"
 description = "Test, diagnosi e monitoraggio dei dischi per Windows 10 e 11"
 license = "MIT"

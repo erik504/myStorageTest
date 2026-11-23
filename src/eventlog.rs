@@ -70,6 +70,23 @@ pub struct StorEvent {
     /// Evento precedente all'ultimo avvio di Windows: il numero del disco può riferirsi a un altro
     /// disco, perché la numerazione cambia dopo un riavvio o un ricollegamento.
     pub stale: bool,
+    /// Comando e risposta del disco, per le operazioni di I/O ritentate o fallite (153 e 154).
+    pub io: Option<IoFailure>,
+}
+
+/// Operazione di I/O non riuscita, ricavata dai dati binari degli eventi 153 e 154 di «disk».
+#[derive(Clone, Debug, PartialEq)]
+pub struct IoFailure {
+    /// Per esempio «scrittura (WRITE 10)».
+    pub command: String,
+    /// Per esempio «errore hardware, guasto interno del dispositivo [4/44/81]».
+    pub answer: String,
+}
+
+impl IoFailure {
+    pub fn text(&self) -> String {
+        format!("{}: {}", self.command, self.answer)
+    }
 }
 
 /// Istante dell'ultimo avvio di Windows, come FILETIME UTC.
@@ -91,6 +108,33 @@ impl StorEvent {
             2 => "Errore",
             3 => "Avviso",
             _ => "Info",
+        }
+    }
+
+    /// Descrizione completa su una riga: comando decodificato (è la parte più utile, e nelle colonne
+    /// strette resta visibile), spiegazione, testo di Windows.
+    pub fn description(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(io) = &self.io {
+            parts.push(io.text());
+        }
+        if !self.explain.is_empty() {
+            parts.push(self.explain.to_string());
+        }
+        parts.push(self.message.clone());
+        parts.join(" — ")
+    }
+
+    /// Descrizione breve: la spiegazione (o, se manca, il testo di Windows) e il comando decodificato.
+    pub fn summary(&self, max_chars: usize) -> String {
+        let head = if self.explain.is_empty() {
+            self.message.chars().take(max_chars).collect::<String>()
+        } else {
+            self.explain.to_string()
+        };
+        match &self.io {
+            Some(io) => format!("{head} · {}", io.text()),
+            None => head,
         }
     }
 
@@ -133,6 +177,224 @@ fn explain(provider: &str, id: u32) -> &'static str {
         (_, 129) => "Reset del dispositivo: non ha risposto in tempo",
         (_, 11) => "Errore del controller",
         _ => "",
+    }
+}
+
+// Decodifica degli eventi 153 (operazione ritentata) e 154 (operazione fallita) di «disk».
+// I dati binari dell'evento sono il pacchetto IO_ERROR_LOG_PACKET scritto dal driver del disco:
+// un'intestazione di 40 byte, con la dimensione dei dati aggiuntivi all'offset 2 e il codice
+// dell'evento all'offset 12, poi i dati aggiuntivi. In questi il byte 1 è lo stato SCSI, il byte 2
+// lo stato della richiesta (SRB) e il byte 3 il codice del comando; dal byte 4, se il disco li ha
+// mandati, seguono i dettagli dell'errore (sense data) con sense key, ASC e ASCQ.
+
+/// Comando e risposta del disco dai dati binari dell'evento; `None` per gli altri eventi.
+fn decode_io_failure(provider: &str, id: u32, xml: &str) -> Option<IoFailure> {
+    if !provider.eq_ignore_ascii_case("disk") || !matches!(id, 153 | 154) {
+        return None;
+    }
+    decode_packet(id, &parse_hex(tag_text(xml, "Binary")?.trim())?)
+}
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+fn decode_packet(id: u32, b: &[u8]) -> Option<IoFailure> {
+    const DUMP: usize = 40;
+    if b.len() < DUMP + 4 {
+        return None;
+    }
+    // Il codice dell'errore registrato finisce con il numero dell'evento (154 = 0xC004009A).
+    let code = u32::from_le_bytes(b[12..16].try_into().ok()?);
+    if code & 0xFFFF != id {
+        return None;
+    }
+    let size = u16::from_le_bytes([b[2], b[3]]) as usize;
+    let dump = &b[DUMP..b.len().min(DUMP + size)];
+    if dump.len() < 4 {
+        return None;
+    }
+    // Lo stato SRB porta negli ultimi due bit due indicatori, che qui non contano.
+    let (scsi, srb, opcode) = (dump[1], dump[2] & 0x3F, dump[3]);
+    Some(IoFailure {
+        command: command_name(opcode),
+        answer: answer_text(scsi, srb, &dump[4..]),
+    })
+}
+
+/// Il comando SCSI in italiano, con il suo nome.
+fn command_name(op: u8) -> String {
+    let (what, name) = match op {
+        0x00 => ("verifica che sia pronto", "TEST UNIT READY"),
+        0x03 => ("lettura dei dettagli d'errore", "REQUEST SENSE"),
+        0x08 => ("lettura", "READ 6"),
+        0x0A => ("scrittura", "WRITE 6"),
+        0x12 => ("identificazione", "INQUIRY"),
+        0x15 => ("modifica delle impostazioni", "MODE SELECT 6"),
+        0x1A => ("lettura delle impostazioni", "MODE SENSE 6"),
+        0x1B => ("avvio o arresto", "START STOP UNIT"),
+        0x1D => ("autodiagnosi", "SEND DIAGNOSTIC"),
+        0x1E => ("blocco dell'espulsione", "PREVENT ALLOW MEDIUM REMOVAL"),
+        0x25 => ("lettura della capacità", "READ CAPACITY 10"),
+        0x28 => ("lettura", "READ 10"),
+        0x2A => ("scrittura", "WRITE 10"),
+        0x2E => ("scrittura con verifica", "WRITE AND VERIFY 10"),
+        0x2F => ("verifica", "VERIFY 10"),
+        0x35 => ("svuotamento della cache", "SYNCHRONIZE CACHE 10"),
+        0x37 => ("lettura dei difetti", "READ DEFECT DATA 10"),
+        0x3B => ("scrittura nel buffer", "WRITE BUFFER"),
+        0x3C => ("lettura del buffer", "READ BUFFER"),
+        0x41 => ("scrittura ripetuta", "WRITE SAME 10"),
+        0x42 => ("liberazione dei blocchi (TRIM)", "UNMAP"),
+        0x4A => ("notifica di eventi", "GET EVENT STATUS NOTIFICATION"),
+        0x4D => ("lettura dei registri", "LOG SENSE"),
+        0x55 => ("modifica delle impostazioni", "MODE SELECT 10"),
+        0x5A => ("lettura delle impostazioni", "MODE SENSE 10"),
+        0x5E => ("lettura delle prenotazioni", "PERSISTENT RESERVE IN"),
+        0x5F => ("prenotazione", "PERSISTENT RESERVE OUT"),
+        0x85 => ("comando ATA passante", "ATA PASS-THROUGH 16"),
+        0x88 => ("lettura", "READ 16"),
+        0x8A => ("scrittura", "WRITE 16"),
+        0x8E => ("scrittura con verifica", "WRITE AND VERIFY 16"),
+        0x8F => ("verifica", "VERIFY 16"),
+        0x91 => ("svuotamento della cache", "SYNCHRONIZE CACHE 16"),
+        0x93 => ("scrittura ripetuta", "WRITE SAME 16"),
+        // SERVICE ACTION IN (16): con i dischi è quasi sempre la lettura della capacità.
+        0x9E => ("lettura della capacità", "READ CAPACITY 16"),
+        0xA0 => ("elenco delle unità", "REPORT LUNS"),
+        0xA1 => ("comando ATA passante", "ATA PASS-THROUGH 12"),
+        0xA3 => ("informazioni sul dispositivo", "MAINTENANCE IN"),
+        0xA8 => ("lettura", "READ 12"),
+        0xAA => ("scrittura", "WRITE 12"),
+        0xAF => ("verifica", "VERIFY 12"),
+        _ => return format!("comando {op:02X}h"),
+    };
+    format!("{what} ({name})")
+}
+
+/// Sense key, ASC e ASCQ, dai dettagli in formato fisso (0x70, 0x71) o a descrittori (0x72, 0x73).
+fn sense_codes(s: &[u8]) -> Option<(u8, u8, u8)> {
+    match s.first()? & 0x7F {
+        0x70 | 0x71 if s.len() >= 14 => Some((s[2] & 0x0F, s[12], s[13])),
+        0x72 | 0x73 if s.len() >= 4 => Some((s[1] & 0x0F, s[2], s[3])),
+        _ => None,
+    }
+}
+
+fn sense_key_text(key: u8) -> &'static str {
+    match key {
+        0x0 => "nessun dettaglio",
+        0x1 => "errore corretto dal disco",
+        0x2 => "disco non pronto",
+        0x3 => "errore del supporto",
+        0x4 => "errore hardware",
+        0x5 => "richiesta non valida",
+        0x6 => "stato del disco cambiato",
+        0x7 => "protetto da scrittura",
+        0x8 => "area non scritta",
+        0x9 => "errore del produttore",
+        0xA => "copia interrotta",
+        0xB => "comando interrotto",
+        0xD => "oltre la fine del volume",
+        0xE => "dati diversi dal confronto",
+        _ => "errore",
+    }
+}
+
+/// Significato di ASC e ASCQ, per i codici più comuni.
+fn asc_text(asc: u8, ascq: u8) -> Option<&'static str> {
+    Some(match (asc, ascq) {
+        (0x04, 0x01) => "il disco si sta avviando",
+        (0x04, 0x02) => "il disco aspetta il comando di avvio",
+        (0x04, 0x03) => "serve un intervento manuale",
+        (0x04, _) => "il disco non è pronto",
+        (0x08, _) => "errore di comunicazione con l'unità",
+        (0x0C, _) => "scrittura non riuscita",
+        (0x10, _) => "errore nel controllo di integrità dei dati",
+        (0x11, _) => "lettura non recuperabile",
+        (0x14, _) => "blocco non trovato",
+        (0x15, _) => "errore di posizionamento",
+        (0x1A, _) => "lunghezza dei parametri non valida",
+        (0x20, _) => "comando non supportato",
+        (0x21, _) => "indirizzo oltre la fine del disco",
+        (0x24, _) => "campo non valido nel comando",
+        (0x25, _) => "unità logica non supportata",
+        (0x26, _) => "parametro non valido",
+        (0x27, _) => "protetto da scrittura",
+        (0x28, _) => "il supporto potrebbe essere cambiato",
+        (0x29, _) => "accensione o reset del dispositivo",
+        (0x2A, _) => "impostazioni cambiate",
+        (0x2C, _) => "sequenza di comandi non valida",
+        (0x31, _) => "formato del supporto danneggiato",
+        (0x3A, _) => "supporto assente",
+        (0x3E, 0x02) => "l'unità logica non risponde in tempo",
+        (0x3E, _) => "guasto dell'unità logica",
+        (0x3F, _) => "condizioni operative cambiate",
+        (0x40, _) | (0x42, _) => "autodiagnosi fallita",
+        (0x44, _) => "guasto interno del dispositivo",
+        (0x47, _) => "errore di parità",
+        (0x4B, _) => "errore nel trasferimento dei dati",
+        (0x4E, _) => "comandi sovrapposti",
+        (0x5D, _) => "il disco prevede un guasto",
+        (0x5E, _) => "risparmio energetico",
+        _ => return None,
+    })
+}
+
+/// Stato della richiesta (SRB) quando il disco non ha mandato dettagli.
+fn srb_text(srb: u8) -> Option<&'static str> {
+    Some(match srb {
+        0x02 => "interrotta, di solito da un reset del collegamento",
+        0x05 => "dispositivo occupato",
+        0x06 => "richiesta non valida",
+        0x08 => "dispositivo assente",
+        0x09 | 0x0B => "scaduto il tempo: il disco non ha risposto",
+        0x0A => "il dispositivo non risponde",
+        0x0E => "reset del bus",
+        0x0F => "errore di parità",
+        0x10 => "lettura dei dettagli d'errore fallita",
+        0x12 => "trasferiti più o meno dati del previsto",
+        0x13 => "il dispositivo si è scollegato",
+        0x16 => "richiesta annullata",
+        0x24 => "dispositivo spento",
+        0x25 => "collegamento interrotto",
+        0x26 => "risorse insufficienti",
+        0x30 => "errore interno del controller",
+        _ => return None,
+    })
+}
+
+fn scsi_status_text(status: u8) -> Option<&'static str> {
+    Some(match status {
+        0x02 => "il disco ha segnalato un errore senza dettagli",
+        0x08 => "disco occupato",
+        0x18 => "disco prenotato da un altro sistema",
+        0x28 => "coda dei comandi piena",
+        0x40 => "comando annullato dal disco",
+        _ => return None,
+    })
+}
+
+fn answer_text(scsi: u8, srb: u8, sense: &[u8]) -> String {
+    if let Some((key, asc, ascq)) = sense_codes(sense).filter(|&(k, a, q)| k != 0 || a != 0 || q != 0) {
+        let text = match asc_text(asc, ascq) {
+            Some(meaning) => format!("{}, {meaning}", sense_key_text(key)),
+            None => sense_key_text(key).to_string(),
+        };
+        return format!("{text} [{key:X}/{asc:02X}/{ascq:02X}]");
+    }
+    if let Some(text) = srb_text(srb) {
+        return format!("{text} [SRB {srb:02X}]");
+    }
+    match scsi_status_text(scsi) {
+        Some(text) => format!("{text} [stato SCSI {scsi:02X}]"),
+        None => format!("errore [SRB {srb:02X}, stato SCSI {scsi:02X}]"),
     }
 }
 
@@ -493,7 +755,9 @@ unsafe fn build_event(ev: EVT_HANDLE, metas: &mut HashMap<String, EVT_HANDLE>, b
             .map(parse_time)
             .unwrap_or(0);
         let joined = values.join(" ");
+        let io = decode_io_failure(&provider, id, &xml);
         Some(StorEvent {
+            io,
             record_id: tag_text(&xml, "EventRecordID")
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0),
@@ -716,6 +980,67 @@ pub fn query_hours(hours: u64, max: usize) -> Vec<StorEvent> {
 /// Eventi con numero di record successivo a quello indicato, in ordine cronologico.
 pub fn query_after(record_id: u64, max: usize) -> Vec<StorEvent> {
     run_query(&xpath(&format!("EventRecordID > {record_id}")), false, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pacchetto come lo scrive il driver del disco: intestazione di 40 byte, poi i dati aggiuntivi.
+    fn packet(id: u32, dump: &str) -> Vec<u8> {
+        let code = if id == 154 { 0xC004_0000u32 } else { 0x8004_0000 } | id;
+        let mut hex = format!("0F01{:02X}000400400000000000", dump.len() / 2);
+        hex.push_str(&code.to_le_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>());
+        hex.push_str(&"0".repeat(48));
+        hex.push_str(dump);
+        parse_hex(&hex).unwrap()
+    }
+
+    // Dati aggiuntivi di eventi veri: un SSD NVMe in un box USB con bridge JMicron che non risponde
+    // più, e dischi USB con letture ritentate.
+    const WRITE_HW: &str = "0002042A700004000000000A000000004481000000002D2D";
+    const FLUSH_HW: &str = "00020435700004000000000A000000004481000000002D2D";
+
+    #[test]
+    fn hardware_error_with_sense() {
+        let io = decode_packet(154, &packet(154, WRITE_HW)).unwrap();
+        assert_eq!(io.command, "scrittura (WRITE 10)");
+        assert_eq!(io.answer, "errore hardware, guasto interno del dispositivo [4/44/81]");
+        let io = decode_packet(154, &packet(154, FLUSH_HW)).unwrap();
+        assert_eq!(io.command, "svuotamento della cache (SYNCHRONIZE CACHE 10)");
+    }
+
+    #[test]
+    fn retried_without_sense() {
+        let io = decode_packet(153, &packet(153, "00000928")).unwrap();
+        assert_eq!(io.command, "lettura (READ 10)");
+        assert_eq!(io.answer, "scaduto il tempo: il disco non ha risposto [SRB 09]");
+        let io = decode_packet(153, &packet(153, "00000228")).unwrap();
+        assert_eq!(io.answer, "interrotta, di solito da un reset del collegamento [SRB 02]");
+        let io = decode_packet(153, &packet(153, "0002048A")).unwrap();
+        assert_eq!(io.command, "scrittura (WRITE 16)");
+        assert_eq!(io.answer, "il disco ha segnalato un errore senza dettagli [stato SCSI 02]");
+    }
+
+    #[test]
+    fn descriptor_sense_and_unknown_command() {
+        let io = decode_packet(154, &packet(154, "000204C5720311000000000000")).unwrap();
+        assert_eq!(io.command, "comando C5h");
+        assert_eq!(io.answer, "errore del supporto, lettura non recuperabile [3/11/00]");
+    }
+
+    #[test]
+    fn other_events_are_not_decoded() {
+        // Il codice registrato deve corrispondere all'evento.
+        assert!(decode_packet(153, &packet(154, WRITE_HW)).is_none());
+        assert!(decode_packet(154, &packet(154, "")).is_none());
+        let xml = format!("<Event><EventData><Binary>{}</Binary></EventData></Event>", {
+            packet(154, WRITE_HW).iter().map(|b| format!("{b:02X}")).collect::<String>()
+        });
+        assert!(decode_io_failure("disk", 154, &xml).is_some());
+        assert!(decode_io_failure("Ntfs", 154, &xml).is_none());
+        assert!(decode_io_failure("disk", 7, &xml).is_none());
+    }
 }
 
 /// Numero di record dell'evento più recente del registro "Sistema" (di qualunque sorgente).

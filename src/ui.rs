@@ -3415,17 +3415,26 @@ impl App {
                 if let (Some(first), Some(last)) = (rows.last(), rows.first()) {
                     ui.label(dim(format!("dal {} al {}", first.time, last.time)));
                 }
-                // Le segnalazioni più frequenti, per capire a colpo d'occhio di cosa si tratta.
-                let mut groups: HashMap<(&str, u32), usize> = HashMap::new();
+                // Le segnalazioni più frequenti, per capire a colpo d'occhio di cosa si tratta; per le
+                // operazioni di I/O fallite conta anche il comando (lettura, scrittura, cache…).
+                let mut groups: HashMap<(&str, u32, &str), usize> = HashMap::new();
                 for e in &rows {
-                    *groups.entry((e.provider.as_str(), e.id)).or_default() += 1;
+                    // Solo l'azione («scrittura», «lettura»…), senza il nome SCSI: la riga è stretta.
+                    let command = e
+                        .io
+                        .as_ref()
+                        .map_or("", |io| io.command.split(" (").next().unwrap_or(""));
+                    *groups.entry((e.provider.as_str(), e.id, command)).or_default() += 1;
                 }
                 let mut top: Vec<_> = groups.into_iter().collect();
                 top.sort_by(|a, b| b.1.cmp(&a.1));
                 let text: Vec<String> = top
                     .iter()
                     .take(3)
-                    .map(|((p, id), n)| format!("{p} {id} ×{}", int(*n as u64)))
+                    .map(|((p, id, command), n)| {
+                        let command = if command.is_empty() { String::new() } else { format!(" {command}") };
+                        format!("{p} {id}{command} ×{}", int(*n as u64))
+                    })
                     .collect();
                 ui.label(dim(format!("· {}", text.join(" · "))));
             }
@@ -3469,11 +3478,7 @@ impl App {
                             cell(ui, widths[2], RichText::new(&e.provider).size(13.0).color(DIM));
                             cell(ui, widths[3], RichText::new(e.id.to_string()).size(13.0));
                             cell(ui, widths[4], RichText::new(e.target()).size(13.0));
-                            let text = if e.explain.is_empty() {
-                                e.message.clone()
-                            } else {
-                                format!("{} — {}", e.explain, e.message)
-                            };
+                            let text = e.description();
                             ui.add(egui::Label::new(RichText::new(&text).size(13.0).color(DIM)).truncate())
                                 .on_hover_text(text);
                         });

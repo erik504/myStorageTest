@@ -6,7 +6,7 @@ use windows_sys::Win32::System::Console::AttachConsole;
 
 use crate::disks::{self, bus_name};
 use crate::tester::{LogLevel, Outcome, Phase, QUEUE_DEPTHS, QUEUE_ROWS, QueueGroup, TestConfig, TestRun};
-use crate::win::human_bytes;
+use crate::win::{human_bytes, thousands};
 use crate::{eventlog, info, smart};
 
 const HELP: &str = "\
@@ -301,7 +301,9 @@ fn smart_cmd(only: Option<u32>) -> i32 {
 }
 
 fn events(hours: u64) -> i32 {
-    let list = eventlog::query_hours(hours, 2000);
+    // Come nella scheda Eventi: un disco guasto scrive decine di migliaia di eventi in poche ore.
+    const MAX: usize = 100_000;
+    let list = eventlog::query_hours(hours, MAX);
     let err = eventlog::LAST_QUERY_ERROR.load(std::sync::atomic::Ordering::Relaxed);
     if err != 0 {
         println!(
@@ -310,7 +312,11 @@ fn events(hours: u64) -> i32 {
         );
         return 2;
     }
-    println!("{} eventi di errore o avviso nelle ultime {hours} ore", list.len());
+    println!(
+        "{} eventi di errore o avviso nelle ultime {hours} ore{}",
+        thousands(list.len() as u64),
+        if list.len() >= MAX { " (i più recenti)" } else { "" }
+    );
     for e in list.iter().take(60) {
         println!(
             "  {}  {:<8} {:<26} {:>4}  {:<14} {}",
@@ -319,15 +325,39 @@ fn events(hours: u64) -> i32 {
             e.provider,
             e.id,
             e.target(),
-            if e.explain.is_empty() {
-                e.message.chars().take(110).collect::<String>()
-            } else {
-                e.explain.to_string()
-            }
+            e.summary(110)
         );
     }
     if list.len() > 60 {
-        println!("  … altri {}", list.len() - 60);
+        println!("  … altri {}", thousands(list.len() as u64 - 60));
+    }
+    if list.len() > 1 {
+        // Riepilogo per tipo: sorgente, codice, destinazione e, per l'I/O fallito, comando e risposta.
+        let mut groups: Vec<(String, usize, &str, &str)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in &list {
+            let line = format!("{:<26} {:>4}  {:<14} {}", e.provider, e.id, e.target(), e.summary(90));
+            let i = match index.get(&line) {
+                Some(&i) => i,
+                None => {
+                    groups.push((line.clone(), 0, e.time.as_str(), e.time.as_str()));
+                    index.insert(line, groups.len() - 1);
+                    groups.len() - 1
+                }
+            };
+            groups[i].1 += 1;
+            // L'elenco va dal più recente: l'ultimo visto è il primo in ordine di tempo.
+            groups[i].2 = e.time.as_str();
+        }
+        groups.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("\nRiepilogo per tipo ({} tipi)", groups.len());
+        for (line, n, first, last) in groups.iter().take(25) {
+            println!("  {:>8}×  {line}", thousands(*n as u64));
+            println!("             dal {first} al {last}");
+        }
+        if groups.len() > 25 {
+            println!("  … altri {} tipi", groups.len() - 25);
+        }
     }
     0
 }
@@ -501,7 +531,7 @@ fn test(args: &[String]) -> i32 {
         }
     }
     for e in &sh.sys_events {
-        println!("  EVENTO {} {} {} {}", e.time, e.provider, e.id, e.message);
+        println!("  EVENTO {} {} {} {}", e.time, e.provider, e.id, e.description());
     }
     println!(
         "\nEsito: {} — {} errori, {} stalli, tracce rimosse: {}",

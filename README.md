@@ -133,10 +133,20 @@ bloccata viene segnalata mentre è ancora in corso, e «Ferma» la annulla.
 **SMART** di ogni disco, con gli attributi in chiaro e i valori anomali evidenziati, e l'**autodiagnosi**
 (self-test) del disco: prova in corso con l'avanzamento, prove registrate dal disco con il loro esito,
 avvio della prova breve o estesa e interruzione. Un'autodiagnosi fallita rende critico lo stato del disco.
+Gli attributi 202 e 206 hanno un significato da dischi a piatti (errori «Data Address Mark», altezza di
+volo delle testine) che negli SSD cambia con il produttore, come nella tabella di smartmontools: negli
+SSD Crucial e Micron il 202 è la vita consumata in percentuale, con la vita residua nel dettaglio e un
+avviso dal 90 % come l'usura degli NVMe, e il 206 è il tasso di errori di scrittura; negli altri SSD
+(Samsung e SK hynix usano il 202 per lo stato di eccezione, Intel per la fine vita, Lexar il 206 per il
+minimo dei cicli di cancellazione…) compaiono come «Attributo del produttore».
 
 **Eventi di sistema**: gli errori e gli avvisi di dischi, controller e file system registrati da Windows
 nelle ultime 24 ore, 7 giorni o 30 giorni, con una spiegazione per i codici più comuni. «Aggiorna»
-aggiunge solo gli eventi nuovi.
+aggiunge solo gli eventi nuovi. Per le operazioni di I/O ritentate (153) o fallite (154) il programma
+legge anche i dati binari dell'evento e dice quale comando il disco ha ricevuto e cosa ha risposto, per
+esempio «scrittura (WRITE 10): errore hardware, guasto interno del dispositivo [4/44/81]» o «lettura
+(READ 10): scaduto il tempo: il disco non ha risposto [SRB 09]»; fra le segnalazioni più frequenti il
+comando è contato a parte, così si vede subito se falliscono le letture, le scritture o tutto.
 
 **Temperatura**: lo storico della temperatura del disco da quando il programma è aperto. Tutti i dischi
 che la dichiarano vengono letti allo stesso ritmo, ogni 30 secondi (da 10 secondi a 15 minuti, a scelta
@@ -239,7 +249,7 @@ mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senz
 mystoragetest --graph             il Grafo Storage come testo: collegamenti, bande teoriche, driver
 mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
 mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
-mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
+mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore), con il riepilogo per tipo
 mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
 mystoragetest --selftest N breve|estesa|stop
                                   avvia o interrompe l'autodiagnosi del disco N (da amministratore)
@@ -295,9 +305,10 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - test completo su una chiavetta USB la cui radice accetta solo cartelle: il file di prova va in una cartella nascosta creata per la prova, e alla fine non restano né il file né la cartella, anche chiudendo a forza il programma durante la scrittura e durante le letture con coda; su un volume senza spazio per il file la prova finisce «Completato con avvisi»;
 - tabella per blocco e profondità della coda su un NVMe PCIe 4.0 (lettura in sequenza 7,35 GB/s e scrittura 6,4 GB/s, come da specifica, contro 4,7 e 4,9 a Q1), su un volume distribuito su due NVMe (8,9 GB/s in lettura), su un volume cifrato VeraCrypt (circa 2 GB/s a ogni Q), su un disco a piatti USB (4K casuale da 174 operazioni al secondo a Q1 a 663 a Q32) e su una chiavetta USB: nessuno stallo falso con le code lunghe sui dischi lenti, file di prova eliminato; riquadri, tabella e fumetti con la finestra alla dimensione normale e a quella minima (dove i riquadri vanno su due righe);
 - due prove contemporanee su due volumi, ognuna con la sua pagina, che resta dopo aver cambiato disco;
-- SMART senza privilegi su sei NVMe e due SATA interni;
+- SMART senza privilegi su sei NVMe e due SATA interni; sul Crucial MX500 l'attributo 202 (valore grezzo 24, attuale 76) letto come vita consumata 24 % e vita residua 76 %, coerente con i 373 cicli di cancellazione medi, e il 206 come tasso di errori di scrittura, confrontati con la voce «Crucial/Micron Client SSDs» della tabella di smartmontools; il riconoscimento dei modelli Crucial e Micron ha una prova automatica;
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
+- decodifica di comando e risposta negli eventi 153 e 154, con prove automatiche (`cargo test`) sui dati di eventi veri e confrontata con la decodifica a mano di circa 100.000 eventi reali: un SSD NVMe in contenitore USB con bridge JMicron che a tratti smette di rispondere (letture, scritture, svuotamento della cache, verifica di prontezza e lettura della capacità, tutte con errore hardware 4/44/81) e dischi USB con letture ritentate per tempo scaduto o interrotte;
 - storico delle temperature degli SSD interni;
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;

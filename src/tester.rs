@@ -1092,6 +1092,19 @@ impl Engine {
                     events.len()
                 ),
             );
+            // I tipi più frequenti, con il comando e la risposta del disco quando ci sono.
+            let mut groups: Vec<(String, usize)> = Vec::new();
+            for e in &events {
+                let what = format!("{} {}: {}", e.provider, e.id, e.summary(90));
+                match groups.iter_mut().find(|g| g.0 == what) {
+                    Some(g) => g.1 += 1,
+                    None => groups.push((what, 1)),
+                }
+            }
+            groups.sort_by(|a, b| b.1.cmp(&a.1));
+            for (what, n) in groups.iter().take(3) {
+                self.log(LogLevel::Error, format!("{n} × {what}"));
+            }
         }
 
         let stopped = self.stop.load(Ordering::Relaxed);

@@ -211,7 +211,10 @@ impl Worker {
             } else {
                 format!("{target} — {what}")
             };
-            let detail = format!("{} (sorgente {}, evento {})", e.message, e.provider, e.id);
+            let detail = match &e.io {
+                Some(io) => format!("{} — {} (sorgente {}, evento {})", io.text(), e.message, e.provider, e.id),
+                None => format!("{} (sorgente {}, evento {})", e.message, e.provider, e.id),
+            };
             self.raise(key, level, title, detail, count);
         }
     }

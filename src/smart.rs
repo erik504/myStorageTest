@@ -537,7 +537,8 @@ fn ata_attr_info(id: u8) -> (&'static str, u8) {
         199 => ("Errori CRC dell'interfaccia", 3),
         200 => ("Errori di scrittura", 0),
         201 => ("Errori di lettura software", 1),
-        202 => ("Vita residua", 0),
+        // 202 e 206: significato dei dischi a piatti; per gli SSD vedi `ata_report`.
+        202 => ("Errori Data Address Mark", 0),
         206 => ("Altezza di volo delle testine", 0),
         210 => ("Recuperi RAIN riusciti", 0),
         220 => ("Spostamento del disco", 0),
@@ -586,8 +587,29 @@ fn ata_data_plausible(data: &[u8]) -> bool {
     ids.len() >= 4 || (!ids.is_empty() && checksum == 0)
 }
 
-fn ata_report(disk: u32, data: &[u8], thresholds: Option<&[u8]>, predict_failure: bool, method: &str) -> SmartReport {
-    let mut r = SmartReport::empty(disk);
+/// SSD Crucial e Micron (MX, BX, M500/M550/M600, 1100/1300, 5100…), che danno al 202 e al 206 un
+/// significato loro (tabella di smartmontools, voci «Crucial/Micron»).
+fn crucial_micron(model: &str) -> bool {
+    let m = model.trim().to_ascii_uppercase();
+    m.starts_with("CRUCIAL")
+        || m.starts_with("MICRON")
+        || m.starts_with("M4-CT")
+        || m.contains("MTFDDA")
+        || m.contains("CTFDDA")
+        || (m.starts_with("CT") && (m.contains("MX") || m.contains("BX")) && m.contains("SSD"))
+}
+
+fn ata_report(
+    disk: &PhysDisk,
+    data: &[u8],
+    thresholds: Option<&[u8]>,
+    predict_failure: bool,
+    method: &str,
+) -> SmartReport {
+    let mut r = SmartReport::empty(disk.number);
+    // 202 e 206 hanno un significato da disco a piatti; negli SSD ognuno li usa a modo suo.
+    let crucial = crucial_micron(&disk.model);
+    let other_ssd = disk.ssd == Some(true) && !crucial;
     r.available = true;
     r.kind = "ATA";
     r.method = method.to_string();
@@ -622,6 +644,28 @@ fn ata_report(disk: u32, data: &[u8], thresholds: Option<&[u8]>, predict_failure
                 };
             }
         }
+        // Nei Crucial e Micron il 202 ha nel valore grezzo la percentuale di vita consumata e in
+        // quello attuale la vita residua (100 meno il grezzo).
+        if id == 202 && crucial && raw <= 100 {
+            if raw >= 100 {
+                level = Health::Critical;
+            } else if raw >= 90 && level < Health::Warning {
+                level = Health::Warning;
+            }
+            let detail = match thr {
+                Some(t) => format!("vita residua {cur} % · peggiore {worst} · soglia {t}"),
+                None => format!("vita residua {cur} % · peggiore {worst}"),
+            };
+            r.push("202", "Vita consumata", format!("{raw} %"), detail, level);
+            continue;
+        }
+        let name = match id {
+            206 if crucial => "Tasso di errori di scrittura",
+            // Samsung e SK hynix usano il 202 per lo stato di eccezione, Intel per la fine vita,
+            // Lexar e Indilinx il 206 per il minimo dei cicli di cancellazione, e così via.
+            202 | 206 if other_ssd || crucial => "Attributo del produttore",
+            _ => name,
+        };
         let value = match kind {
             2 => {
                 let c = (raw & 0xFF) as i32;
@@ -1390,7 +1434,7 @@ fn ata_read(disk: &PhysDisk, h: &Handle, via: AtaVia, predict: bool) -> Option<S
     };
     let thresholds = ata_io(h, via, AtaCmd::read_thresholds(), true);
     let mut r = ata_report(
-        disk.number,
+        disk,
         &data,
         thresholds.as_ref().map(|t| &t[..]),
         predict,
@@ -2031,7 +2075,7 @@ fn read_inner(disk: &PhysDisk, mode: Mode) -> Sample {
         }
         let (predict, data) = predicted?;
         let mut r = ata_report(
-            disk.number,
+            disk,
             &data,
             None,
             predict,
@@ -2343,5 +2387,31 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
         _ => nvme()
             .or_else(|_| ata(AtaVia::Native, "il disco"))
             .or_else(|_| ata(AtaVia::Sat16, "il disco")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crucial_and_micron_models() {
+        // Modelli delle voci «Crucial/Micron» della tabella di smartmontools.
+        for m in [
+            "CT2000MX500SSD1",
+            "CT1000BX500SSD1",
+            "Crucial_CT512M550SSD1",
+            "Micron_1100_MTFDDAK256TBN",
+            "MTFDDAK2T0TDL",
+            "Micron_5300_MTFDDAK1T9TDS",
+            "M4-CT256M4SSD2",
+            "C300-CTFDDAC256MAG",
+        ] {
+            assert!(crucial_micron(m), "{m}");
+        }
+        // Altri SSD (anche un NVMe Crucial, che non ha attributi ATA) e dischi a piatti.
+        for m in ["Samsung SSD 870 QVO 4TB", "CT1000P3PSSD8", "ST4000LM024-2AN17V", "WDC WD40EFRX-68N32N0"] {
+            assert!(!crucial_micron(m), "{m}");
+        }
     }
 }
