@@ -104,6 +104,8 @@ pub struct SelfTest {
     pub extended_minutes: Option<u32>,
     /// Vuoto se la prova si può avviare da qui; altrimenti il motivo.
     pub cannot_start: String,
+    /// Avvertenza da leggere prima di avviare la prova; vuota se non serve.
+    pub caution: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1028,9 +1030,22 @@ fn sense_codes(sense: &[u8; 32]) -> (u8, u8, u8) {
     }
 }
 
-/// Secondi concessi ai comandi che non devono aspettare l'avvio del motore.
+/// Secondi concessi ai comandi che non devono aspettare l'avvio del motore. Bastano anche per
+/// l'avvio dell'autodiagnosi, che il disco conferma subito: un bridge JMicron JMS581 che non lo
+/// eseguiva non ha risposto nemmeno in 60 secondi.
 const SCSI_TIMEOUT: u32 = 8;
 const ERROR_SEM_TIMEOUT: u32 = 121;
+
+/// Perché un comando SCSI non è riuscito, in parole; `timeout` sono i secondi che aveva.
+fn fail_text(f: ScsiFail, timeout: u32) -> String {
+    match f {
+        ScsiFail::Rejected { status, key, asc, ascq } => {
+            format!("ha rifiutato il comando (stato {status:02X}h, chiave {key:X}h, codice {asc:02X}/{ascq:02X})")
+        }
+        ScsiFail::Io(ERROR_SEM_TIMEOUT) => format!("non ha risposto entro {timeout} s"),
+        ScsiFail::Io(code) => format!("non ha risposto: errore di Windows {code} ({})", win::error_text(code)),
+    }
+}
 
 /// Invia un comando SCSI al dispositivo. Con `ata_sense` accetta come riuscito anche lo stato
 /// «CHECK CONDITION» senza errore vero, con cui i bridge SAT restituiscono i registri ATA.
@@ -1495,6 +1510,12 @@ fn asmedia_nvme(h: &Handle, opcode: u8, cdw10: u32, len: usize) -> Option<Vec<u8
 /// Contenitori USB-NVMe con bridge JMicron JMS583/JMS581/JMS586: un comando NVMe di amministrazione
 /// in tre passi (comando, dati, risposta). Con `len` zero il comando non ha dati.
 fn jmicron_admin(h: &Handle, opcode: u8, nsid: u32, cdw10: u32, len: usize) -> Option<Vec<u8>> {
+    jmicron_nvme(h, opcode, nsid, cdw10, len).ok()
+}
+
+/// Come `jmicron_admin`, ma se non riesce dice a quale passo si è fermato e perché.
+fn jmicron_nvme(h: &Handle, opcode: u8, nsid: u32, cdw10: u32, len: usize) -> Result<Vec<u8>, String> {
+    let timeout = SCSI_TIMEOUT;
     const SIGNATURE: u32 = 0x454D_564E; // "NVME"
     let mut cmd = [0u8; 512];
     cmd[0..4].copy_from_slice(&SIGNATURE.to_le_bytes());
@@ -1503,27 +1524,47 @@ fn jmicron_admin(h: &Handle, opcode: u8, nsid: u32, cdw10: u32, len: usize) -> O
     cmd[48..52].copy_from_slice(&cdw10.to_le_bytes());
 
     // Protocolli: 0 = comando, 1 = nessun dato, 2 = dati in ingresso, F = risposta.
-    let step = |proto: u8, len: usize| -> [u8; 12] {
+    let step = |name: &str, proto: u8, dir: Dir, payload: &[u8], len: usize| -> Result<Vec<u8>, String> {
         let mut cdb = [0u8; 12];
         cdb[0] = 0xA1;
         cdb[1] = 0x80 | proto;
         cdb[3] = (len >> 16) as u8;
         cdb[4] = (len >> 8) as u8;
         cdb[5] = len as u8;
-        cdb
+        scsi_exec(h, &format!("JMicron NVMe: {name}"), &cdb, dir, payload, len, timeout, false)
+            .map(|r| r.data)
+            .map_err(|f| format!("al passo «{name}» il bridge USB {}", fail_text(f, timeout)))
     };
-    scsi(h, "JMicron NVMe: comando", &step(0x00, 512), Dir::Out, &cmd, 512)?;
+    step("invio del comando", 0x00, Dir::Out, &cmd, 512)?;
     let data = if len > 0 {
-        scsi(h, "JMicron NVMe: dati", &step(0x02, len), Dir::In, &[], len)?
+        step("lettura dei dati", 0x02, Dir::In, &[], len)?
     } else {
-        scsi(h, "JMicron NVMe: nessun dato", &step(0x01, 0), Dir::None, &[], 0)?
+        step("esecuzione", 0x01, Dir::None, &[], 0)?
     };
-    let reply = scsi(h, "JMicron NVMe: risposta", &step(0x0F, 512), Dir::In, &[], 512)?;
-    if rd_u32(&reply, 0) != SIGNATURE || (rd_u32(&reply, 20) >> 17) != 0 {
-        trace(|| "JMicron NVMe: la risposta non porta la firma attesa, o il disco segnala un errore".into());
-        return None;
-    }
-    Some(data)
+    let reply = step("risposta", 0x0F, Dir::In, &[], 512)?;
+    let why = if rd_u32(&reply, 0) != SIGNATURE {
+        format!("al passo «risposta» il bridge USB ha dato dati senza la firma attesa ({} …)", hex(&reply[..16]))
+    } else if rd_u32(&reply, 20) >> 17 != 0 {
+        format!("il disco ha risposto con {}", nvme_status_text(rd_u32(&reply, 20) >> 17))
+    } else {
+        return Ok(data);
+    };
+    trace(|| format!("JMicron NVMe: {why}"));
+    Err(why)
+}
+
+/// Campo «stato» della risposta NVMe (già spostato di 17 bit), con il significato dei casi
+/// che l'autodiagnosi può incontrare.
+fn nvme_status_text(status: u32) -> String {
+    let (sct, sc) = ((status >> 8) & 7, status & 0xFF);
+    let what = match (sct, sc) {
+        (0, 0x01) => ", comando non riconosciuto",
+        (0, 0x02) => ", campo del comando non valido",
+        (0, 0x0B) => ", namespace o formato non valido",
+        (1, 0x1D) => ", un'autodiagnosi è già in corso",
+        _ => "",
+    };
+    format!("stato NVMe {sct:X}/{sc:02X}h{what}")
 }
 
 /// Quale protocollo proprietario porta i comandi NVMe attraverso il bridge USB.
@@ -1594,6 +1635,12 @@ fn nvme_bridge_read(disk: &PhysDisk, h: &Handle, via: NvmeVia, strict: bool) -> 
     let mut st = nvme_selftest(identify.as_deref(), tests.as_deref());
     if via != NvmeVia::Jmicron && st.supported {
         st.cannot_start = FORWARD_ONLY_READS.into();
+    }
+    if via == NvmeVia::Jmicron && st.supported {
+        match selftest_blocked(disk.usb_id) {
+            Some(why) => st.cannot_start = why,
+            None => st.caution = selftest_caution(disk.usb_id).unwrap_or_default(),
+        }
     }
     let mut r = nvme_report(disk.number, &log, via.label());
     r.set_selftest(st);
@@ -1755,6 +1802,45 @@ fn read_via(disk: &PhysDisk, h: &Handle, via: Via) -> Option<SmartReport> {
 /// Prodotti JMicron che sono bridge USB-NVMe (gli altri sono bridge SATA).
 fn jmicron_nvme_product(pid: u16) -> bool {
     matches!(pid, 0x0583 | 0xA583 | 0x0581 | 0x0586 | 0x0562 | 0x1581 | 0x0580 | 0xF583)
+}
+
+/// Bridge JMicron JMS581 (152D:0581 e 1581): con un contenitore di questo tipo il comando di
+/// autodiagnosi è stato accettato, ma la sua esecuzione non è mai finita, nemmeno in 60 secondi;
+/// Windows ha reimpostato il bridge, che è ripartito solo togliendo l'alimentazione.
+fn jms581(usb_id: Option<(u16, u16)>) -> bool {
+    matches!(usb_id, Some((0x152D, 0x0581 | 0x1581)))
+}
+
+/// Perché l'autodiagnosi non si può avviare attraverso il bridge del contenitore, se è uno di
+/// quelli che si bloccano.
+pub fn selftest_blocked(usb_id: Option<(u16, u16)>) -> Option<String> {
+    let (vid, pid) = usb_id.filter(|_| jms581(usb_id))?;
+    Some(format!(
+        "Il bridge JMicron JMS581 di questo contenitore ({vid:04X}:{pid:04X}) accetta il comando di autodiagnosi \
+         ma non lo esegue: si blocca, Windows lo scollega e riparte solo togliendo l'alimentazione. Per fare la \
+         prova monta il disco in uno slot M.2 interno."
+    ))
+}
+
+/// Avvertenza per l'autodiagnosi attraverso un bridge USB-NVMe JMicron, l'unico tipo di bridge da
+/// cui la si può avviare: il comando passa da un protocollo proprio di JMicron. Sui JMS581 la prova
+/// è bloccata (vedi `selftest_blocked`), sugli altri modelli no, ma possono comportarsi allo stesso modo.
+pub fn selftest_caution(usb_id: Option<(u16, u16)>) -> Option<String> {
+    let (vid, pid) = usb_id?;
+    if vid != 0x152D || !jmicron_nvme_product(pid) || jms581(usb_id) {
+        return None;
+    }
+    let chip = match pid {
+        0x0583 | 0xA583 | 0xF583 => "JMicron JMS583",
+        0x0586 => "JMicron JMS586",
+        _ => "bridge JMicron",
+    };
+    Some(format!(
+        "Con i bridge JMicron USB-NVMe l'autodiagnosi passa da un protocollo proprio del bridge e può bloccarlo: \
+         un JMS581 (152D:0581) accetta il comando ma non lo esegue, e Windows scollega il contenitore, per questo \
+         sui JMS581 la prova non si avvia. Questo contenitore ha un {chip} ({vid:04X}:{pid:04X}). Prima di avviarla \
+         chiudi i file aperti sul disco; se il disco sparisce, scollega e ricollega il contenitore."
+    ))
 }
 
 const NOT_ANSWERING: &str = "Il disco non ha risposto in tempo ai comandi: riprova con «Rileggi».";
@@ -2349,10 +2435,21 @@ pub fn exclusive<T>(work: impl FnOnce() -> T) -> T {
 
 /// Avvia o interrompe l'autodiagnosi del disco. Richiede i privilegi di amministratore.
 pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
+    if disk.is_usb() && jms581(disk.usb_id) {
+        return Err("il bridge JMicron JMS581 del contenitore si blocca con questo comando, quindi non lo invio; \
+                    per la prova monta il disco in uno slot M.2 interno"
+            .into());
+    }
     if !win::is_elevated() {
         return Err("servono i privilegi di amministratore".into());
     }
     let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    // Il protocollo del bridge lo trova la lettura dello SMART. La finestra legge il disco prima di
+    // offrire la prova, la riga di comando no: senza questa lettura i comandi andrebbero per SAT,
+    // che i bridge USB-NVMe rifiutano.
+    if disk.is_usb() && known_via(disk).is_none() {
+        read_inner(disk, Mode::Full);
+    }
     STUCK.set(false);
     let h = win::open_device_rw(&disk.device_path())
         .map_err(|code| format!("impossibile aprire il disco: {} (codice {code})", win::error_text(code)))?;
@@ -2373,9 +2470,9 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
         const BRIDGE: &str = "il disco o il bridge USB";
         return match known_via(disk) {
             Some(Via::Ata(via)) => ata(via, BRIDGE),
-            Some(Via::Nvme(NvmeVia::Jmicron)) => jmicron_admin(&h, 0x14, 0xFFFF_FFFF, nvme_code, 0)
-                .map(|_| ())
-                .ok_or_else(|| refused(BRIDGE)),
+            Some(Via::Nvme(NvmeVia::Jmicron)) => {
+                jmicron_nvme(&h, 0x14, 0xFFFF_FFFF, nvme_code, 0).map(|_| ())
+            }
             Some(Via::Nvme(_)) => Err("il bridge USB di questo contenitore inoltra solo le letture".into()),
             Some(Via::ScsiLog | Via::Nothing) => Err("il bridge USB non inoltra i comandi al disco".into()),
             None => ata(AtaVia::Sat12, BRIDGE).or_else(|_| ata(AtaVia::Sat16, BRIDGE)),
@@ -2390,9 +2487,27 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
     }
 }
 
+/// Come `self_test`, raccogliendo una riga per ogni comando inviato, con il tempo di risposta.
+pub fn self_test_traced(disk: &PhysDisk, cmd: SelfTestCmd) -> (Result<(), String>, Vec<String>) {
+    TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+    let outcome = self_test(disk, cmd);
+    let lines = TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+    (outcome, lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jmicron_failure_texts() {
+        assert_eq!(fail_text(ScsiFail::Io(ERROR_SEM_TIMEOUT), 60), "non ha risposto entro 60 s");
+        let refused = ScsiFail::Rejected { status: 2, key: 5, asc: 0x20, ascq: 0 };
+        assert_eq!(fail_text(refused, 8), "ha rifiutato il comando (stato 02h, chiave 5h, codice 20/00)");
+        assert_eq!(nvme_status_text(0x01), "stato NVMe 0/01h, comando non riconosciuto");
+        assert_eq!(nvme_status_text(0x11D), "stato NVMe 1/1Dh, un'autodiagnosi è già in corso");
+        assert_eq!(nvme_status_text(0x4002), "stato NVMe 0/02h, campo del comando non valido");
+    }
 
     #[test]
     fn crucial_and_micron_models() {
@@ -2412,6 +2527,34 @@ mod tests {
         // Altri SSD (anche un NVMe Crucial, che non ha attributi ATA) e dischi a piatti.
         for m in ["Samsung SSD 870 QVO 4TB", "CT1000P3PSSD8", "ST4000LM024-2AN17V", "WDC WD40EFRX-68N32N0"] {
             assert!(!crucial_micron(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn caution_only_for_jmicron_nvme_bridges() {
+        let jms583 = selftest_caution(Some((0x152D, 0x0583))).unwrap();
+        assert!(jms583.contains("un JMS581 (152D:0581) accetta il comando ma non lo esegue"));
+        assert!(jms583.contains("Questo contenitore ha un JMicron JMS583 (152D:0583)."));
+        let jms586 = selftest_caution(Some((0x152D, 0x0586))).unwrap();
+        assert!(jms586.contains("Questo contenitore ha un JMicron JMS586 (152D:0586)."));
+        let unnamed = selftest_caution(Some((0x152D, 0x0562))).unwrap();
+        assert!(unnamed.contains("Questo contenitore ha un bridge JMicron (152D:0562)."));
+        // JMS581: niente avvertenza, perché la prova è bloccata.
+        assert!(selftest_caution(Some((0x152D, 0x0581))).is_none());
+        // Bridge JMicron USB-SATA, Realtek, nessun USB: niente avvertenza.
+        assert!(selftest_caution(Some((0x152D, 0x0578))).is_none());
+        assert!(selftest_caution(Some((0x0BDA, 0x9210))).is_none());
+        assert!(selftest_caution(None).is_none());
+    }
+
+    #[test]
+    fn selftest_blocked_only_on_jms581() {
+        for pid in [0x0581, 0x1581] {
+            let why = selftest_blocked(Some((0x152D, pid))).unwrap();
+            assert!(why.contains(&format!("JMS581 di questo contenitore (152D:{pid:04X})")), "{why}");
+        }
+        for id in [Some((0x152D, 0x0583)), Some((0x152D, 0x0586)), Some((0x152D, 0x0578)), Some((0x0BDA, 0x9210)), None] {
+            assert!(selftest_blocked(id).is_none(), "{id:?}");
         }
     }
 }

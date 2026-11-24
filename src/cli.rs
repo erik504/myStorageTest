@@ -24,9 +24,10 @@ Uso:
   mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
                                     (da amministratore; senza FILE li stampa)
   mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore)
-  mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
-  mystoragetest --selftest N breve|estesa|stop
-                                    avvia o interrompe l'autodiagnosi del disco N (da amministratore)
+  mystoragetest --selftest [X:|N]   autodiagnosi dei dischi: stato e prove registrate
+  mystoragetest --selftest X:|N breve|estesa|stop
+                                    avvia o interrompe l'autodiagnosi del disco del volume X: o del
+                                    disco N (da amministratore), con i comandi inviati e i loro tempi
   mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
   mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
   mystoragetest --test X: [opzioni] esegue le prove sul volume X:
@@ -552,28 +553,53 @@ fn test(args: &[String]) -> i32 {
     }
 }
 
-/// `--selftest [N] [breve|estesa|stop]`: stato dell'autodiagnosi, oppure avvio o interruzione sul disco N.
+/// `--selftest [X:|N] [breve|estesa|stop]`: stato dell'autodiagnosi, oppure avvio o interruzione
+/// sul disco del volume X: o sul disco N, con i comandi inviati e i loro tempi.
 fn selftest_cmd(args: &[String]) -> i32 {
-    let only: Option<u32> = args.first().and_then(|s| s.parse().ok());
-    let action = args.iter().find_map(|a| match a.to_lowercase().as_str() {
+    let action_of = |a: &str| match a.to_lowercase().as_str() {
         "breve" | "short" => Some(smart::SelfTestCmd::Short),
         "estesa" | "esteso" | "long" | "extended" => Some(smart::SelfTestCmd::Extended),
         "stop" | "interrompi" | "abort" => Some(smart::SelfTestCmd::Abort),
         _ => None,
-    });
+    };
+    let action = args.iter().find_map(|a| action_of(a));
     let inv = disks::scan();
+    let which = args.first().map(String::as_str).filter(|a| action_of(a).is_none());
+    let only: Option<u32> = which.and_then(|w| {
+        w.parse().ok().or_else(|| {
+            let mut chars = w.chars();
+            let letter = chars.next().filter(char::is_ascii_alphabetic)?.to_ascii_uppercase();
+            matches!(chars.as_str(), "" | ":" | ":\\").then_some(())?;
+            inv.volume(letter)?.disks.first().copied()
+        })
+    });
+    if let Some(w) = which.filter(|_| only.is_none_or(|n| inv.disk(n).is_none())) {
+        println!("Volume o disco non trovato: {w}");
+        return 2;
+    }
     if let Some(cmd) = action {
         let Some(disk) = only.and_then(|n| inv.disk(n)) else {
-            println!("Indicare il numero del disco, per esempio: --selftest 2 breve");
+            println!("Indicare il volume o il numero del disco, per esempio: --selftest H: breve");
             return 2;
         };
-        return match smart::self_test(disk, cmd) {
+        if let Some(caution) = smart::selftest_caution(disk.usb_id).filter(|_| cmd != smart::SelfTestCmd::Abort) {
+            println!("Attenzione. {caution}\n");
+        }
+        println!("Disco {} — {} · inizio {}", disk.number, disk.title(), crate::win::now_string());
+        let started = std::time::Instant::now();
+        let (outcome, lines) = smart::self_test_traced(disk, cmd);
+        let secs = format!("{:.1}", started.elapsed().as_secs_f64()).replace('.', ",");
+        for l in &lines {
+            println!("  {l}");
+        }
+        let end = crate::win::now_string();
+        return match outcome {
             Ok(()) => {
-                println!("{} sul disco {}: comando accettato.", cmd.label(), disk.number);
+                println!("{} sul disco {}: comando accettato in {secs} s (fine {end}).", cmd.label(), disk.number);
                 0
             }
             Err(e) => {
-                println!("{} sul disco {} non riuscita: {e}.", cmd.label(), disk.number);
+                println!("{} sul disco {} non riuscita dopo {secs} s (fine {end}): {e}.", cmd.label(), disk.number);
                 2
             }
         };
@@ -604,6 +630,9 @@ fn selftest_cmd(args: &[String]) -> i32 {
             println!("  Si può avviare da qui");
         } else {
             println!("  Non si può avviare da qui: {}", st.cannot_start);
+        }
+        if !st.caution.is_empty() {
+            println!("  Attenzione. {}", st.caution);
         }
         if st.entries.is_empty() {
             println!("  Nessuna prova registrata");

@@ -3218,6 +3218,27 @@ impl App {
                         ui.label(RichText::new(format!("⚠ {issue}")).color(WARN));
                     }
                     ui.add_space(4.0);
+                    // Solo per le verifiche automatiche: la sezione con un bridge JMicron su un disco
+                    // qualunque, per vederla senza un contenitore JMicron collegato. La variabile dà il
+                    // prodotto in esadecimale (0581 è un JMS581, con la prova bloccata).
+                    let faked;
+                    let fake_pid = std::env::var("MYSTORAGETEST_FAKE_JMICRON")
+                        .ok()
+                        .filter(|_| self.script.is_some())
+                        .and_then(|p| u16::from_str_radix(&p, 16).ok());
+                    let r = if let Some(pid) = fake_pid {
+                        let mut f = r.clone();
+                        let id = Some((0x152D, pid));
+                        f.selftest.supported = true;
+                        match smart::selftest_blocked(id) {
+                            Some(why) => f.selftest.cannot_start = why,
+                            None => f.selftest.caution = smart::selftest_caution(id).unwrap_or_default(),
+                        }
+                        faked = f;
+                        &faked
+                    } else {
+                        r
+                    };
                     selftest_section(ui, *n, r, self.selftest_note.get(n), sending, &mut action);
                     ui.add_space(4.0);
                     egui::Grid::new(("smart", *n)).num_columns(4).spacing([18.0, 5.0]).striped(true).show(ui, |ui| {
@@ -4871,12 +4892,15 @@ fn selftest_section(
                     if ui.add_enabled(can && running, egui::Button::new("Interrompi")).clicked() {
                         *action = Some((disk, SelfTestCmd::Abort));
                     }
-                    let extended = format!("Estesa{}", minutes(st.extended_minutes));
-                    if ui.add_enabled(can && !running, egui::Button::new(extended)).clicked() {
+                    // Con un'avvertenza (bridge che potrebbe bloccarsi) la si ritrova anche sui pulsanti.
+                    let start = |ui: &mut Ui, label: String| {
+                        let b = ui.add_enabled(can && !running, egui::Button::new(label));
+                        if st.caution.is_empty() { b } else { b.on_hover_text(&st.caution) }
+                    };
+                    if start(ui, format!("Estesa{}", minutes(st.extended_minutes))).clicked() {
                         *action = Some((disk, SelfTestCmd::Extended));
                     }
-                    let short = format!("Breve{}", minutes(st.short_minutes));
-                    if ui.add_enabled(can && !running, egui::Button::new(short)).clicked() {
+                    if start(ui, format!("Breve{}", minutes(st.short_minutes))).clicked() {
                         *action = Some((disk, SelfTestCmd::Short));
                     }
                     if sending {
@@ -4893,6 +4917,9 @@ fn selftest_section(
                  tutta la superficie. Intanto il disco resta utilizzabile. L'esito lo registra il disco stesso; \
                  il programma lo rilegge e, con il monitoraggio attivo, avvisa se una prova fallisce.",
             ));
+            if !st.caution.is_empty() {
+                ui.label(RichText::new(format!("Attenzione. {}", st.caution)).color(WARN).size(13.0));
+            }
             if let Some((kind, done)) = st.running {
                 ui.horizontal(|ui| {
                     ui.spinner();

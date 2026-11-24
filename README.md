@@ -133,6 +133,15 @@ bloccata viene segnalata mentre è ancora in corso, e «Ferma» la annulla.
 **SMART** di ogni disco, con gli attributi in chiaro e i valori anomali evidenziati, e l'**autodiagnosi**
 (self-test) del disco: prova in corso con l'avanzamento, prove registrate dal disco con il loro esito,
 avvio della prova breve o estesa e interruzione. Un'autodiagnosi fallita rende critico lo stato del disco.
+Nei contenitori USB-NVMe la prova si avvia solo attraverso i bridge JMicron, con un loro protocollo.
+Sui **JMS581** (152D:0581 e 1581) è bloccata, con la spiegazione: un contenitore con questo bridge
+accetta il comando ma non lo esegue, nemmeno in 60 secondi; Windows lo reimposta e lo scollega, e il
+bridge riparte solo togliendo l'alimentazione. Per gli altri JMicron (JMS583, JMS586) la sezione avvisa
+che il bridge può bloccarsi allo stesso modo, dice quale bridge ha il contenitore e consiglia di chiudere
+prima i file aperti sul disco. Se la prova non parte, la nota dice a quale passo del protocollo si è
+fermata e perché (bridge che non risponde o rifiuta, oppure lo stato NVMe con cui risponde il disco).
+Da riga di comando `--selftest` legge prima lo SMART dei dischi USB, come fa la finestra, per sapere quale
+protocollo usare con il bridge.
 Gli attributi 202 e 206 hanno un significato da dischi a piatti (errori «Data Address Mark», altezza di
 volo delle testine) che negli SSD cambia con il produttore, come nella tabella di smartmontools: negli
 SSD Crucial e Micron il 202 è la vita consumata in percentuale, con la vita residua nel dettaglio e un
@@ -225,7 +234,8 @@ prima lettura il programma cerca quello giusto, in quest'ordine, e lo ricorda pe
 Alle chiavette e alle schede di memoria (supporti rimovibili) vanno solo i comandi SAT: di norma non hanno
 dati SMART e il programma lo dice, senza riprovare a ogni lettura. Se un disco non risponde in tempo la
 ricerca si ferma subito, invece di insistere con altri comandi. Fra i bridge USB-NVMe solo JMicron inoltra
-il comando di avvio dell'autodiagnosi; Realtek e ASMedia inoltrano soltanto le letture.
+il comando di avvio dell'autodiagnosi, tranne il JMS581 che si blocca; Realtek e ASMedia inoltrano soltanto
+le letture.
 
 «Rapporto di diagnosi», nella scheda SMART, scrive in `%LOCALAPPDATA%\myStorageTest\diagnosi-smart.txt` i
 comandi inviati a ogni disco e le risposte ricevute, e lo apre: serve a capire perché un disco o un bridge
@@ -250,9 +260,10 @@ mystoragetest --graph             il Grafo Storage come testo: collegamenti, ban
 mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
 mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
 mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore), con il riepilogo per tipo
-mystoragetest --selftest [N]      autodiagnosi dei dischi: stato e prove registrate
-mystoragetest --selftest N breve|estesa|stop
-                                  avvia o interrompe l'autodiagnosi del disco N (da amministratore)
+mystoragetest --selftest [X:|N]   autodiagnosi dei dischi: stato e prove registrate
+mystoragetest --selftest X:|N breve|estesa|stop
+                                  avvia o interrompe l'autodiagnosi del disco del volume X: o del
+                                  disco N (da amministratore), con i comandi inviati e i loro tempi
 mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
 mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
 mystoragetest --test X: [opzioni] esegue le prove sul volume X:
@@ -308,6 +319,8 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - SMART senza privilegi su sei NVMe e due SATA interni; sul Crucial MX500 l'attributo 202 (valore grezzo 24, attuale 76) letto come vita consumata 24 % e vita residua 76 %, coerente con i 373 cicli di cancellazione medi, e il 206 come tasso di errori di scrittura, confrontati con la voce «Crucial/Micron Client SSDs» della tabella di smartmontools; il riconoscimento dei modelli Crucial e Micron ha una prova automatica;
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
+- autodiagnosi attraverso un bridge JMicron JMS581 (152D:0581), da amministratore, con `--selftest H: breve`: le letture dello SMART attraverso il bridge rispondono in circa 200 ms, il comando di avvio viene accettato, ma la sua esecuzione non finisce, né in 8 né in 60 secondi; Windows reimposta il bridge, che va scollegato e ricollegato (sette tentativi, a 10 e a 5 Gbit/s). Da qui il blocco della prova sui JMS581;
+- blocco e avvertenza per l'autodiagnosi attraverso i bridge JMicron USB-NVMe: prove automatiche su quali bridge sono bloccati (JMS581, 0581 e 1581) e quali hanno l'avvertenza (JMS583, JMS586 e gli altri PID JMicron USB-NVMe; non i bridge JMicron USB-SATA, Realtek e i dischi non USB), e i due testi verificati a schermo nella scheda SMART su un disco interno con un bridge simulato (`MYSTORAGETEST_FAKE_JMICRON=0581` e `=0583`);
 - decodifica di comando e risposta negli eventi 153 e 154, con prove automatiche (`cargo test`) sui dati di eventi veri e confrontata con la decodifica a mano di circa 100.000 eventi reali: un SSD NVMe in contenitore USB con bridge JMicron che a tratti smette di rispondere (letture, scritture, svuotamento della cache, verifica di prontezza e lettura della capacità, tutte con errore hardware 4/44/81) e dischi USB con letture ritentate per tempo scaduto o interrotte;
 - storico delle temperature degli SSD interni;
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
@@ -325,7 +338,7 @@ Non ancora verificato:
 
 - **collegamento SATA dentro un contenitore USB**: si legge solo da amministratore, attraverso il bridge;
 - **«Espelli»**: la richiesta a Windows è quella documentata per la rimozione sicura e il dispositivo a cui va è stato controllato, ma l'espulsione vera non è stata eseguita, per non scollegare i dischi in uso; l'espulsione del solo supporto (lettori con più alloggiamenti, supporti rimovibili non USB) non ha avuto un dispositivo su cui girare;
-- **avvio e interruzione dell'autodiagnosi**, su qualunque disco: richiedono l'amministratore; i comandi sono scritti secondo le specifiche NVMe e ATA e la documentazione di Windows, ma non sono stati eseguiti;
+- **avvio e interruzione dell'autodiagnosi**, sui dischi interni e attraverso i bridge diversi dal JMS581: richiedono l'amministratore; i comandi sono scritti secondo le specifiche NVMe e ATA e la documentazione di Windows, ma non sono stati eseguiti;
 - **SMART dei dischi USB con bridge Realtek e ASMedia, con i vecchi bridge JMicron, Cypress, Sunplus e Prolific** e **registri SCSI**: i comandi sono scritti secondo i protocolli documentati ma non c'era un dispositivo su cui eseguirli («Rapporto di diagnosi» serve proprio a controllarli);
 - **disco fermo lasciato stare**: la domanda al disco funziona, ma un disco davvero fermo durante una lettura periodica non è ancora stato osservato;
 - **scansione della superficie di un volume vero**: richiede l'amministratore; tutto il resto della scansione è stato provato leggendo un file al posto del volume;
