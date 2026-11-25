@@ -976,6 +976,16 @@ fn disk_key(d: &PhysDisk) -> String {
     format!("{}|{}", d.model, d.serial)
 }
 
+/// Quale dispositivo occupa un numero di disco: staccato un contenitore USB e collegato un altro,
+/// Windows può dare al nuovo lo stesso numero (e la stessa lettera), ma non la stessa identità.
+fn disk_identity(d: &PhysDisk) -> String {
+    format!("{}|{}|{}|{}|{:?}", d.instance_id, d.model, d.serial, d.size, d.usb_id)
+}
+
+fn identities(disks: &[PhysDisk]) -> HashMap<u32, String> {
+    disks.iter().map(|d| (d.number, disk_identity(d))).collect()
+}
+
 /// Campioni di temperatura conservati per disco (a 30 secondi sono circa sette giorni).
 const TEMPS_MAX: usize = 20_000;
 
@@ -987,6 +997,9 @@ struct SmartBatch {
     asleep: Vec<u32>,
     /// Rapporto di diagnosi delle letture complete: disco, ora, testo.
     diagnoses: Vec<(u32, String, String)>,
+    /// Identità dei dischi letti, per scartare le letture di un disco che nel frattempo è stato
+    /// sostituito da un altro con lo stesso numero.
+    ids: HashMap<u32, String>,
 }
 
 /// Esito di un rapporto di diagnosi chiesto dall'utente.
@@ -994,6 +1007,8 @@ struct DiagDone {
     list: Vec<smart::Diagnosis>,
     /// Il file in cui è stato salvato, se era il rapporto di tutti i dischi.
     saved: Option<Result<PathBuf, String>>,
+    /// Identità dei dischi esaminati (vedi `SmartBatch::ids`).
+    ids: HashMap<u32, String>,
 }
 
 /// Intervallo in parole: "30 secondi", "5 minuti".
@@ -1092,6 +1107,10 @@ struct Script {
     second: Option<Sel>,
     /// Sequenza dedicata alla scansione della superficie (`MYSTORAGETEST_AUTOTEST=superficie`).
     surface: bool,
+    /// Sequenza dedicata a un disco sostituito da un altro (`MYSTORAGETEST_AUTOTEST=sostituzione`).
+    swap: bool,
+    /// Quando è stato sostituito.
+    swapped_at: Option<Instant>,
     /// Quello che la sequenza della superficie osserva, scritto in `superficie.txt`.
     report: Vec<String>,
 }
@@ -1141,6 +1160,8 @@ pub struct App {
     side_hover: Option<Sel>,
     smart: HashMap<u32, SmartReport>,
     smart_rx: Option<Receiver<SmartBatch>>,
+    /// Dischi appena comparsi, o sostituiti da un altro con lo stesso numero, da leggere subito.
+    fresh_disks: HashSet<u32>,
     /// Dischi trovati fermi all'ultima lettura periodica e lasciati stare: da che ora.
     asleep: HashMap<u32, String>,
     /// Rapporto di diagnosi in preparazione, e l'esito dell'ultimo salvato in un file: riuscito o
@@ -1252,6 +1273,8 @@ impl App {
             home: None,
             second: None,
             surface: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("superficie"),
+            swap: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("sostituzione"),
+            swapped_at: None,
             report: Vec::new(),
         });
         let scripted = script.is_some();
@@ -1326,6 +1349,7 @@ impl App {
             runs: HashMap::new(),
             smart: HashMap::new(),
             smart_rx: None,
+            fresh_disks: HashSet::new(),
             events: Vec::new(),
             events_rx: None,
             events_hours: 24,
@@ -1420,7 +1444,10 @@ impl App {
         }
         let seen: HashSet<String> = self.diag.keys().cloned().collect();
         self.smart_rx = Some(background(ctx, move || {
-            let mut batch = SmartBatch::default();
+            let mut batch = SmartBatch {
+                ids: identities(&list),
+                ..Default::default()
+            };
             for d in &list {
                 // Le letture complete — all'avvio, con «Rileggi» e al primo incontro con un disco
                 // appena collegato — tengono traccia dei comandi: è il rapporto di diagnosi che la
@@ -1484,6 +1511,7 @@ impl App {
             self.diag_note = None;
         }
         self.diag_rx = Some(background(ctx, move || {
+            let ids = identities(&list);
             let list = smart::diagnose(&list);
             let saved = to_file.then(|| {
                 let path = dir.join("diagnosi-smart.txt");
@@ -1492,7 +1520,7 @@ impl App {
                     .map(|_| path)
                     .map_err(|e| e.to_string())
             });
-            DiagDone { list, saved }
+            DiagDone { list, saved, ids }
         }));
     }
 
@@ -1527,9 +1555,20 @@ impl App {
     }
 
     /// Accoglie una lettura SMART: aggiorna lo storico delle temperature e segue le autodiagnosi.
-    fn smart_arrived(&mut self, batch: SmartBatch) {
+    fn smart_arrived(&mut self, mut batch: SmartBatch) {
         let secs = self.session_start.elapsed().as_secs_f64();
         let now = clock(self.session_start_ft, secs);
+        // Letture di un disco che, mentre le si faceva, è stato sostituito da un altro con lo
+        // stesso numero: non sono sue, e il nuovo disco è già in coda per essere letto.
+        let replaced: HashSet<u32> = batch
+            .ids
+            .iter()
+            .filter(|(n, id)| self.inventory.disk(**n).map(disk_identity).as_ref() != Some(*id))
+            .map(|(n, _)| *n)
+            .collect();
+        batch.diagnoses.retain(|(n, ..)| !replaced.contains(n));
+        batch.asleep.retain(|n| !replaced.contains(n));
+        batch.reports.retain(|r| !replaced.contains(&r.disk));
         // Il rapporto di una lettura normale non sostituisce quello chiesto apposta, che ha
         // riprovato tutte le strade.
         for (n, at, text) in batch.diagnoses {
@@ -3939,6 +3978,104 @@ impl App {
         }
     }
 
+    /// Verifica automatica (`MYSTORAGETEST_AUTOTEST=sostituzione`): al posto del disco del volume
+    /// scelto ne compare un altro con lo stesso numero, come quando si stacca un contenitore USB e se
+    /// ne collega un altro. Il disco «di prima» è finto: identità e SMART di un contenitore JMicron
+    /// JMS581, con la lettura periodica rimandata di dieci minuti. La rilettura dell'elenco dei dischi
+    /// deve accorgersi che il disco è un altro, togliere lo SMART finto e rileggere quello vero.
+    /// Scrive in `sostituzione.txt` quello che osserva.
+    fn drive_swap_script(&mut self, ctx: &egui::Context) {
+        let Some(n) = self.sel_disks().first().copied() else { return };
+        let step = {
+            let script = self.script.as_mut().unwrap();
+            script.step += 1;
+            script.step - 1
+        };
+        let wait = |app: &mut App, ms: u64| {
+            app.script.as_mut().unwrap().next_at = Instant::now() + Duration::from_millis(ms);
+        };
+        let again = |app: &mut App, step: u32| {
+            let script = app.script.as_mut().unwrap();
+            script.step = step;
+            script.next_at = Instant::now() + Duration::from_millis(250);
+        };
+        let shot = |app: &mut App, name: &str| script_shot(ctx, app.script.as_mut().unwrap(), name);
+        let note = |app: &mut App, text: String| {
+            let script = app.script.as_mut().unwrap();
+            script.report.push(text);
+            let _ = std::fs::create_dir_all(&script.dir);
+            let _ = std::fs::write(script.dir.join("sostituzione.txt"), script.report.join("\n") + "\n");
+        };
+        let seen = |app: &App| {
+            let disk = app.inventory.disk(n).map(|d| d.title()).unwrap_or_else(|| "assente".into());
+            let smart = app.smart.get(&n).map_or_else(
+                || "nessuno".to_string(),
+                |r| {
+                    let start = if r.selftest.cannot_start.is_empty() { "autodiagnosi avviabile" } else { &r.selftest.cannot_start };
+                    format!("{} · {start}", r.method)
+                },
+            );
+            format!("disco {n}: {disk} · SMART: {smart}")
+        };
+        let since = |app: &App| app.script.as_ref().unwrap().swapped_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        match step {
+            // Attende la prima lettura dello SMART.
+            0 => {
+                if self.smart.contains_key(&n) && self.smart_rx.is_none() {
+                    self.tab = Tab::Smart;
+                    wait(self, 800);
+                } else {
+                    again(self, 0);
+                }
+            }
+            1 => {
+                note(self, format!("prima — {}", seen(self)));
+                shot(self, "1-prima.png");
+            }
+            2 => {
+                if let Some(d) = self.inventory.disks.iter_mut().find(|d| d.number == n) {
+                    d.vendor = "General".into();
+                    d.model = "General Generic PCIE".into();
+                    d.serial = "FINTO".into();
+                    d.usb_id = Some((0x152D, 0x0581));
+                    d.instance_id.push_str("-FINTO");
+                }
+                if let Some(r) = self.smart.get_mut(&n) {
+                    r.method = "Bridge USB-NVMe JMicron (finto)".into();
+                    r.selftest.supported = true;
+                    r.selftest.caution.clear();
+                    r.selftest.cannot_start = smart::selftest_blocked(Some((0x152D, 0x0581))).unwrap_or_default();
+                }
+                // Come con l'intervallo normale: la lettura periodica non arriva prima della rilettura
+                // dell'elenco dei dischi, che parte fra 4 secondi.
+                self.next_sample = Instant::now() + Duration::from_secs(600);
+                self.last_scan = Instant::now();
+                self.script.as_mut().unwrap().swapped_at = Some(Instant::now());
+                wait(self, 300);
+            }
+            3 => {
+                note(self, format!("disco di prima (finto) — {}", seen(self)));
+                shot(self, "2-prima-finto.png");
+            }
+            // Attende lo SMART del disco vero, al massimo 30 secondi.
+            4 => {
+                let real = self.smart.get(&n).is_some_and(|r| !r.method.contains("finto"));
+                if real || since(self) > 30.0 {
+                    let text = format!("dopo {:.1} s — {}", since(self), seen(self));
+                    note(self, text);
+                    wait(self, 500);
+                } else {
+                    again(self, 4);
+                }
+            }
+            5 => shot(self, "3-dopo.png"),
+            _ => {
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
     fn drive_script(&mut self, ctx: &egui::Context) {
         let Some(script) = &mut self.script else { return };
         ctx.request_repaint_after(Duration::from_millis(40));
@@ -3947,6 +4084,10 @@ impl App {
         }
         if script.surface {
             self.drive_surface_script(ctx);
+            return;
+        }
+        if script.swap {
+            self.drive_swap_script(ctx);
             return;
         }
         let shot = |script: &mut Script, name: &str| {
@@ -5861,18 +6002,32 @@ impl eframe::App for App {
         }
 
         // Risultati dei lavori in background.
-        if let Some(rx) = &self.inventory_rx {
-            if let Ok(inv) = rx.try_recv() {
-                self.inventory = inv;
-                self.inventory_rx = None;
-                let still_there = match self.selected {
-                    Some(Sel::Volume(l)) => self.inventory.volume(l).is_some(),
-                    Some(Sel::Disk(n)) => self.inventory.disk(n).is_some(),
-                    None => false,
-                };
-                if !still_there && !self.testing() {
-                    self.selected = self.inventory.volumes.first().map(|v| Sel::Volume(v.letter));
+        let rescanned = self.inventory_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(inv) = rescanned {
+            let before = identities(&self.inventory.disks);
+            self.inventory = inv;
+            self.inventory_rx = None;
+            // Un disco sparito, o sostituito da un altro con lo stesso numero: quello che si sapeva
+            // di lui non vale per il nuovo. I dischi nuovi si leggono subito, senza aspettare la
+            // prossima lettura periodica.
+            let after = identities(&self.inventory.disks);
+            for (n, id) in &before {
+                if after.get(n) != Some(id) {
+                    self.smart.remove(n);
+                    self.asleep.remove(n);
+                    self.selftest_running.remove(n);
+                    self.selftest_note.remove(n);
                 }
+            }
+            self.fresh_disks
+                .extend(after.iter().filter(|(n, id)| before.get(n) != Some(*id)).map(|(n, _)| *n));
+            let still_there = match self.selected {
+                Some(Sel::Volume(l)) => self.inventory.volume(l).is_some(),
+                Some(Sel::Disk(n)) => self.inventory.disk(n).is_some(),
+                None => false,
+            };
+            if !still_there && !self.testing() {
+                self.selected = self.inventory.volumes.first().map(|v| Sel::Volume(v.letter));
             }
         }
         if let Some(rx) = &self.smart_rx {
@@ -5886,9 +6041,13 @@ impl eframe::App for App {
                 self.diag_rx = None;
                 // Il rapporto di ogni disco resta nella scheda Info, e lo SMART letto nel prepararlo
                 // aggiorna quello mostrato.
-                let mut batch = SmartBatch::default();
+                let mut batch = SmartBatch {
+                    ids: done.ids,
+                    ..Default::default()
+                };
                 for d in done.list {
-                    if let Some(disk) = self.inventory.disk(d.disk) {
+                    let same = |disk: &&PhysDisk| batch.ids.get(&d.disk) == Some(&disk_identity(disk));
+                    if let Some(disk) = self.inventory.disk(d.disk).filter(same) {
                         self.diag.insert(disk_key(disk), (d.at, d.text));
                     }
                     batch.reports.extend(d.report);
@@ -5975,9 +6134,24 @@ impl eframe::App for App {
             }
         }
         self.note_surface_progress();
-        // Rilettura periodica di temperature e autodiagnosi, anche con la finestra nascosta.
+        if self.smart_rx.is_none() && !self.fresh_disks.is_empty() {
+            let fresh = std::mem::take(&mut self.fresh_disks);
+            self.read_smart(ctx, true, |d| fresh.contains(&d.number));
+        }
+        // Rilettura periodica di temperature e autodiagnosi, anche con la finestra nascosta. Con la
+        // finestra nascosta l'elenco dei dischi non si rilegge da solo: lo si rilegge prima, perché
+        // al posto di un disco ne può essere arrivato un altro con lo stesso numero.
         if self.smart_rx.is_none() && Instant::now() >= self.next_sample {
-            self.sample_smart(ctx);
+            // L'elenco è vecchio se è stato riletto prima che la lettura periodica fosse dovuta.
+            let stale = self.last_scan < self.next_sample;
+            if self.hidden && stale && !self.testing() && self.eject_rx.is_none() {
+                if self.inventory_rx.is_none() {
+                    self.last_scan = Instant::now();
+                    self.inventory_rx = Some(background(ctx, disks::scan));
+                }
+            } else if self.inventory_rx.is_none() {
+                self.sample_smart(ctx);
+            }
         }
         ctx.request_repaint_after(self.next_sample.saturating_duration_since(Instant::now()) + Duration::from_millis(50));
 

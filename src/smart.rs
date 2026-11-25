@@ -1481,8 +1481,21 @@ fn ata_read(disk: &PhysDisk, h: &Handle, via: AtaVia, predict: bool) -> Option<S
 // Comandi NVMe attraverso un bridge USB
 // ---------------------------------------------------------------------------------------------
 
-const FORWARD_ONLY_READS: &str =
-    "Il bridge USB di questo contenitore inoltra solo le letture: l'autodiagnosi non si può avviare da qui.";
+/// Perché attraverso i bridge USB-NVMe Realtek e ASMedia l'autodiagnosi non si avvia.
+fn forward_only_reads(via: NvmeVia) -> &'static str {
+    match via {
+        // Provato su un RTL9210B (0BDA:9210, firmware 1.00): il comando di lettura E4h con il
+        // codice della prova viene rifiutato come «comando non valido» (20/00), con e senza dati.
+        NvmeVia::Realtek => {
+            "Il bridge Realtek di questo contenitore inoltra al disco solo i comandi di lettura: un RTL9210B ha \
+             rifiutato quello di autodiagnosi. La prova non si può avviare da qui."
+        }
+        _ => {
+            "Per i bridge ASMedia è noto solo un comando di lettura, che non porta quello di autodiagnosi: la prova \
+             non si può avviare da qui."
+        }
+    }
+}
 
 /// Contenitori USB-NVMe con bridge Realtek RTL9210/RTL9211/RTL9220: inoltra solo Identify e Get
 /// Log Page, e del registro al massimo 512 byte (oltre, restituisce dati vecchi).
@@ -1634,7 +1647,7 @@ fn nvme_bridge_read(disk: &PhysDisk, h: &Handle, via: NvmeVia, strict: bool) -> 
     let tests = via.log(h, 0x06, via.tests_len());
     let mut st = nvme_selftest(identify.as_deref(), tests.as_deref());
     if via != NvmeVia::Jmicron && st.supported {
-        st.cannot_start = FORWARD_ONLY_READS.into();
+        st.cannot_start = forward_only_reads(via).into();
     }
     if via == NvmeVia::Jmicron && st.supported {
         match selftest_blocked(disk.usb_id) {
@@ -2473,7 +2486,10 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
             Some(Via::Nvme(NvmeVia::Jmicron)) => {
                 jmicron_nvme(&h, 0x14, 0xFFFF_FFFF, nvme_code, 0).map(|_| ())
             }
-            Some(Via::Nvme(_)) => Err("il bridge USB di questo contenitore inoltra solo le letture".into()),
+            Some(Via::Nvme(NvmeVia::Realtek)) => {
+                Err("il bridge Realtek del contenitore inoltra al disco solo i comandi di lettura".into())
+            }
+            Some(Via::Nvme(_)) => Err("per il bridge ASMedia del contenitore è noto solo un comando di lettura".into()),
             Some(Via::ScsiLog | Via::Nothing) => Err("il bridge USB non inoltra i comandi al disco".into()),
             None => ata(AtaVia::Sat12, BRIDGE).or_else(|_| ata(AtaVia::Sat16, BRIDGE)),
         };
@@ -2487,10 +2503,82 @@ pub fn self_test(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<(), String> {
     }
 }
 
-/// Come `self_test`, raccogliendo una riga per ogni comando inviato, con il tempo di risposta.
-pub fn self_test_traced(disk: &PhysDisk, cmd: SelfTestCmd) -> (Result<(), String>, Vec<String>) {
+/// Prova sperimentale, solo da riga di comando: l'autodiagnosi attraverso un bridge Realtek
+/// RTL9210/9211/9220. L'unico comando proprietario noto di questi bridge (E4h) è una lettura che
+/// porta il codice del comando NVMe e il byte basso di CDW10, cioè proprio il codice della prova;
+/// non porta il namespace, e non si sa che cosa il bridge faccia con un comando senza dati. Si manda
+/// prima senza dati e, se il bridge lo rifiuta, come una lettura di 512 byte. Se la prova sia
+/// partita lo dice il registro delle prove del disco, letto prima e dopo.
+pub fn realtek_selftest_trial(disk: &PhysDisk, cmd: SelfTestCmd) -> Result<String, String> {
+    if !win::is_elevated() {
+        return Err("servono i privilegi di amministratore".into());
+    }
+    let _one = BUS.lock().unwrap_or_else(|e| e.into_inner());
+    if known_via(disk).is_none() {
+        read_inner(disk, Mode::Full);
+    }
+    if !matches!(known_via(disk), Some(Via::Nvme(NvmeVia::Realtek))) {
+        return Err("il disco non risulta dietro un bridge USB-NVMe Realtek".into());
+    }
+    STUCK.set(false);
+    let h = win::open_device_rw(&disk.device_path())
+        .map_err(|code| format!("impossibile aprire il disco: {} (codice {code})", win::error_text(code)))?;
+    let stc: u8 = match cmd {
+        SelfTestCmd::Short => 0x1,
+        SelfTestCmd::Extended => 0x2,
+        SelfTestCmd::Abort => 0xF,
+    };
+    // Prova in corso e percentuale, dai primi due byte del registro delle prove (06h).
+    let state = || realtek_nvme(&h, 0x02, 0x06, 512).map(|log| (log[0] & 0x0F, log[1] & 0x7F));
+    let before = state();
+    trace(|| format!("prima del comando: {}", running_text(before)));
+    let send = |len: usize, dir: Dir| {
+        let mut cdb = [0u8; 16];
+        cdb[0] = 0xE4;
+        cdb[1] = len as u8;
+        cdb[2] = (len >> 8) as u8;
+        cdb[3] = 0x14; // Device Self-test
+        cdb[4] = stc;
+        let what = if len == 0 { "Realtek NVMe: Device Self-test senza dati" } else { "Realtek NVMe: Device Self-test come lettura" };
+        scsi_exec(&h, what, &cdb, dir, &[], len, SCSI_TIMEOUT, false)
+    };
+    let sent = match send(0, Dir::None) {
+        Err(ScsiFail::Rejected { .. }) => send(512, Dir::In),
+        other => other,
+    };
+    if let Err(f) = sent {
+        return Err(format!("il bridge USB {}", fail_text(f, SCSI_TIMEOUT)));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let after = state();
+    trace(|| format!("2 s dopo il comando: {}", running_text(after)));
+    let started = matches!(after, Some((op, _)) if op == stc);
+    let stopped = cmd == SelfTestCmd::Abort && matches!(after, Some((0, _)));
+    if started || stopped {
+        Ok(format!("il bridge ha inoltrato il comando: {}", running_text(after)))
+    } else {
+        Err(format!(
+            "il bridge ha accettato il comando, ma il registro del disco non cambia come dovrebbe ({})",
+            running_text(after)
+        ))
+    }
+}
+
+/// Prova in corso secondo il registro NVMe delle prove: tipo e percentuale.
+fn running_text(state: Option<(u8, u8)>) -> String {
+    match state {
+        None => "registro delle prove non leggibile".into(),
+        Some((0, _)) => "nessuna prova in corso".into(),
+        Some((1, p)) => format!("autodiagnosi breve in corso, {p} % completato"),
+        Some((2, p)) => format!("autodiagnosi estesa in corso, {p} % completato"),
+        Some((op, p)) => format!("prova di tipo {op:X}h in corso, {p} % completato"),
+    }
+}
+
+/// Esegue `work` raccogliendo una riga per ogni comando inviato, con il tempo di risposta.
+pub fn with_trace<T>(work: impl FnOnce() -> T) -> (T, Vec<String>) {
     TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
-    let outcome = self_test(disk, cmd);
+    let outcome = work();
     let lines = TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
     (outcome, lines)
 }

@@ -28,6 +28,9 @@ Uso:
   mystoragetest --selftest X:|N breve|estesa|stop
                                     avvia o interrompe l'autodiagnosi del disco del volume X: o del
                                     disco N (da amministratore), con i comandi inviati e i loro tempi
+  mystoragetest --selftest X:|N breve|estesa|stop --realtek
+                                    prova sperimentale: lo stesso attraverso un bridge USB-NVMe Realtek,
+                                    con un comando non documentato per questo uso
   mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
   mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
   mystoragetest --test X: [opzioni] esegue le prove sul volume X:
@@ -582,20 +585,30 @@ fn selftest_cmd(args: &[String]) -> i32 {
             println!("Indicare il volume o il numero del disco, per esempio: --selftest H: breve");
             return 2;
         };
-        if let Some(caution) = smart::selftest_caution(disk.usb_id).filter(|_| cmd != smart::SelfTestCmd::Abort) {
+        let realtek = args.iter().any(|a| a == "--realtek");
+        if realtek {
+            println!(
+                "Prova sperimentale: il comando di autodiagnosi dentro il comando di lettura dei bridge Realtek \
+                 (E4h), che non è documentato per questo uso.\n"
+            );
+        } else if let Some(caution) = smart::selftest_caution(disk.usb_id).filter(|_| cmd != smart::SelfTestCmd::Abort) {
             println!("Attenzione. {caution}\n");
         }
         println!("Disco {} — {} · inizio {}", disk.number, disk.title(), crate::win::now_string());
         let started = std::time::Instant::now();
-        let (outcome, lines) = smart::self_test_traced(disk, cmd);
+        let (outcome, lines) = if realtek {
+            smart::with_trace(|| smart::realtek_selftest_trial(disk, cmd))
+        } else {
+            smart::with_trace(|| smart::self_test(disk, cmd).map(|()| "comando accettato".to_string()))
+        };
         let secs = format!("{:.1}", started.elapsed().as_secs_f64()).replace('.', ",");
         for l in &lines {
             println!("  {l}");
         }
         let end = crate::win::now_string();
         return match outcome {
-            Ok(()) => {
-                println!("{} sul disco {}: comando accettato in {secs} s (fine {end}).", cmd.label(), disk.number);
+            Ok(text) => {
+                println!("{} sul disco {}: {text}, in {secs} s (fine {end}).", cmd.label(), disk.number);
                 0
             }
             Err(e) => {

@@ -148,6 +148,10 @@ SSD Crucial e Micron il 202 è la vita consumata in percentuale, con la vita res
 avviso dal 90 % come l'usura degli NVMe, e il 206 è il tasso di errori di scrittura; negli altri SSD
 (Samsung e SK hynix usano il 202 per lo stato di eccezione, Intel per la fine vita, Lexar il 206 per il
 minimo dei cicli di cancellazione…) compaiono come «Attributo del produttore».
+Se al posto di un disco ne compare un altro con lo stesso numero e la stessa lettera (per esempio
+staccando un contenitore USB e collegandone un altro), la finestra se ne accorge alla rilettura
+dell'elenco dei dischi, ogni 4 secondi: toglie lo SMART e le note del disco di prima e legge subito il
+nuovo. Con la finestra nascosta nell'area di notifica l'elenco si rilegge prima di ogni lettura periodica.
 
 **Eventi di sistema**: gli errori e gli avvisi di dischi, controller e file system registrati da Windows
 nelle ultime 24 ore, 7 giorni o 30 giorni, con una spiegazione per i codici più comuni. «Aggiorna»
@@ -234,8 +238,14 @@ prima lettura il programma cerca quello giusto, in quest'ordine, e lo ricorda pe
 Alle chiavette e alle schede di memoria (supporti rimovibili) vanno solo i comandi SAT: di norma non hanno
 dati SMART e il programma lo dice, senza riprovare a ogni lettura. Se un disco non risponde in tempo la
 ricerca si ferma subito, invece di insistere con altri comandi. Fra i bridge USB-NVMe solo JMicron inoltra
-il comando di avvio dell'autodiagnosi, tranne il JMS581 che si blocca; Realtek e ASMedia inoltrano soltanto
-le letture.
+il comando di avvio dell'autodiagnosi, tranne il JMS581 che si blocca. Per Realtek e ASMedia è noto solo un
+comando proprietario di lettura (E4h e E6h, gli stessi di smartmontools), che porta il codice del comando
+NVMe ma non il namespace e prevede sempre dati in arrivo: l'avvio dell'autodiagnosi non ha una strada
+documentata. `--selftest X: breve --realtek` prova comunque a mandarlo attraverso il comando dei Realtek,
+prima senza dati e poi come lettura, e controlla nel registro del disco se la prova è partita. Un RTL9210B
+(0BDA:9210, firmware 1.00) lo rifiuta in entrambe le forme come «comando non valido» (codice 20/00),
+subito e senza conseguenze: il bridge controlla il codice del comando NVMe e quello dell'autodiagnosi non
+lo accetta.
 
 «Rapporto di diagnosi», nella scheda SMART, scrive in `%LOCALAPPDATA%\myStorageTest\diagnosi-smart.txt` i
 comandi inviati a ogni disco e le risposte ricevute, e lo apre: serve a capire perché un disco o un bridge
@@ -264,6 +274,9 @@ mystoragetest --selftest [X:|N]   autodiagnosi dei dischi: stato e prove registr
 mystoragetest --selftest X:|N breve|estesa|stop
                                   avvia o interrompe l'autodiagnosi del disco del volume X: o del
                                   disco N (da amministratore), con i comandi inviati e i loro tempi
+mystoragetest --selftest X:|N breve|estesa|stop --realtek
+                                  prova sperimentale: lo stesso attraverso un bridge USB-NVMe Realtek,
+                                  con un comando non documentato per questo uso
 mystoragetest --check-events [N]  confronta la lettura veloce degli eventi con i testi di Windows
 mystoragetest --export-icon FILE  salva in un PNG l'icona, in tutte le dimensioni e nei tre stati
 mystoragetest --test X: [opzioni] esegue le prove sul volume X:
@@ -320,6 +333,8 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - autodiagnosi senza privilegi: disponibilità, durate dichiarate e prove registrate su sei NVMe; disponibilità ed esito dell'ultima prova su due SATA;
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
 - autodiagnosi attraverso un bridge JMicron JMS581 (152D:0581), da amministratore, con `--selftest H: breve`: le letture dello SMART attraverso il bridge rispondono in circa 200 ms, il comando di avvio viene accettato, ma la sua esecuzione non finisce, né in 8 né in 60 secondi; Windows reimposta il bridge, che va scollegato e ricollegato (sette tentativi, a 10 e a 5 Gbit/s). Da qui il blocco della prova sui JMS581;
+- autodiagnosi attraverso un bridge Realtek RTL9210B (0BDA:9210, firmware 1.00), da amministratore, con `--selftest H: breve --realtek`: le letture attraverso il bridge (registro SMART, Identify, registro delle prove) rispondono in 2–3 ms; il comando di autodiagnosi dentro il comando E4h viene rifiutato come «comando non valido» (20/00) sia senza dati sia come lettura, in 1–2 ms, e il disco resta collegato;
+- disco sostituito da un altro con lo stesso numero e la stessa lettera, con la verifica automatica `MYSTORAGETEST_AUTOTEST=sostituzione`: al disco del volume scelto vengono date identità e SMART finti di un contenitore JMicron JMS581, con la lettura periodica rimandata di dieci minuti; alla rilettura dell'elenco dei dischi lo SMART finto sparisce e quello vero compare dopo circa 4 secondi. Con la finestra nascosta nell'area di notifica il programma resta fermo (0,14 s di processore in 70 secondi) e si chiude con `--quit`;
 - blocco e avvertenza per l'autodiagnosi attraverso i bridge JMicron USB-NVMe: prove automatiche su quali bridge sono bloccati (JMS581, 0581 e 1581) e quali hanno l'avvertenza (JMS583, JMS586 e gli altri PID JMicron USB-NVMe; non i bridge JMicron USB-SATA, Realtek e i dischi non USB), e i due testi verificati a schermo nella scheda SMART su un disco interno con un bridge simulato (`MYSTORAGETEST_FAKE_JMICRON=0581` e `=0583`);
 - decodifica di comando e risposta negli eventi 153 e 154, con prove automatiche (`cargo test`) sui dati di eventi veri e confrontata con la decodifica a mano di circa 100.000 eventi reali: un SSD NVMe in contenitore USB con bridge JMicron che a tratti smette di rispondere (letture, scritture, svuotamento della cache, verifica di prontezza e lettura della capacità, tutte con errore hardware 4/44/81) e dischi USB con letture ritentate per tempo scaduto o interrotte;
 - storico delle temperature degli SSD interni;
