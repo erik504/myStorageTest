@@ -1813,8 +1813,18 @@ fn read_via(disk: &PhysDisk, h: &Handle, via: Via) -> Option<SmartReport> {
     }
 }
 
+/// Che cosa c'è dietro il bridge USB di un disco, secondo la strada già trovata per lo SMART:
+/// `Some(true)` un disco NVMe, `Some(false)` un disco ATA; `None` se non lo si sa (ancora).
+pub fn usb_inner_nvme(d: &PhysDisk) -> Option<bool> {
+    match known_via(d)? {
+        Via::Nvme(_) => Some(true),
+        Via::Ata(_) => Some(false),
+        _ => None,
+    }
+}
+
 /// Prodotti JMicron che sono bridge USB-NVMe (gli altri sono bridge SATA).
-fn jmicron_nvme_product(pid: u16) -> bool {
+pub fn jmicron_nvme_product(pid: u16) -> bool {
     matches!(pid, 0x0583 | 0xA583 | 0x0581 | 0x0586 | 0x0562 | 0x1581 | 0x0580 | 0xF583)
 }
 

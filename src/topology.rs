@@ -46,6 +46,8 @@ pub enum Kind {
     UsbController,
     Controller,
     Hub,
+    /// Bridge di un contenitore USB: il chip che fa da tramite fra l'USB e il disco (SATA o NVMe).
+    Bridge,
     /// Dispositivo PCIe che non è un disco: scheda grafica, rete, audio…
     Device,
     /// Porta PCIe senza niente collegato.
@@ -380,6 +382,99 @@ fn vendor(v: u16) -> Option<&'static str> {
     })
 }
 
+/// Il nome del prodotto come lo dichiara il dispositivo stesso sul bus: per l'USB è la stringa del
+/// prodotto («RTL9210C», «USB3.1 Storage Device»…), che Windows non mostra nel nome.
+fn bus_reported_name(node: u32) -> String {
+    let key = DEVPROPKEY {
+        fmtid: windows_sys::core::GUID::from_u128(0x540b947e_8b40_45bc_a8a2_6a0b894cbda2),
+        pid: 4,
+    };
+    let (mut kind, mut buf, mut len) = (0u32, [0u16; 256], 512u32);
+    let rc = unsafe { CM_Get_DevNode_PropertyW(node, &key, &mut kind, buf.as_mut_ptr() as *mut u8, &mut len, 0) };
+    if rc == 0 { win::from_wide(&buf).trim().to_string() } else { String::new() }
+}
+
+/// Che cosa collega il bridge di un contenitore USB al disco.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inner {
+    Nvme,
+    Sata,
+}
+
+/// Il chip del bridge di un contenitore USB: il nome e, se il chip sa collegare un tipo di disco
+/// solo, quale. Il nome viene dal prodotto USB; se il prodotto o il disco dichiarano il chip per
+/// intero («RTL9210C», «RTL9210B-CG»), si usa quello, che dice anche la revisione. Molti
+/// contenitori hanno l'identificativo USB del loro produttore e non quello del chip.
+fn bridge_chip(v: u16, p: u16, product: &str, d: &PhysDisk) -> (Option<String>, Option<Inner>) {
+    use Inner::{Nvme, Sata};
+    let known: Option<(&str, Option<Inner>)> = match (v, p) {
+        (0x152D, 0x0583 | 0xA583 | 0xF583) => Some(("JMicron JMS583", Some(Nvme))),
+        (0x152D, 0x0581 | 0x1581) => Some(("JMicron JMS581", None)),
+        (0x152D, 0x0586) => Some(("JMicron JMS586", None)),
+        (0x152D, 0x0578) => Some(("JMicron JMS578", Some(Sata))),
+        (0x152D, 0x0567) => Some(("JMicron JMS567", Some(Sata))),
+        (0x152D, 0x0561) => Some(("JMicron JMS561", Some(Sata))),
+        (0x152D, 0x0539) => Some(("JMicron JMS539", Some(Sata))),
+        (0x152D, 0x2329) => Some(("JMicron JM20329", Some(Sata))),
+        (0x152D, 0x2338) => Some(("JMicron JM20338", Some(Sata))),
+        (0x152D, 0x2339) => Some(("JMicron JM20339", Some(Sata))),
+        (0x0BDA, 0x9210) => Some(("Realtek RTL9210", None)),
+        (0x0BDA, 0x9220) => Some(("Realtek RTL9220", None)),
+        (0x174C, 0x2362) => Some(("ASMedia ASM2362", Some(Nvme))),
+        (0x174C, 0x2364) => Some(("ASMedia ASM2364", Some(Nvme))),
+        (0x174C, 0x2464) => Some(("ASMedia ASM2464", Some(Nvme))),
+        (0x174C, 0x235C) => Some(("ASMedia ASM235CM", Some(Sata))),
+        (0x174C, 0x1153 | 0x55AA) => Some(("ASMedia ASM1153", Some(Sata))),
+        (0x174C, 0x1351) => Some(("ASMedia ASM1351", Some(Sata))),
+        _ => None,
+    };
+    // Il nome del chip scritto nel prodotto USB o nel disco: «RTL9…», «JMS5…», «JM20…», «ASM1…», «ASM2…».
+    let named = [product, d.model.as_str(), d.vendor.as_str()]
+        .iter()
+        .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == '_' || c == ','))
+        .map(|w| w.trim().to_ascii_uppercase())
+        .find(|w| ["RTL9", "JMS5", "JM20", "ASM1", "ASM2"].iter().any(|k| w.starts_with(k)) && w.len() >= 7);
+    let maker = |chip: &str| match &chip[..2] {
+        "RT" => "Realtek",
+        "JM" => "JMicron",
+        _ => "ASMedia",
+    };
+    match (known, named) {
+        // Il nome per intero, se è dello stesso chip della tabella (o se la tabella non lo conosce).
+        (Some((k, only)), Some(n)) if n.starts_with(k.split(' ').nth(1).unwrap_or("")) => {
+            (Some(format!("{} {n}", maker(&n))), only)
+        }
+        (Some((k, only)), _) => (Some(k.to_string()), only),
+        (None, Some(n)) => (Some(format!("{} {n}", maker(&n))), None),
+        (None, None) => (None, None),
+    }
+}
+
+/// Come passano i comandi SMART attraverso il bridge, e l'autodiagnosi: quello che il programma
+/// sa e ha provato.
+fn bridge_smart_note(chip: &str, v: u16, p: u16, inner: Option<Inner>) -> &'static str {
+    if inner == Some(Inner::Sata) {
+        return "SMART del disco con i comandi SAT (ATA PASS-THROUGH), se il bridge li inoltra.";
+    }
+    if v == 0x152D && crate::smart::jmicron_nvme_product(p) {
+        return if matches!(p, 0x0581 | 0x1581) {
+            "SMART del disco con il protocollo JMicron. L'autodiagnosi è disattivata: con un JMS581 il comando \
+             ha bloccato il bridge."
+        } else {
+            "SMART del disco con il protocollo JMicron; l'autodiagnosi si può avviare, ma il bridge potrebbe \
+             bloccarsi."
+        };
+    }
+    if chip.starts_with("Realtek") {
+        return "SMART del disco con il comando di lettura Realtek (E4h). L'autodiagnosi non passa: RTL9210B e \
+                RTL9210C rifiutano il comando.";
+    }
+    if chip.starts_with("ASMedia") && inner == Some(Inner::Nvme) {
+        return "SMART del disco con il comando di lettura ASMedia (E6h); per l'autodiagnosi non c'è una strada nota.";
+    }
+    ""
+}
+
 /// Bus, dispositivo e funzione da «Bus PCI 0, dispositivo 3, funzione 2» (o la stessa frase in
 /// un'altra lingua: contano solo i numeri, in quest'ordine).
 fn pci_numbers(location: &str) -> Option<(u32, u32, u32)> {
@@ -521,7 +616,7 @@ struct Item {
 fn item(key: String, kind: Kind, icon: Icon, title: String, lines: Vec<String>, tip: String) -> Item {
     let domain = match kind {
         Kind::SataController => Link::Sata,
-        Kind::UsbController | Kind::Hub => Link::Usb,
+        Kind::UsbController | Kind::Hub | Kind::Bridge => Link::Usb,
         Kind::Virtual | Kind::Volume | Kind::Span | Kind::Container => Link::Soft,
         _ => Link::Pcie,
     };
@@ -910,6 +1005,9 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
             None => n.bw_tip = "Windows non dichiara la velocità di questo collegamento PCIe.".into(),
         }
     }
+    // Il bridge di un contenitore USB, fra l'hub e il disco. Chiavette e schede di memoria (supporti
+    // rimovibili) non ne hanno uno da mostrare: il dispositivo USB è il supporto stesso.
+    let mut bridge: Option<Item> = None;
     if let Some(dev) = w.usb_device {
         n.domain = Link::Usb;
         n.link = Link::Usb;
@@ -918,38 +1016,118 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
             "usbstor" => " · BOT",
             _ => "",
         };
-        let bridge = ids(&dev.id)
-            .map(|(v, p)| format!(" · {}{v:04X}:{p:04X}", vendor(v).map(|m| format!("{m} ")).unwrap_or_default()))
-            .unwrap_or_default();
-        match links.usb {
+        let (v, p) = ids(&dev.id).unwrap_or_default();
+        let who = if d.removable { "Il disco" } else { "Il bridge" };
+        let (usb_text, usb_slow, usb_band, usb_band_tip) = match links.usb {
             Some(u) => {
                 let (text, slow) = info::usb_short(&u);
-                n.warn |= slow;
-                n.bw = Some(usb_bw(u.speed));
-                n.bw_tip = usb_tip(&u, "Il disco");
-                lines.push(format!("{text}{proto}{bridge}"));
+                (text, slow, Some(usb_bw(u.speed)), usb_tip(&u, who))
             }
-            None => {
-                n.bw_tip = "Windows non dichiara la velocità di questo collegamento USB.".into();
-                lines.push(format!("USB{proto}{bridge}"));
+            None => (
+                "USB".to_string(),
+                false,
+                None,
+                "Windows non dichiara la velocità di questo collegamento USB.".to_string(),
+            ),
+        };
+        let edge = dev.address.map(|a| format!("porta {a}")).unwrap_or_default();
+        let order = format!("p{:03}", dev.address.unwrap_or(0));
+        if d.removable {
+            let maker = vendor(v).map(|m| format!("{m} ")).unwrap_or_default();
+            n.warn |= usb_slow;
+            n.bw = usb_band;
+            n.bw_tip = usb_band_tip;
+            lines.push(format!("{usb_text}{proto} · {maker}{v:04X}:{p:04X}"));
+            n.edge = edge;
+            n.order = order;
+            n.link_ids = usb_port_ids(dev);
+            more_ids = dev_ids(dev, "del dispositivo USB");
+        } else {
+            let product = bus_reported_name(dev.node);
+            let (chip, only) = bridge_chip(v, p, &product, d);
+            // Che disco c'è dentro: dalla lettura dello SMART, se c'è già stata, altrimenti da quello
+            // che il bridge sa collegare, dal disco meccanico (SATA) o dal nome.
+            let name = format!("{} {}", d.vendor, d.model).to_ascii_uppercase();
+            let inner = crate::smart::usb_inner_nvme(d)
+                .map(|nvme| if nvme { Inner::Nvme } else { Inner::Sata })
+                .or(links.sata.map(|_| Inner::Sata))
+                .or(only)
+                .or(links.rpm.filter(|r| *r > 0).map(|_| Inner::Sata))
+                .or((name.contains("NVME") || name.contains("PCIE")).then_some(Inner::Nvme));
+            let kind_text = match inner {
+                Some(Inner::Nvme) => "USB-NVMe",
+                Some(Inner::Sata) => "USB-SATA",
+                None => "USB",
+            };
+            let title = chip.clone().unwrap_or_else(|| match vendor(v) {
+                Some(m) => format!("Bridge {m}"),
+                None => "Bridge USB".to_string(),
+            });
+            let mut tip = format!("{title}: bridge {kind_text} del contenitore\n{}", dev.name);
+            if !product.is_empty() {
+                tip.push_str(&format!("\nProdotto USB: {product}"));
+            }
+            let note = bridge_smart_note(&title, v, p, inner);
+            if !note.is_empty() {
+                tip.push_str(&format!("\n{note}"));
+            }
+            let mut b = item(
+                format!("bridge:{}", dev.id),
+                Kind::Bridge,
+                Icon::Bridge,
+                title,
+                vec![format!("bridge {kind_text} · {v:04X}:{p:04X}"), format!("{usb_text}{proto}")],
+                tip,
+            );
+            b.node.link = Link::Usb;
+            b.node.warn = usb_slow;
+            b.node.bw = usb_band;
+            b.node.bw_tip = usb_band_tip;
+            b.node.edge = edge;
+            b.node.order = order;
+            b.node.link_ids = usb_port_ids(dev);
+            b.node.ids = dev_ids(dev, "");
+            if !product.is_empty() {
+                b.node.ids.push(("Prodotto USB".to_string(), product));
+            }
+            bridge = Some(b);
+            // Il disco sta dietro il bridge: il suo collegamento è quello dentro il contenitore.
+            n.order = format!("d{:03}", d.number);
+            match inner {
+                Some(Inner::Nvme) => {
+                    n.link = Link::Pcie;
+                    n.edge = "NVMe".into();
+                    n.bw_tip = "Dentro il contenitore il bridge parla con l'SSD in NVMe, su PCIe. Windows non dichiara \
+                                la velocità di questo collegamento: di solito il limite è quello USB."
+                        .into();
+                }
+                Some(Inner::Sata) => {
+                    n.link = Link::Sata;
+                    n.edge = "SATA".into();
+                    n.bw_tip = "Dentro il contenitore il bridge parla con il disco in SATA. La velocità di questo \
+                                collegamento si legge da amministratore, attraverso il bridge."
+                        .into();
+                }
+                None => {
+                    n.bw_tip = "Collegamento dentro il contenitore, fra il bridge e il disco: Windows non dice di che \
+                                tipo è."
+                        .into();
+                }
             }
         }
-        n.edge = dev.address.map(|a| format!("porta {a}")).unwrap_or_default();
-        n.order = format!("p{:03}", dev.address.unwrap_or(0));
-        n.link_ids = usb_port_ids(dev);
-        more_ids = dev_ids(dev, "del dispositivo USB");
     }
     if let Some(s) = links.sata {
         let (text, slow) = info::sata_short(&s);
-        if w.usb_device.is_some() {
+        if w.usb_device.is_some() && bridge.is_none() {
             lines.push(format!("nel contenitore: {text}"));
         } else {
             n.warn |= slow;
             let generation = if s.generation > 0 { s.generation } else { s.max_gen };
+            let label = text.split(" (").next().unwrap_or_default().to_string();
             n.bw = Some(sata_bw(generation));
             n.bw_tip = format!(
-                "{}: {} teorici al netto della codifica 8b/10b.{}",
-                text.split(" (").next().unwrap_or_default(),
+                "{}{label}: {} teorici al netto della codifica 8b/10b.{}",
+                if bridge.is_some() { "Dentro il contenitore, " } else { "" },
                 info::rate(sata_bw(generation)),
                 if slow {
                     format!("\nIl disco arriverebbe a {}.", info::rate(sata_bw(s.max_gen)))
@@ -957,7 +1135,11 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
                     String::new()
                 }
             );
-            lines.push(text);
+            if bridge.is_some() {
+                n.edge = label;
+            } else {
+                lines.push(text);
+            }
         }
     }
     if let Some(rpm) = links.rpm.filter(|r| *r > 0) {
@@ -1003,6 +1185,7 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
     n.ids.extend(more_ids);
     n.disk = Some(d.number);
     n.letters = d.letters.clone();
+    w.items.extend(bridge);
     w.items.push(leaf);
     (w.items, nvme_id)
 }

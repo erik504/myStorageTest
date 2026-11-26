@@ -15,6 +15,8 @@ pub enum Icon {
     SataController,
     UsbController,
     Hub,
+    /// Bridge di un contenitore USB: una spina USB e il chip.
+    Bridge,
     Gpu,
     Network,
     Audio,
@@ -117,6 +119,18 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, color: Color32) {
             boxed(rect(0.08, 0.34, 0.92, 0.74), 0.06);
             for x in [0.18, 0.42, 0.66] {
                 solid(rect(x, 0.48, x + 0.16, 0.6));
+            }
+        }
+        Icon::Bridge => {
+            // La spina USB a sinistra, il chip a destra.
+            boxed(rect(0.04, 0.38, 0.3, 0.62), 0.03);
+            solid(rect(0.1, 0.45, 0.17, 0.55));
+            seg(at(0.3, 0.5), at(0.44, 0.5));
+            boxed(rect(0.44, 0.24, 0.94, 0.76), 0.05);
+            solid(rect(0.58, 0.39, 0.8, 0.61));
+            for x in [0.53, 0.69, 0.85] {
+                seg(at(x, 0.1), at(x, 0.24));
+                seg(at(x, 0.76), at(x, 0.9));
             }
         }
         Icon::Gpu => {

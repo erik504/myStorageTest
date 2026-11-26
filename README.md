@@ -16,10 +16,14 @@ casella che lo accende e lo spegne, e la voce **Grafo Storage**.
 
 **Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi e gli altri dispositivi
 PCIe. Da sinistra a destra il processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una
-porta del processore), i controller SATA e USB, gli hub USB in cascata, e in una colonna i dischi, ognuno
-con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, USB 3.2 Gen 1 con il bridge e il
-protocollo UAS o BOT, i giri al minuto dei dischi meccanici quando li dichiarano), salute SMART e
-temperatura. Ci sono anche gli altri canali PCIe: scheda grafica (con l'audio HDMI), schede di rete, audio,
+porta del processore), i controller SATA e USB, gli hub USB in cascata, i bridge dei contenitori USB, e in
+una colonna i dischi, ognuno con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, i
+giri al minuto dei dischi meccanici quando li dichiarano), salute SMART e temperatura. Il riquadro del
+bridge dice il chip (per esempio Realtek RTL9210B-CG o JMicron JMS581, anche quando il contenitore ha
+l'identificativo USB del suo produttore), se collega un disco NVMe o SATA, l'identificativo USB, la velocità
+USB e il protocollo UAS o BOT; il fumetto aggiunge come passano i comandi SMART e se l'autodiagnosi si può
+avviare. La linea fra bridge e disco ha il colore del collegamento dentro il contenitore (NVMe o SATA).
+Chiavette e schede di memoria non hanno un bridge a sé. Ci sono anche gli altri canali PCIe: scheda grafica (con l'audio HDMI), schede di rete, audio,
 controller senza dischi, porte libere, e le funzioni interne al processore e al chipset. Ogni riquadro ha
 un'icona (processore, chipset, controller, hub, scheda grafica, rete, tipo di disco…) e il colore del tipo
 di collegamento: PCIe e NVMe, SATA, USB, software (volumi e dischi virtuali, tratteggiati). Lo spessore
@@ -351,6 +355,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
 - interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
 - Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo. La vista del grafo con eventi simulati: rotellina e tasto + ingrandiscono attorno al puntatore, le frecce spostano, 0 torna alla vista iniziale, e un trascinamento che parte sopra un disco sposta la vista senza aprirlo. Gli identificativi di porte, controller, NVMe, hub radice, hub e dispositivi USB e volumi, confrontati con le proprietà che Windows dà per ciascun dispositivo (ID istanza, indirizzi PCI, percorsi di posizione, nomi ACPI delle porte del processore e del chipset); il clic destro che li copia non è nelle verifiche automatiche, per non toccare gli appunti.
+- bridge dei contenitori USB nel Grafo Storage, senza privilegi: un Realtek RTL9210B-CG (0BDA:9210) a 10 Gbit/s con UAS e due dischi Seagate (0BC2:3322 e 0BC2:61B7) dietro un hub USB 3, ciascuno con il suo bridge fra l'hub e il disco; il nome del chip e il prodotto USB confrontati con le proprietà di Windows. Il tipo di disco dietro un bridge che sa collegare sia NVMe sia SATA si conosce dopo la lettura dello SMART, che senza privilegi non c'è; chiavette e lettori di schede restano senza bridge;
 
 Non ancora verificato:
 

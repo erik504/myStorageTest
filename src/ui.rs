@@ -396,6 +396,7 @@ fn draw_graph(
     const ROW_1: f32 = 64.0;
     let box_w_1 = |kind: Kind| match kind {
         Kind::Hub => 134.0,
+        Kind::Bridge => 196.0,
         Kind::Cpu => 172.0,
         Kind::Port => 160.0,
         Kind::Device => 224.0,
@@ -1154,6 +1155,8 @@ pub struct App {
     graph_key: String,
     /// «Aggiorna» chiede di ricostruire il grafo alla prossima lettura dei dischi.
     graph_dirty: bool,
+    /// Dischi in contenitori USB di cui il grafo sa già che disco c'è dietro il bridge.
+    graph_bridges: HashSet<String>,
     /// Disco o volume sotto il puntatore nel grafo (si evidenzia nella colonna a sinistra) e nella
     /// colonna a sinistra (si evidenzia nel grafo).
     graph_hover: Option<Sel>,
@@ -1314,6 +1317,7 @@ impl App {
             graph_rx: None,
             graph_key: String::new(),
             graph_dirty: true,
+            graph_bridges: HashSet::new(),
             graph_hover: None,
             side_hover: None,
             temps: HashMap::new(),
@@ -1617,6 +1621,13 @@ impl App {
                         }
                         self.selftest_note.insert(r.disk, (ok, text));
                     }
+                }
+            }
+            // La prima lettura di un disco in un contenitore USB dice se dentro c'è un disco NVMe o
+            // SATA: il grafo lo mostra sul bridge, e va rifatto.
+            if let Some(d) = disk.as_ref().filter(|d| d.is_usb() && !d.removable) {
+                if smart::usb_inner_nvme(d).is_some() && self.graph_bridges.insert(disk_identity(d)) {
+                    self.graph_dirty = true;
                 }
             }
             self.smart.insert(r.disk, r);
@@ -2173,7 +2184,8 @@ impl App {
         });
         ui.label(dim(
             "Come sono collegati i dischi e gli altri dispositivi PCIe: dal processore e dal chipset, attraverso \
-             le porte PCIe, i controller SATA e USB e gli hub, fino ai dischi; a destra i volumi su più dischi e i \
+             le porte PCIe, i controller SATA e USB, gli hub e i bridge dei contenitori USB, fino ai dischi; a \
+             destra i volumi su più dischi e i \
              contenitori cifrati, in fondo i volumi senza disco con il driver che li crea. Il colore dice il tipo \
              di collegamento, lo spessore la banda teorica; in giallo i collegamenti più lenti di quanto il \
              dispositivo potrebbe. Passa sopra a un riquadro o a una linea per i dettagli; un clic su un disco lo \
@@ -2212,6 +2224,7 @@ impl App {
                 (Icon::SataController, "controller"),
                 (Icon::UsbController, "USB"),
                 (Icon::Hub, "hub"),
+                (Icon::Bridge, "bridge USB"),
                 (Icon::Gpu, "scheda grafica"),
                 (Icon::Network, "rete"),
                 (Icon::Audio, "audio"),
