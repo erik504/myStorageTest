@@ -1,6 +1,6 @@
 [package]
 name = "mystoragetest"
-version = "0.1.30"
+version = "0.1.32"
 edition = "2024"
 description = "Test, diagnosi e monitoraggio dei dischi per Windows 10 e 11"
 license = "MIT"
@@ -20,6 +20,7 @@ features = [
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Vhd",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_EventLog",

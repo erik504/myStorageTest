@@ -14,8 +14,7 @@ del suo collegamento, la temperatura e il pallino dello stato SMART; in cima ci 
 rilegge dischi, volumi, i dati della scheda Info e il Grafo Storage, la voce **Monitoraggio**, con la
 casella che lo accende e lo spegne, e la voce **Grafo Storage**.
 
-**Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi e gli altri dispositivi
-PCIe. Da sinistra a destra il processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una
+**Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi. Da sinistra a destra il processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una
 porta del processore), i controller SATA e USB, gli hub USB in cascata, i bridge dei contenitori USB (tutti
 in una colonna, subito prima dei dischi), e in una colonna i dischi, ognuno con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, i
 giri al minuto dei dischi meccanici quando li dichiarano), salute SMART e temperatura. Il riquadro del
@@ -23,10 +22,28 @@ bridge dice il chip (per esempio Realtek RTL9210B-CG o JMicron JMS581, anche qua
 l'identificativo USB del suo produttore), se collega un disco NVMe o SATA, l'identificativo USB, la velocità
 USB e il protocollo UAS o BOT; il fumetto aggiunge come passano i comandi SMART e se l'autodiagnosi si può
 avviare. La linea fra bridge e disco ha il colore del collegamento dentro il contenitore (NVMe o SATA).
-Chiavette e schede di memoria non hanno un bridge a sé. Ci sono anche gli altri canali PCIe: scheda grafica (con l'audio HDMI), schede di rete, audio,
-controller senza dischi, porte libere, e le funzioni interne al processore e al chipset. Ogni riquadro ha
-un'icona (processore, chipset, controller, hub, scheda grafica, rete, tipo di disco…) e il colore del tipo
-di collegamento: PCIe e NVMe, SATA, USB, software (volumi e dischi virtuali, tratteggiati). Lo spessore
+Chiavette e schede di memoria non hanno un bridge a sé. Ci sono anche i controller di dischi senza
+dischi e le porte PCIe libere.
+
+La casella **Grafo completo**, sopra il grafo, aggiunge tutti gli altri dispositivi e i collegamenti che
+usano; senza la spunta il grafo mostra solo i dischi e ciò che li collega al processore, e la scelta resta
+salvata. Nel grafo completo ci sono:
+- le schede PCIe: scheda grafica (con l'audio HDMI), rete, audio;
+- i controller USB senza dischi;
+- tutti gli hub USB, anche vuoti, e tutti i dispositivi USB, ciascuno sulla porta che usa, con la
+  velocità e il ruolo ricavato dalle sue funzioni (tastiera, mouse, tastiera e mouse per i ricevitori,
+  audio, webcam, Bluetooth, scheda video USB, dispositivo HID);
+- i monitor, sotto la scheda grafica o la scheda video USB che li pilota, con il nome, la risoluzione
+  nativa letta dall'EDID e il collegamento quando Windows lo scrive nel nome (HDMI);
+- il codec audio sotto il controller HD Audio;
+- i dispositivi della scheda madre: SMBus, PSP, il bridge LPC con la porta seriale e il controller
+  integrato, il TPM dichiarato in ACPI.
+
+Le risorse di sistema (timer, controller delle interruzioni, orologio, pulsanti, interfacce WMI) e i ponti
+del processore non compaiono, perché non sono collegamenti. Ogni riquadro ha
+un'icona (processore, chipset, controller, hub, scheda grafica, rete, monitor, tastiera, mouse, chip della
+scheda madre, tipo di disco…) e il colore del tipo di collegamento: PCIe e NVMe, SATA, USB, software (volumi
+e dischi virtuali, tratteggiati) e, nel grafo completo, rosa per video, HD Audio, LPC e ACPI. Lo spessore
 delle linee segue la banda teorica del collegamento; passando sopra a una linea un fumetto la dice e
 spiega da dove viene (per esempio «PCIe 4.0 x4: 16 GT/s per linea × 4 linee, codifica 128b/130b → 7,9 GB/s
 teorici», o che dietro il chipset tutto divide il suo collegamento con il processore). In giallo i
@@ -37,7 +54,10 @@ VeraCrypt o TrueCrypt, collegati al disco o al volume che contiene il loro file,
 di chi li ospita (un contenitore su un volume a strisce sta a destra di quel volume). In fondo i dischi virtuali
 e i volumi senza un disco fisico, ciascuno con il driver che lo crea (per esempio Google Drive con il suo
 driver di file system): Windows dice se un driver sta sul percorso delle richieste di un volume, e lo si
-chiede per ogni driver caricato. Il grafo sta in un riquadro suo e all'inizio vi entra tutto (non sotto
+chiede per ogni driver caricato. Un disco virtuale dice il file che lo contiene (un VHD, VHDX o ISO, letto
+anche senza privilegi), e i dischi che Windows crea da sé sono riconosciuti: il disco base di Sandbox di
+Windows, che Windows collega all'avvio quando la funzione è attiva, compare come «Sandbox di Windows»
+anche nella colonna a sinistra e in `--list`. Il grafo sta in un riquadro suo e all'inizio vi entra tutto (non sotto
 il 45 %); la rotellina lo ingrandisce o lo rimpicciolisce attorno al puntatore, trascinandolo con il mouse
 lo si sposta, + e − ingrandiscono e rimpiccioliscono, le frecce lo spostano (con Maiuscolo a passi più
 lunghi) e 0 torna alla vista iniziale; sotto il grafo c'è la scala. Passando sopra a un riquadro si
@@ -51,17 +71,21 @@ dispositivo USB che li contiene; per i controller USB l'hub radice; per hub e di
 percorso fino a lì (`…#USBROOT(0)#USB(8)#USB(1)`); per i volumi il nome `\\?\Volume{…}\`, il dispositivo
 di Windows e i driver. Sulle linee il canale: la porta PCIe da cui passa il collegamento (indirizzo, ID
 istanza, percorsi), la porta dell'hub USB o quella del controller SATA, il file di un contenitore. Il clic
-destro su un riquadro o su una linea copia gli identificativi; anche `--graph` li stampa.
+destro su un riquadro o su una linea copia gli identificativi; anche `--graph` li stampa
+(`--graph completo` per il grafo completo).
 Un clic su un disco ne apre la pagina. Il grafo viene dall'albero dei dispositivi di Windows: per ogni
-disco e per ogni dispositivo PCI si risale fino al processore, senza privilegi di amministratore e senza
-svegliare i dischi fermi, e si ricostruisce quando i dischi cambiano.
+disco e per ogni dispositivo PCI (nel grafo completo anche per ogni dispositivo USB) si risale fino al
+processore, senza privilegi di amministratore e senza svegliare i dischi fermi, e si ricostruisce quando i
+dischi cambiano; un dispositivo USB collegato da poco compare con «Aggiorna».
 
 Ogni disco ha cinque schede.
 
 **Info**, la prima: tutti i dati del volume e dei dischi su cui sta. Del volume lo spazio occupato e
 libero, il file system con le sue funzioni, l'unità di allocazione, il numero di serie e la partizione che
 lo ospita; di ogni disco modello, numero di serie, firmware, collegamento, dimensione dei settori, TRIM,
-cache in scrittura, tabella delle partizioni e stato SMART. Per ogni disco ci sono anche l'interfaccia, cioè
+cache in scrittura, tabella delle partizioni e stato SMART. Per le partizioni senza lettera ci sono anche
+l'etichetta e il file system del volume e la cartella in cui è montato, se lo è; per un disco virtuale il
+file che lo contiene e, se Windows lo crea da sé, che cos'è. Per ogni disco ci sono anche l'interfaccia, cioè
 di che cosa è capace, e il collegamento attuale, cioè a che cosa lavora davvero:
 
 - NVMe: versione dello standard e collegamento PCIe, generazione e linee (per esempio «NVMe 1.4 su PCIe
@@ -281,7 +305,9 @@ mystoragetest --monitor           avvia nascosto nell'area di notifica, con il m
 mystoragetest --quit              chiude l'istanza in esecuzione
 mystoragetest --list              elenca volumi e dischi
 mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
-mystoragetest --graph             il Grafo Storage come testo: collegamenti, bande teoriche, driver
+mystoragetest --graph [completo]  il Grafo Storage come testo: collegamenti, bande teoriche, driver
+                                  (completo: anche hub, dispositivi USB, scheda grafica, audio, rete,
+                                  monitor e dispositivi della scheda madre)
 mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
 mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
 mystoragetest --events [ORE]      errori di disco nel registro di sistema (predefinito: 24 ore), con il riepilogo per tipo
@@ -370,8 +396,10 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - comandi diretti a due chiavette USB (una su UASP, una no), che Windows lascia passare anche senza privilegi: i comandi SAT partono, vengono rifiutati come previsto e le chiavette risultano senza SMART, senza altri tentativi;
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
 - interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
-- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo. La vista del grafo con eventi simulati: rotellina e tasto + ingrandiscono attorno al puntatore, le frecce spostano, 0 torna alla vista iniziale, e un trascinamento che parte sopra un disco sposta la vista senza aprirlo. Gli identificativi di porte, controller, NVMe, hub radice, hub e dispositivi USB e volumi, confrontati con le proprietà che Windows dà per ciascun dispositivo (ID istanza, indirizzi PCI, percorsi di posizione, nomi ACPI delle porte del processore e del chipset); il clic destro che li copia non è nelle verifiche automatiche, per non toccare gli appunti.
+- Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi, nel grafo completo, gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo. La vista del grafo con eventi simulati: rotellina e tasto + ingrandiscono attorno al puntatore, le frecce spostano, 0 torna alla vista iniziale, e un trascinamento che parte sopra un disco sposta la vista senza aprirlo. Gli identificativi di porte, controller, NVMe, hub radice, hub e dispositivi USB e volumi, confrontati con le proprietà che Windows dà per ciascun dispositivo (ID istanza, indirizzi PCI, percorsi di posizione, nomi ACPI delle porte del processore e del chipset); il clic destro che li copia non è nelle verifiche automatiche, per non toccare gli appunti.
 - disco che non risponde: il caso reale di un contenitore Realtek RTL9210B bloccato (più di 1.000 letture ritentate e 12 reimpostazioni del bridge in un quarto d'ora), con cui la versione precedente non apriva la finestra, non si chiudeva e non elencava i dischi; poi, con la simulazione `MYSTORAGETEST_FAKE_STUCK=8,L` (domande al disco 8 e al volume L: che non tornano mai, dall'avvio o dopo qualche secondo con `@3`): `--list` risponde in 2,6 secondi invece di restare fermo, la finestra mostra la prima schermata in 3,3 secondi e completa la sequenza di verifica, con il disco e il volume segnati «non risponde» (dall'avvio solo con il numero e la lettera, dopo con i dati letti prima), il grafo intatto e la chiusura da sola; senza simulazione nulla cambia (`--list` in 0,4 secondi, 0,4 s di processore in 40 secondi a finestra aperta). Quel contenitore si bloccava circa due minuti dopo ogni collegamento, con due SSD diversi, per il firmware del bridge: dopo l'aggiornamento dalla 1.23.5 alla 1.35.6 ha letto 371 GB a circa 706 MB/s in 11 minuti senza un errore;
+- disco virtuale di Sandbox di Windows (Msft Virtual Disk da 8 GB, senza lettera), senza privilegi: il file `C:\ProgramData\Microsoft\Windows\Containers\BaseImages\…\BaseLayer.vhdx` letto da Windows e il volume «PortableBaseLayer» con la cartella in cui è montato, confrontati con le proprietà del volume di Windows, in `--list`, `--info`, `--graph` e nella scheda Info; sul disco di sistema etichetta e file system delle partizioni EFI e di ripristino; `--info` di tutti i dischi in 0,2 secondi; prove automatiche del riconoscimento e dei nomi delle partizioni;
+- grafo completo sullo stesso PC, senza privilegi, confrontato con l'albero dei dispositivi di Windows: 28 dispositivi USB su tre controller (15 hub, sei dei quali senza niente dietro, i tre bridge dei dischi e dieci dispositivi: ricevitori Logitech e Keychron come «tastiera e mouse», un mouse Logitech G900 che dichiara anche una tastiera riconosciuto come mouse, cuffie USB come audio, due schede video DisplayLink con i loro monitor, un Billboard USB-C, i controller dei LED), i tre monitor della scheda grafica con la risoluzione nativa dall'EDID (3840×2160 e due 2560×1440 in HDMI), il codec Realtek sotto il controller HD Audio, SMBus, PSP, il bridge LPC con COM1 e il controller integrato, il TPM 2.0 in ACPI; nessuna risorsa di sistema e nessun ponte del processore. Il grafo dei dischi senza la spunta non mostra più scheda grafica, rete e audio. `--graph completo` in 0,9 secondi, `--graph` in 0,4; la spunta resta salvata e il grafo si ricostruisce passando da un modo all'altro, con la vista che torna a mostrarlo tutto; prove automatiche dell'EDID, dei ruoli dei dispositivi USB e dei dispositivi ACPI esclusi;
 - output della riga di comando in una console con la code page 850, raccolto con `| Out-String` e `| Out-File`: lettere accentate, «·», ««»», «×» e «°» giusti, «—» e «→» resi come «-» e «->»; in una console UTF-8 l'output non cambia; prove automatiche della conversione per le code page 850 e 1252;
 - bridge dei contenitori USB nel Grafo Storage, senza privilegi: un Realtek RTL9210B-CG (0BDA:9210) a 10 Gbit/s con UAS e due dischi Seagate (0BC2:3322 e 0BC2:61B7) dietro un hub USB 3, ciascuno con il suo bridge fra l'hub e il disco; il nome del chip e il prodotto USB confrontati con le proprietà di Windows. Il tipo di disco dietro un bridge che sa collegare sia NVMe sia SATA si conosce dopo la lettura dello SMART, che senza privilegi non c'è; chiavette e lettori di schede restano senza bridge;
 
@@ -399,8 +427,8 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 |---|---|
 | `src/disks.rs` | elenco di volumi e dischi fisici, bridge USB |
 | `src/info.rs` | dati di dettaglio di volumi e dischi (partizioni, settori, collegamenti PCIe, SATA e USB) ed espulsione |
-| `src/topology.rs` | Grafo Storage: catena di ogni disco e dispositivo PCI nell'albero dei dispositivi, fino al processore; bande teoriche, volumi su più dischi, contenitori cifrati, driver dei volumi senza disco |
-| `src/icons.rs` | iconcine disegnate a vettori: tipi di disco e componenti del grafo |
+| `src/topology.rs` | Grafo Storage: catena di ogni disco e dispositivo PCI nell'albero dei dispositivi, fino al processore; bande teoriche, volumi su più dischi, contenitori cifrati, driver dei volumi senza disco; nel grafo completo dispositivi USB, monitor (EDID), codec audio, dispositivi LPC e ACPI |
+| `src/icons.rs` | iconcine disegnate a vettori: tipi di disco e componenti del grafo, anche monitor, tastiera, mouse, webcam, Bluetooth, chip della scheda madre |
 | `src/tester.rs` | motore delle prove di I/O |
 | `src/errors.rs` | classificazione dei codici d'errore |
 | `src/smart.rs` | SMART e autodiagnosi (NVMe, ATA, pass-through USB) |
@@ -417,7 +445,8 @@ Le variabili d'ambiente `MYSTORAGETEST_SHOT`, `MYSTORAGETEST_AUTOTEST`, `MYSTORA
 `MYSTORAGETEST_VOL2`, `MYSTORAGETEST_NOACTIVATE`, `MYSTORAGETEST_POS`, `MYSTORAGETEST_SIZE` e `MYSTORAGETEST_FAKE_ALERT` servono
 alle verifiche automatiche dell'interfaccia: eseguono una prova (con `VOL2` anche una seconda, insieme,
 su un altro volume), salvano le schermate di ogni scheda (comprese quelle dei fumetti dei grafici, con un
-puntatore simulato, e quella del grafico della superficie, con dati inventati) e chiudono.
+puntatore simulato, e quella del grafico della superficie, con dati inventati) e chiudono. `VOL` sceglie
+un volume con la sua lettera o un disco senza lettera con il suo numero.
 `MYSTORAGETEST_INSTANCE` dà alle istanze di prova un nome, impostazioni e registro separati, così non
 interferiscono con quella in uso; `MYSTORAGETEST_RESTART_TEST` prova il riavvio del programma senza la
 richiesta di elevazione.

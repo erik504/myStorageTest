@@ -2238,7 +2238,14 @@ fn read_inner(disk: &PhysDisk, mode: Mode) -> Sample {
             BUS_NVME => try_nvme("Driver NVMe di Windows"),
             BUS_SATA | BUS_ATA => try_ata(),
             14 | 15 | 16 => {
-                note = "Disco virtuale: lo SMART si legge sui dischi fisici che lo compongono.".into();
+                note = if disk.backing_file.is_empty() {
+                    "Disco virtuale: lo SMART si legge sui dischi fisici che lo compongono.".into()
+                } else {
+                    format!(
+                        "Disco virtuale: i dati stanno nel file {}; lo SMART che conta è quello del disco che lo ospita.",
+                        disk.backing_file
+                    )
+                };
                 None
             }
             _ => try_nvme("Driver NVMe di Windows").or_else(try_ata).or_else(try_scsi),

@@ -19,7 +19,9 @@ Uso:
   mystoragetest --quit              chiude l'istanza in esecuzione
   mystoragetest --list              elenca volumi e dischi
   mystoragetest --info [X:|N]       tutti i dati del volume X: o del disco N (senza argomento: di tutti)
-  mystoragetest --graph             il Grafo Storage come testo: collegamenti, bande teoriche, driver
+  mystoragetest --graph [completo]  il Grafo Storage come testo: collegamenti, bande teoriche, driver
+                                    (completo: anche hub, dispositivi USB, scheda grafica, audio, rete,
+                                    monitor e dispositivi della scheda madre)
   mystoragetest --smart [N]         stato SMART di tutti i dischi o del disco N
   mystoragetest --diagnosi [FILE]   comandi inviati a ogni disco per leggere lo SMART e risposte ricevute
                                     (da amministratore; senza FILE li stampa)
@@ -128,7 +130,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         }
         "--export-icon" => export_icon(args.get(1).map(String::as_str).unwrap_or("icona.png")),
         "--list" => list(),
-        "--graph" => graph(),
+        "--graph" => graph(args.get(1).is_some_and(|s| s == "completo")),
         "--smart" => smart_cmd(args.get(1).and_then(|s| s.parse().ok())),
         "--events" => events(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(24)),
         "--test" => test(&args[1..]),
@@ -148,7 +150,10 @@ fn list() -> i32 {
     println!("Dischi fisici:");
     for d in &inv.disks {
         let usb = d.usb_id.map(|(v, p)| format!(" [{v:04X}:{p:04X}]")).unwrap_or_default();
-        let letters: String = d.letters.iter().map(|l| format!(" {l}:")).collect();
+        let mut letters: String = d.letters.iter().map(|l| format!(" {l}:")).collect();
+        if let Some(note) = d.virtual_note().filter(|_| d.letters.is_empty()) {
+            letters = format!(" {note}");
+        }
         let stuck = if d.stuck { "   NON RISPONDE" } else { "" };
         println!(
             "  {:>2}  {:<32} {:<8}{} {:<4} {:>9} {}{stuck}",
@@ -177,10 +182,10 @@ fn list() -> i32 {
     0
 }
 
-/// `--graph`: il Grafo Storage come albero di testo.
-fn graph() -> i32 {
+/// `--graph [completo]`: il Grafo Storage come albero di testo.
+fn graph(full: bool) -> i32 {
     use crate::topology;
-    let g = topology::build(&disks::scan());
+    let g = topology::build(&disks::scan(), full);
     fn show(g: &topology::Graph, i: usize, depth: usize) {
         let n = &g.nodes[i];
         let pad = "  ".repeat(depth);
@@ -247,14 +252,15 @@ fn info_cmd(which: Option<&str>) -> i32 {
         let x = det.disk(d.number);
         print(&info::disk_rows(d, x, None));
         for p in x.map(|x| x.partitions.as_slice()).unwrap_or_default() {
+            let folders = if p.folders.is_empty() { String::new() } else { format!("  in {}", p.folders.join("  ")) };
             println!(
-                "      partizione {:<3} {:<3} {:<24} inizio {:>9}  dimensione {:>9}  {}{}",
+                "      partizione {:<3} {:<3} {:<30} inizio {:>9}  dimensione {:>9}  {}{}{folders}",
                 p.number,
                 p.letter.map(|l| format!("{l}:")).unwrap_or_default(),
-                p.kind,
+                p.kind_text(),
                 human_bytes(p.offset),
                 human_bytes(p.length),
-                p.name,
+                p.names(),
                 if p.active { "  (attiva)" } else { "" }
             );
         }

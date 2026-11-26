@@ -34,6 +34,8 @@ pub struct Settings {
     pub always_admin: bool,
     /// Ogni quanti secondi si rilegge la temperatura dei dischi mentre il programma è aperto.
     pub temp_sample_secs: u32,
+    /// Il Grafo Storage mostra tutti i dispositivi, non solo quelli dei dischi.
+    pub graph_full: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +54,7 @@ impl Default for Settings {
             surface_reached: std::collections::BTreeMap::new(),
             always_admin: false,
             temp_sample_secs: 30,
+            graph_full: false,
         }
     }
 }

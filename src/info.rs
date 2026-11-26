@@ -10,9 +10,10 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW, CM_Get_Parent, CM_Locate_DevNodeW,
     CM_Request_Device_EjectW,
 };
-use windows_sys::Win32::Foundation::DEVPROPKEY;
+use windows_sys::Win32::Foundation::{DEVPROPKEY, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceW, GetVolumeInformationW,
+    GetVolumeNameForVolumeMountPointW,
 };
 use windows_sys::core::GUID;
 
@@ -53,6 +54,11 @@ pub struct Partition {
     /// Partizione d'avvio (solo MBR).
     pub active: bool,
     pub letter: Option<char>,
+    /// Per i volumi senza lettera: etichetta e file system del volume, e le cartelle in cui è
+    /// montato.
+    pub label: String,
+    pub fs: String,
+    pub folders: Vec<String>,
 }
 
 /// Collegamento USB di un disco, come lo vede l'hub a cui è attaccato.
@@ -493,7 +499,109 @@ fn disk_details(d: &PhysDisk) -> DiskDetails {
             }
         }
     }
+    // I volumi senza lettera (montati in una cartella, o senza nome per l'utente).
+    if out.partitions.iter().any(|p| p.letter.is_none()) {
+        for (guid, folders) in letterless_volumes() {
+            for (disk, start, _) in guid_extents(&guid) {
+                if disk != d.number {
+                    continue;
+                }
+                if let Some(p) = out
+                    .partitions
+                    .iter_mut()
+                    .find(|p| p.letter.is_none() && start >= p.offset && start < p.offset + p.length)
+                {
+                    (p.label, p.fs) = volume_label(&guid);
+                    p.folders = folders.clone();
+                }
+            }
+        }
+    }
     out
+}
+
+/// I volumi che non hanno una lettera, con le cartelle in cui sono montati. Quelli con una
+/// lettera sono già noti e non si aprono.
+fn letterless_volumes() -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut name = [0u16; 64];
+    let find = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
+    if find == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    loop {
+        let guid = win::from_wide(&name);
+        let paths = disks::volume_paths(&guid);
+        if !paths.iter().any(|p| p.len() == 3 && p.ends_with(":\\")) {
+            out.push((guid, paths));
+        }
+        if unsafe { FindNextVolumeW(find, name.as_mut_ptr(), name.len() as u32) } == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindVolumeClose(find);
+    }
+    out
+}
+
+/// Tratti di disco di un volume indicato con il suo nome `\\?\Volume{…}\`.
+fn guid_extents(guid: &str) -> Vec<(u32, u64, u64)> {
+    let Ok(h) = win::open_device_query(guid.trim_end_matches('\\')) else {
+        return Vec::new();
+    };
+    let mut buf = [0u8; 2048];
+    if win::ioctl(&h, disks::IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, &[], &mut buf).is_err() {
+        return Vec::new();
+    }
+    (0..(rd_u32(&buf, 0) as usize).min(80))
+        .map(|i| {
+            let at = 8 + i * 24;
+            (rd_u32(&buf, at), rd_u64(&buf, at + 8), rd_u64(&buf, at + 16))
+        })
+        .collect()
+}
+
+/// Etichetta e file system di un volume indicato con il suo nome `\\?\Volume{…}\`.
+fn volume_label(guid: &str) -> (String, String) {
+    let root = win::wide(guid);
+    let mut label = [0u16; 261];
+    let mut fs = [0u16; 261];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        )
+    };
+    if ok == 0 { (String::new(), String::new()) } else { (win::from_wide(&label), win::from_wide(&fs)) }
+}
+
+impl Partition {
+    /// Tipo della partizione, con il file system del volume quando lo si conosce: «NTFS o exFAT»
+    /// diventa quello vero.
+    pub fn kind_text(&self) -> String {
+        match (self.fs.as_str(), self.kind.as_str()) {
+            ("", kind) => kind.to_string(),
+            (fs, "NTFS o exFAT") => fs.to_string(),
+            (fs, kind) => format!("{kind} · {fs}"),
+        }
+    }
+
+    /// Nome per chi legge: quello scritto nella tabella (GPT) e l'etichetta del volume, se diversa.
+    pub fn names(&self) -> String {
+        match (self.name.is_empty(), self.label.is_empty()) {
+            (_, true) => self.name.clone(),
+            (true, false) => format!("«{}»", self.label),
+            (false, false) if self.name == self.label => self.name.clone(),
+            (false, false) => format!("{} · «{}»", self.name, self.label),
+        }
+    }
 }
 
 /// Tabella delle partizioni del disco: schema ("GPT", "MBR") e partizioni in ordine di posizione.
@@ -924,6 +1032,12 @@ pub fn disk_rows(d: &PhysDisk, det: Option<&DiskDetails>, smart: Option<&SmartRe
         bus.push_str(&format!(" · bridge {vid:04X}:{pid:04X}"));
     }
     rows.push(row("Bus", bus));
+    if !d.backing_file.is_empty() {
+        rows.push(row("File del disco virtuale", d.backing_file.as_str()));
+    }
+    if let Some((_, text)) = d.known_virtual() {
+        rows.push(row("Che cos'è", text));
+    }
     if let Some(x) = det {
         rows.extend(link_rows(d, x));
     }
@@ -976,6 +1090,17 @@ pub fn disk_rows(d: &PhysDisk, det: Option<&DiskDetails>, smart: Option<&SmartRe
     if !d.letters.is_empty() {
         let letters: Vec<String> = d.letters.iter().map(|l| format!("{l}:")).collect();
         rows.push(row("Volumi", letters.join("  ")));
+    }
+    if let Some(x) = det {
+        let folders: Vec<String> = x
+            .partitions
+            .iter()
+            .filter(|p| !p.folders.is_empty())
+            .map(|p| format!("partizione {}: {}", p.number, p.folders.join("  ")))
+            .collect();
+        if !folders.is_empty() {
+            rows.push(row("Volumi montati in cartelle", folders.join(" · ")));
+        }
     }
     if let Some(r) = smart {
         let temp = r.temperature.map(|t| format!(" · {t} °C")).unwrap_or_default();
@@ -1180,4 +1305,26 @@ fn eject_media(letters: &[char]) -> Result<(), String> {
     win::ioctl(first, IOCTL_STORAGE_EJECT_MEDIA, &[], &mut [])
         .map(|_| ())
         .map_err(|code| format!("il dispositivo non ha accettato l'espulsione ({})", win::error_text(code)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_kind_and_names() {
+        let mut p = Partition { kind: "NTFS o exFAT".into(), ..Default::default() };
+        assert_eq!(p.kind_text(), "NTFS o exFAT");
+        assert_eq!(p.names(), "");
+        p.fs = "NTFS".into();
+        p.label = "PortableBaseLayer".into();
+        assert_eq!(p.kind_text(), "NTFS");
+        assert_eq!(p.names(), "«PortableBaseLayer»");
+        p.kind = "Ripristino di Windows".into();
+        p.name = "Basic data partition".into();
+        assert_eq!(p.kind_text(), "Ripristino di Windows · NTFS");
+        assert_eq!(p.names(), "Basic data partition · «PortableBaseLayer»");
+        p.label = p.name.clone();
+        assert_eq!(p.names(), "Basic data partition");
+    }
 }

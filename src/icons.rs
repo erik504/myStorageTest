@@ -40,6 +40,16 @@ pub enum Icon {
     Volume,
     /// Gruppo di riquadri: dischi virtuali, volumi senza disco.
     Group,
+    // Grafo completo.
+    Keyboard,
+    Mouse,
+    Monitor,
+    Camera,
+    Bluetooth,
+    /// Dispositivo della scheda madre: SMBus, bridge LPC, TPM, porta seriale…
+    Chip,
+    /// Dispositivo USB generico: una spina e il corpo.
+    UsbDevice,
 }
 
 /// Disegna l'icona nel quadrato `r`.
@@ -289,6 +299,54 @@ pub fn paint(p: &Painter, r: Rect, icon: Icon, color: Color32) {
                 let x = 0.1 + k as f32 * 0.06;
                 boxed(rect(x, y, x + 0.68, y + 0.14), 0.04);
             }
+        }
+        Icon::Keyboard => {
+            boxed(rect(0.04, 0.26, 0.96, 0.74), 0.06);
+            for (row, y) in [0.38f32, 0.5].into_iter().enumerate() {
+                for k in 0..6 {
+                    let x = 0.14 + k as f32 * 0.13 + row as f32 * 0.04;
+                    solid(rect(x, y - 0.03, x + 0.07, y + 0.03));
+                }
+            }
+            seg(at(0.28, 0.63), at(0.72, 0.63));
+        }
+        Icon::Mouse => {
+            boxed(rect(0.26, 0.08, 0.74, 0.92), 0.22);
+            seg(at(0.5, 0.08), at(0.5, 0.38));
+            seg(at(0.26, 0.38), at(0.74, 0.38));
+        }
+        Icon::Monitor => {
+            boxed(rect(0.06, 0.12, 0.94, 0.68), 0.04);
+            seg(at(0.5, 0.68), at(0.5, 0.82));
+            seg(at(0.3, 0.86), at(0.7, 0.86));
+        }
+        Icon::Camera => {
+            p.circle(at(0.5, 0.42), s * 0.3, fill, line);
+            p.circle(at(0.5, 0.42), s * 0.12, Color32::TRANSPARENT, line);
+            p.circle_filled(at(0.5, 0.42), w * 0.9, color);
+            seg(at(0.5, 0.72), at(0.5, 0.84));
+            seg(at(0.28, 0.88), at(0.72, 0.88));
+        }
+        Icon::Bluetooth => {
+            p.add(Shape::line(
+                vec![at(0.28, 0.3), at(0.72, 0.68), at(0.5, 0.88), at(0.5, 0.12), at(0.72, 0.32), at(0.28, 0.7)],
+                line,
+            ));
+        }
+        Icon::Chip => {
+            boxed(rect(0.26, 0.18, 0.74, 0.82), 0.05);
+            p.circle_filled(at(0.38, 0.3), w * 0.9, color);
+            for y in [0.32, 0.5, 0.68] {
+                seg(at(0.08, y), at(0.26, y));
+                seg(at(0.74, y), at(0.92, y));
+            }
+        }
+        Icon::UsbDevice => {
+            boxed(rect(0.34, 0.06, 0.66, 0.3), 0.02);
+            solid(rect(0.41, 0.13, 0.47, 0.19));
+            solid(rect(0.53, 0.13, 0.59, 0.19));
+            boxed(rect(0.24, 0.3, 0.76, 0.92), 0.1);
+            p.circle_filled(at(0.5, 0.66), w * 1.1, color);
         }
     }
 }

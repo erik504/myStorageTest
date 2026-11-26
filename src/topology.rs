@@ -1,9 +1,13 @@
-//! Grafo Storage: come sono collegati i dischi. Per ogni disco e per ogni dispositivo PCIe si risale
-//! l'albero dei dispositivi di Windows fino al processore, si tengono i passaggi che dicono qualcosa
-//! (processore, chipset, controller, hub USB) e si uniscono le catene in un albero unico, con i dischi
-//! alla fine. Sui collegamenti: porte, velocità e banda teorica. A destra dei dischi i volumi che ne
-//! usano più d'uno e i contenitori cifrati, collegati a ciò che li ospita; in fondo i volumi senza un
-//! disco fisico, con il driver che li crea.
+//! Grafo Storage: come sono collegati i dischi. Per ogni disco e per ogni controller di dischi si
+//! risale l'albero dei dispositivi di Windows fino al processore, si tengono i passaggi che dicono
+//! qualcosa (processore, chipset, controller, hub USB) e si uniscono le catene in un albero unico, con
+//! i dischi alla fine. Sui collegamenti: porte, velocità e banda teorica. A destra dei dischi i volumi
+//! che ne usano più d'uno e i contenitori cifrati, collegati a ciò che li ospita; in fondo i volumi
+//! senza un disco fisico, con il driver che li crea.
+//!
+//! Il grafo completo aggiunge tutto il resto: gli altri dispositivi PCIe (scheda grafica, rete,
+//! audio, funzioni della scheda madre), tutti gli hub e i dispositivi USB, i monitor collegati alle
+//! schede grafiche, i codec audio e i dispositivi della scheda madre sul bus LPC e in ACPI.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -12,13 +16,14 @@ use std::ptr::{null, null_mut};
 use windows_sys::Wdk::Storage::FileSystem::{FileFsDriverPathInformation, NtQueryVolumeInformationFile};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW, CM_Get_Parent,
-    CM_Locate_DevNodeW, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+    CM_Get_Sibling, CM_Locate_DevNodeW, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiGetClassDevsW,
 };
 use windows_sys::Win32::Foundation::DEVPROPKEY;
 use windows_sys::Win32::Storage::FileSystem::{GetVolumeNameForVolumeMountPointW, QueryDosDeviceW};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameW};
-use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegGetValueW};
 
 use crate::disks::{Inventory, PhysDisk, Volume, bus_name};
 use crate::icons::Icon;
@@ -48,7 +53,7 @@ pub enum Kind {
     Hub,
     /// Bridge di un contenitore USB: il chip che fa da tramite fra l'USB e il disco (SATA o NVMe).
     Bridge,
-    /// Dispositivo PCIe che non è un disco: scheda grafica, rete, audio…
+    /// Dispositivo che non è un disco: scheda grafica, rete, audio, dispositivo USB, monitor…
     Device,
     /// Porta PCIe senza niente collegato.
     Port,
@@ -71,6 +76,8 @@ pub enum Link {
     Usb,
     /// Fatto dal software: dischi virtuali, volumi su più dischi, contenitori.
     Soft,
+    /// Solo nel grafo completo: video (monitor), HD Audio (codec), LPC e ACPI (scheda madre).
+    Other,
 }
 
 impl Link {
@@ -80,6 +87,7 @@ impl Link {
             Link::Sata => "SATA",
             Link::Usb => "USB",
             Link::Soft => "software",
+            Link::Other => "altro collegamento",
         }
     }
 }
@@ -128,6 +136,8 @@ pub struct Graph {
     pub roots: Vec<usize>,
     /// Riquadri a destra dei dischi.
     pub side: Vec<usize>,
+    /// Grafo completo: con tutti i dispositivi, non solo con quelli dei dischi.
+    pub full: bool,
 }
 
 impl Graph {
@@ -222,16 +232,73 @@ fn device_id(node: u32) -> Option<String> {
     (unsafe { CM_Get_Device_IDW(node, id.as_mut_ptr(), id.len() as u32, 0) } == 0).then(|| win::from_wide(&id))
 }
 
-/// Classe e sottoclasse PCI di un dispositivo (0x03 = scheda grafica, 0x02 = rete…).
+/// Classe e sottoclasse PCI di un dispositivo (0x03 = scheda grafica, 0x02 = rete…). Se il driver
+/// PCI non le dichiara (succede ai ponti verso il processore), dagli ID compatibili: «PCI\CC_0600».
 fn pci_class(node: u32) -> Option<(u8, u8)> {
     const PCI: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x3ab22e31_8264_4b4e_9af5_a8d2d8e33e62);
+    const CM_DRP_COMPATIBLEIDS: u32 = 0x03;
     let get = |pid: u32| -> Option<u8> {
         let key = DEVPROPKEY { fmtid: PCI, pid };
         let (mut kind, mut buf, mut len) = (0u32, [0u8; 8], 8u32);
         let rc = unsafe { CM_Get_DevNode_PropertyW(node, &key, &mut kind, buf.as_mut_ptr(), &mut len, 0) };
         (rc == 0 && len >= 1).then_some(buf[0])
     };
-    Some((get(3)?, get(4)?))
+    get(3).zip(get(4)).or_else(|| {
+        dev_multi(node, CM_DRP_COMPATIBLEIDS).iter().find_map(|id| {
+            let up = id.to_ascii_uppercase();
+            let at = up.find("CC_")? + 3;
+            let hex = |k: usize| u8::from_str_radix(up.get(at + k..at + k + 2)?, 16).ok();
+            Some((hex(0)?, hex(2)?))
+        })
+    })
+}
+
+/// Nome di un dispositivo: quello che mostra Windows.
+fn name_of(node: u32) -> String {
+    let friendly = dev_string(node, CM_DRP_FRIENDLYNAME);
+    if friendly.is_empty() { dev_string(node, CM_DRP_DEVICEDESC) } else { friendly }
+}
+
+fn dev_with_id(node: u32, id: String) -> Dev {
+    Dev {
+        node,
+        name: name_of(node),
+        service: dev_string(node, CM_DRP_SERVICE).to_ascii_lowercase(),
+        class: dev_string(node, CM_DRP_CLASS).to_ascii_lowercase(),
+        location: dev_string(node, CM_DRP_LOCATION_INFORMATION),
+        address: dev_u32(node, CM_DRP_ADDRESS),
+        paths: dev_multi(node, CM_DRP_LOCATION_PATHS),
+        slot: dev_u32(node, CM_DRP_UI_NUMBER),
+        id,
+    }
+}
+
+fn dev_at(node: u32) -> Option<Dev> {
+    device_id(node).map(|id| dev_with_id(node, id))
+}
+
+/// I figli di un dispositivo nell'albero di Windows (solo quelli presenti).
+fn children_of(node: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cur = 0u32;
+    if unsafe { CM_Get_Child(&mut cur, node, 0) } != 0 {
+        return out;
+    }
+    loop {
+        out.push(cur);
+        let mut next = 0u32;
+        if out.len() >= 512 || unsafe { CM_Get_Sibling(&mut next, cur, 0) } != 0 {
+            break;
+        }
+        cur = next;
+    }
+    out
+}
+
+fn locate(instance_id: &str) -> Option<u32> {
+    let id = win::wide(instance_id);
+    let mut node = 0u32;
+    (!instance_id.is_empty() && unsafe { CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) } == 0).then_some(node)
 }
 
 /// La catena di un dispositivo, dalla radice dell'albero (esclusa) fino a lui.
@@ -244,18 +311,7 @@ fn chain_of(start: u32) -> Vec<Dev> {
         if up.starts_with("HTREE\\ROOT") || up.starts_with("ROOT\\ACPI_HAL") || up.starts_with("ACPI_HAL\\") {
             break;
         }
-        let friendly = dev_string(node, CM_DRP_FRIENDLYNAME);
-        out.push(Dev {
-            node,
-            name: if friendly.is_empty() { dev_string(node, CM_DRP_DEVICEDESC) } else { friendly },
-            service: dev_string(node, CM_DRP_SERVICE).to_ascii_lowercase(),
-            class: dev_string(node, CM_DRP_CLASS).to_ascii_lowercase(),
-            location: dev_string(node, CM_DRP_LOCATION_INFORMATION),
-            address: dev_u32(node, CM_DRP_ADDRESS),
-            paths: dev_multi(node, CM_DRP_LOCATION_PATHS),
-            slot: dev_u32(node, CM_DRP_UI_NUMBER),
-            id,
-        });
+        out.push(dev_with_id(node, id));
         let mut parent = 0u32;
         if unsafe { CM_Get_Parent(&mut parent, node, 0) } != 0 {
             break;
@@ -267,26 +323,21 @@ fn chain_of(start: u32) -> Vec<Dev> {
 }
 
 fn chain_of_id(instance_id: &str) -> Vec<Dev> {
-    let id = win::wide(instance_id);
-    let mut node = 0u32;
-    if instance_id.is_empty() || unsafe { CM_Locate_DevNodeW(&mut node, id.as_ptr(), 0) } != 0 {
-        return Vec::new();
-    }
-    chain_of(node)
+    locate(instance_id).map(chain_of).unwrap_or_default()
 }
 
-/// Tutti i dispositivi PCI presenti, ponti compresi.
-fn pci_devices() -> Vec<u32> {
+/// Tutti i dispositivi presenti di un bus («PCI», ponti compresi; «USB», hub e interfacce compresi).
+fn present_devices(enumerator: &str) -> Vec<u32> {
     const DIGCF_PRESENT: u32 = 0x2;
     const DIGCF_ALLCLASSES: u32 = 0x4;
     let mut out = Vec::new();
-    let enumerator = win::wide("PCI");
+    let enumerator = win::wide(enumerator);
     unsafe {
         let set = SetupDiGetClassDevsW(null(), enumerator.as_ptr(), null_mut(), DIGCF_PRESENT | DIGCF_ALLCLASSES);
         if set as isize == -1 || set as isize == 0 {
             return out;
         }
-        for index in 0..512u32 {
+        for index in 0..1024u32 {
             let mut info: SP_DEVINFO_DATA = std::mem::zeroed();
             info.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
             if SetupDiEnumDeviceInfo(set, index, &mut info) == 0 {
@@ -378,6 +429,37 @@ fn vendor(v: u16) -> Option<&'static str> {
         0x1987 => "Phison",
         0xC0A9 => "Micron / Crucial",
         0x1DBE => "INNOGRIT",
+        // Dispositivi USB e altre schede, per il grafo completo.
+        0x046D => "Logitech",
+        0x045E => "Microsoft",
+        0x0B05 | 0x1043 => "ASUS",
+        0x3434 => "Keychron",
+        0x0A12 => "Qualcomm CSR",
+        0x17E9 => "DisplayLink",
+        0x0424 => "Microchip",
+        0x1532 => "Razer",
+        0x1038 => "SteelSeries",
+        0x1B1C => "Corsair",
+        0x0D8C => "C-Media",
+        0x046A => "Cherry",
+        0x8087 => "Intel",
+        0x0CF3 => "Qualcomm Atheros",
+        0x13D3 => "IMC Networks",
+        0x0B95 => "ASIX",
+        0x2357 => "TP-Link",
+        0x0E8D | 0x14C3 => "MediaTek",
+        0x1912 => "Renesas",
+        0x1106 => "VIA",
+        0x05AC => "Apple",
+        0x054C => "Sony",
+        0x057E => "Nintendo",
+        0x28DE => "Valve",
+        0x0C45 => "Microdia",
+        0x04F2 => "Chicony",
+        0x046E => "Behavior Tech",
+        0x1462 => "MSI",
+        0x1458 => "Gigabyte",
+        0x1849 => "ASRock",
         _ => return None,
     })
 }
@@ -935,12 +1017,13 @@ pub fn disk_icon(d: &PhysDisk, rpm: Option<u16>) -> Icon {
 }
 
 /// Il percorso di un disco, dalla radice a lui. Restituisce anche il controller NVMe, che nel grafo
-/// è il disco stesso.
-fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
+/// è il disco stesso, e il dispositivo USB che lo contiene (il bridge o la chiavetta).
+fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>, Option<String>) {
     let chain = chain_of_id(&d.instance_id);
     let last = chain.len().saturating_sub(1);
     let mut w = walk(&chain, last, cpu, d.bus == crate::disks::BUS_NVME);
     let nvme_id = w.nvme.map(|n| n.id.clone());
+    let usb_id = w.usb_device.map(|u| u.id.clone());
 
     // Un disco di cui Windows non dà la catena (succede ad alcuni dischi virtuali) sta comunque sotto
     // un riquadro, invece di restare isolato.
@@ -972,6 +1055,9 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
             format!(" · {}", d.letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" "))
         }
     )];
+    if let Some(note) = d.virtual_note() {
+        lines.push(note);
+    }
     let mut leaf = item(
         format!("disk:{}", d.number),
         Kind::Disk,
@@ -1169,7 +1255,14 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
     }
     if virtual_bus {
         n.order = format!("v{:03}", d.number);
-        n.bw_tip = "Disco virtuale: i dati stanno in un file o in un altro disco, e la velocità dipende da lì.".into();
+        n.bw_tip = if d.backing_file.is_empty() {
+            "Disco virtuale: i dati stanno in un file o in un altro disco, e la velocità dipende da lì.".into()
+        } else {
+            format!(
+                "Disco virtuale: i dati stanno nel file {}, e la velocità dipende dal disco che lo ospita.",
+                d.backing_file
+            )
+        };
     }
     if n.bw_tip.is_empty() && !virtual_bus {
         n.bw_tip = "Windows non dichiara la velocità di questo collegamento.".into();
@@ -1186,18 +1279,22 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
     if !d.serial.is_empty() {
         n.ids.push(("Numero di serie".to_string(), d.serial.clone()));
     }
+    if !d.backing_file.is_empty() {
+        n.ids.push(("File del disco virtuale".to_string(), d.backing_file.clone()));
+    }
     n.ids.extend(more_ids);
     n.disk = Some(d.number);
     n.letters = d.letters.clone();
     w.items.extend(bridge);
     w.items.push(leaf);
-    (w.items, nvme_id)
+    (w.items, nvme_id, usb_id)
 }
 
-/// Riquadro di un dispositivo PCIe che non porta a dischi: scheda grafica, rete, audio, controller
-/// senza dischi. `None` per le funzioni interne che non interessano (ponti del processore,
-/// strumentazione, sicurezza).
-fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Option<Vec<Item>> {
+/// Riquadro di un dispositivo PCIe che non porta a dischi: controller di dischi senza dischi, porta
+/// libera; nel grafo completo (`full`) anche scheda grafica, rete, audio, controller USB senza dischi e
+/// le funzioni della scheda madre. `None` per ciò che non va mostrato (le parti del processore, le
+/// funzioni fittizie).
+fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>, full: bool) -> Option<Vec<Item>> {
     let dev = chain.last()?;
     if !chain.first().is_some_and(is_root) {
         return None;
@@ -1225,32 +1322,44 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
         w.items.push(it);
         return Some(w.items);
     }
-    // Le funzioni integrate nel complesso radice (bus 0) non passano da una porta.
-    if bus == 0 {
-        return None;
-    }
     let (base, sub) = pci_class(dev.node).unwrap_or((0xFF, 0));
-    if matches!(base, 0x06 | 0x08 | 0x10 | 0x11 | 0x13) {
+    // I ponti verso il processore (host bridge) sono parti del processore; le funzioni di
+    // strumentazione AMD sono fittizie.
+    if (base, sub) == (0x06, 0x00) || base == 0x13 {
         return None;
     }
     // L'audio HDMI della scheda grafica è una funzione della scheda stessa.
     if base == 0x04 && gpu_audio.contains(&(bus, slot)) {
         return None;
     }
-    if matches!(base, 0x01 | 0x0C) && !(base == 0x0C && sub != 0x03) {
+    // Nel grafo dei dischi, solo i controller di dischi.
+    if !full && base != 0x01 {
+        return None;
+    }
+    if base == 0x01 || (base, sub) == (0x0C, 0x03) {
         w.items.push(controller_item(dev, &mut w.port, w.uplink, false));
         return Some(w.items);
     }
     let (v, devid) = ids(&dev.id).unwrap_or_default();
     let maker = vendor(v).map(|m| format!("{m} · ")).unwrap_or_default();
     let lower = dev.name.to_ascii_lowercase();
-    let (icon, what, role) = match base {
-        0x03 => (Icon::Gpu, "La scheda", "scheda grafica"),
-        0x02 if lower.contains("wi-fi") || lower.contains("wireless") || lower.contains("wlan") => {
+    let (icon, what, role) = match (base, sub) {
+        (0x03, _) => (Icon::Gpu, "La scheda", "scheda grafica"),
+        (0x02, _) if lower.contains("wi-fi") || lower.contains("wireless") || lower.contains("wlan") => {
             (Icon::Network, "La scheda", "rete senza fili")
         }
-        0x02 => (Icon::Network, "La scheda", "scheda di rete"),
-        0x04 => (Icon::Audio, "Il dispositivo", "audio"),
+        (0x02, _) => (Icon::Network, "La scheda", "scheda di rete"),
+        (0x04, _) => (Icon::Audio, "Il dispositivo", "audio"),
+        (0x0D, _) => (Icon::Bluetooth, "Il dispositivo", "senza fili"),
+        (0x06, 0x01) => (Icon::Chip, "Il bridge", "verso il bus LPC della scheda madre"),
+        (0x06, _) => (Icon::Chip, "Il bridge", "bridge"),
+        (0x0C, 0x05) => (Icon::Chip, "Il controller", "SMBus: sensori, memorie, LED"),
+        (0x0C, _) => (Icon::Controller, "Il controller", "controller di bus seriale"),
+        (0x08, _) => (Icon::Chip, "Il dispositivo", "periferica di sistema"),
+        (0x10, _) => (Icon::Chip, "Il dispositivo", "sicurezza e cifratura"),
+        (0x11, _) => (Icon::Chip, "Il dispositivo", "acquisizione di segnali"),
+        (0x07, _) => (Icon::Controller, "Il dispositivo", "comunicazione"),
+        (0x09, _) => (Icon::Controller, "Il dispositivo", "input"),
         _ => (Icon::Controller, "Il dispositivo", ""),
     };
     let via = w.port.take();
@@ -1264,6 +1373,9 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
     }
     if internal {
         first = format!("{first} · dentro il processore").trim_start_matches(" · ").to_string();
+    } else if bus == 0 {
+        // Funzioni integrate nel complesso radice: non passano da una porta.
+        first = format!("{first} · integrato").trim_start_matches(" · ").to_string();
     }
     let mut lines = Vec::new();
     if !first.is_empty() {
@@ -1277,11 +1389,13 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
             info::pcie_label(l.max_gen, l.max_width)
         ));
     }
+    // «Adattatore PCI standard per bus ISA» dice poco: oggi è il bus LPC.
+    let title = if (base, sub) == (0x06, 0x01) { "Bridge LPC (ISA)".to_string() } else { dev.name.clone() };
     let mut it = item(
         format!("pci:{}", dev.id),
         Kind::Device,
         icon,
-        dev.name.clone(),
+        title,
         lines,
         format!(
             "{}{}",
@@ -1298,6 +1412,295 @@ fn device_path(chain: &[Dev], cpu: &str, gpu_audio: &HashSet<(u32, u32)>) -> Opt
     it.node.order = via.map(|p| p.addr).unwrap_or(at);
     w.items.push(it);
     Some(w.items)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grafo completo: dispositivi USB, monitor, codec audio, scheda madre
+// ---------------------------------------------------------------------------------------------
+
+/// Classe di Windows e nome dei dispositivi sotto `node` (interfacce USB, collezioni HID, monitor,
+/// uscite audio…), fino a tre livelli.
+fn sub_devices(node: u32) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut level = vec![node];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for n in level {
+            for c in children_of(n) {
+                out.push((dev_string(c, CM_DRP_CLASS).to_ascii_lowercase(), name_of(c)));
+                next.push(c);
+            }
+        }
+        level = next;
+    }
+    out
+}
+
+/// Che cosa è un dispositivo USB, dalle classi delle sue interfacce e dal nome: icona e ruolo.
+fn usb_role(dev: &Dev, product: &str, subs: &[(String, String)]) -> (Icon, &'static str) {
+    let has = |c: &str| dev.class == c || subs.iter().any(|(k, _)| k == c);
+    let name = format!("{product} {}", dev.name).to_lowercase();
+    let named = |w: &[&str]| w.iter().any(|k| name.contains(k));
+    if has("bluetooth") {
+        (Icon::Bluetooth, "adattatore Bluetooth")
+    } else if has("display") {
+        // Schede video USB (DisplayLink) e monitor alimentati dall'USB.
+        (Icon::Monitor, "scheda video USB")
+    } else if has("camera") {
+        (Icon::Camera, "webcam")
+    } else if has("image") {
+        (Icon::Camera, "fotocamera o scanner")
+    } else if matches!(dev.service.as_str(), "usbstor" | "uaspstor") || has("diskdrive") || has("cdrom") {
+        (Icon::UsbDrive, "archiviazione USB")
+    } else if named(&["mouse"]) && has("mouse") {
+        (Icon::Mouse, "mouse")
+    } else if named(&["keyboard", "tastiera"]) && has("keyboard") {
+        (Icon::Keyboard, "tastiera")
+    } else if has("keyboard") && has("mouse") {
+        (Icon::Keyboard, "tastiera e mouse")
+    } else if has("keyboard") {
+        (Icon::Keyboard, "tastiera")
+    } else if has("mouse") {
+        (Icon::Mouse, "mouse")
+    } else if has("media") || has("audioendpoint") {
+        (Icon::Audio, "audio")
+    } else if has("net") {
+        (Icon::Network, "scheda di rete USB")
+    } else if has("printer") {
+        (Icon::UsbDevice, "stampante")
+    } else if has("ports") {
+        (Icon::UsbDevice, "porta seriale USB")
+    } else if has("wpd") {
+        (Icon::UsbDevice, "telefono o lettore multimediale")
+    } else if has("smartcardreader") {
+        (Icon::UsbDevice, "lettore di smart card")
+    } else if has("biometric") {
+        (Icon::UsbDevice, "lettore di impronte")
+    } else if named(&["billboard"]) {
+        (Icon::UsbDevice, "Billboard: descrive le modalità USB-C")
+    } else if has("hidclass") {
+        (Icon::UsbDevice, "dispositivo HID")
+    } else {
+        (Icon::UsbDevice, "dispositivo USB")
+    }
+}
+
+/// Riquadro di un dispositivo USB che non è un hub né un disco: tastiera, mouse, audio, webcam…
+fn usb_device_item(dev: &Dev) -> Item {
+    let (v, p) = ids(&dev.id).unwrap_or_default();
+    let product = bus_reported_name(dev.node);
+    let subs = sub_devices(dev.node);
+    let (icon, role) = usb_role(dev, &product, &subs);
+    let maker = vendor(v).map(|m| format!(" · {m}")).unwrap_or_default();
+    let mut lines = vec![role.to_string(), format!("{v:04X}:{p:04X}{maker}")];
+    let mut tip = dev.name.clone();
+    if !product.is_empty() {
+        tip.push_str(&format!("\nProdotto USB: {product}"));
+    }
+    // Le funzioni che Windows ha trovato: interfacce, tastiere, mouse, uscite audio…
+    let mut parts: Vec<&str> = Vec::new();
+    for (class, name) in &subs {
+        if !matches!(class.as_str(), "" | "softwarecomponent") && !parts.contains(&name.as_str()) && parts.len() < 10 {
+            parts.push(name);
+        }
+    }
+    if !parts.is_empty() {
+        tip.push_str(&format!("\nFunzioni: {}", parts.join(", ")));
+    }
+    let title = if product.is_empty() { dev.name.clone() } else { product.clone() };
+    let mut it = item(format!("usbdev:{}", dev.id), Kind::Device, icon, title, Vec::new(), tip);
+    let n = &mut it.node;
+    n.domain = Link::Usb;
+    n.link = Link::Usb;
+    n.ids = dev_ids(dev, "");
+    if !product.is_empty() {
+        n.ids.push(("Prodotto USB".to_string(), product));
+    }
+    n.link_ids = usb_port_ids(dev);
+    n.edge = dev.address.map(|a| format!("porta {a}")).unwrap_or_default();
+    n.order = format!("p{:03}", dev.address.unwrap_or(0));
+    match info::usb_link(&dev.id) {
+        Some(u) => {
+            let (text, slow) = info::usb_short(&u);
+            lines.push(text);
+            n.warn = slow;
+            n.bw = Some(usb_bw(u.speed));
+            n.bw_tip = usb_tip(&u, "Il dispositivo");
+        }
+        None => n.bw_tip = "Windows non dichiara la velocità di questo collegamento USB.".into(),
+    }
+    n.lines = lines;
+    it
+}
+
+/// Nome del modello, sigla del produttore e risoluzione nativa di un monitor, dall'EDID che Windows
+/// conserva nel registro.
+fn monitor_edid(instance_id: &str) -> Option<(String, String, Option<(u32, u32)>)> {
+    let key = win::wide(&format!("SYSTEM\\CurrentControlSet\\Enum\\{instance_id}\\Device Parameters"));
+    let value = win::wide("EDID");
+    let mut buf = [0u8; 512];
+    let mut len = buf.len() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_BINARY,
+            null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    parse_edid(&buf[..(len as usize).min(buf.len())])
+}
+
+fn parse_edid(e: &[u8]) -> Option<(String, String, Option<(u32, u32)>)> {
+    if e.len() < 128 || e[..8] != [0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0] {
+        return None;
+    }
+    // Tre lettere da cinque bit ciascuna: «DEL», «AOC», «ACI»…
+    let m = u16::from_be_bytes([e[8], e[9]]);
+    let maker: String = [(m >> 10) & 31, (m >> 5) & 31, m & 31]
+        .iter()
+        .map(|&c| (b'@' + c as u8) as char)
+        .collect();
+    let mut name = String::new();
+    for at in [54usize, 72, 90, 108] {
+        let d = &e[at..at + 18];
+        if d[0] == 0 && d[1] == 0 && d[3] == 0xFC {
+            name = d[5..]
+                .iter()
+                .take_while(|&&b| b != 0x0A && b != 0)
+                .map(|&b| b as char)
+                .collect::<String>()
+                .trim()
+                .to_string();
+        }
+    }
+    // Il primo descrittore dettagliato è la risoluzione nativa.
+    let d = &e[54..72];
+    let native = (u16::from_le_bytes([d[0], d[1]]) != 0).then(|| {
+        (d[2] as u32 | ((d[4] as u32 & 0xF0) << 4), d[5] as u32 | ((d[7] as u32 & 0xF0) << 4))
+    });
+    Some((name, maker, native))
+}
+
+/// Riquadro di un monitor, sotto la scheda grafica (o la scheda video USB) a cui è collegato.
+fn monitor_item(dev: &Dev) -> Item {
+    let model = dev.id.split('\\').nth(1).unwrap_or_default().to_string();
+    let edid = monitor_edid(&dev.id);
+    let lower = dev.name.to_lowercase();
+    let generic = dev.name.is_empty() || lower.contains("generic") || lower.contains("pnp");
+    let edid_name = edid.as_ref().map(|(n, _, _)| n.clone()).filter(|n| !n.is_empty());
+    let title = match &edid_name {
+        _ if !generic => dev.name.clone(),
+        Some(n) => format!("Monitor {n}"),
+        None => format!("Monitor {model}"),
+    };
+    // Windows a volte scrive il collegamento nel nome: «Dell U2717D (HDMI)».
+    let conn = ["HDMI", "DisplayPort", "DP", "DVI", "VGA"]
+        .into_iter()
+        .find(|c| dev.name.contains(&format!("({c}")))
+        .unwrap_or("");
+    let mut first = "monitor".to_string();
+    if let Some((w, h)) = edid.as_ref().and_then(|(_, _, r)| *r) {
+        first.push_str(&format!(" · {w}×{h}"));
+    }
+    let mut second = model.clone();
+    if let Some(n) = edid_name.as_ref().filter(|n| !title.to_lowercase().contains(&n.to_lowercase())) {
+        second.push_str(&format!(" · {n}"));
+    }
+    let mut tip = dev.name.clone();
+    if let Some((name, maker, _)) = &edid {
+        tip.push_str(&format!("\nDall'EDID: {maker} {name}"));
+    }
+    let mut it = item(format!("dev:{}", dev.id), Kind::Device, Icon::Monitor, title, vec![first, second], tip);
+    it.node.domain = Link::Other;
+    it.node.link = Link::Other;
+    it.node.edge = conn.to_string();
+    it.node.ids = dev_ids(dev, "");
+    it.node.bw_tip = format!(
+        "Collegamento video{}: Windows non ne dichiara la banda.",
+        if conn.is_empty() { String::new() } else { format!(" {conn}") }
+    );
+    it.node.order = format!("m{}", dev.id);
+    it
+}
+
+/// Riquadro di un codec audio, sotto il controller HD Audio: ha i convertitori e le prese.
+fn codec_item(dev: &Dev) -> Item {
+    let (v, d) = ids(&dev.id).unwrap_or_default();
+    let maker = vendor(v).map(|m| format!("{m} · ")).unwrap_or_default();
+    let mut it = item(
+        format!("dev:{}", dev.id),
+        Kind::Device,
+        Icon::Audio,
+        dev.name.clone(),
+        vec!["codec audio".into(), format!("{maker}{v:04X}:{d:04X}")],
+        dev.name.clone(),
+    );
+    it.node.domain = Link::Other;
+    it.node.link = Link::Other;
+    it.node.edge = "HD Audio".into();
+    it.node.ids = dev_ids(dev, "");
+    it.node.bw_tip = "Collegamento HD Audio fra il controller e il codec, che ha i convertitori e le prese audio.".into();
+    it.node.order = format!("c{}", dev.id);
+    it
+}
+
+/// Riquadro di un dispositivo della scheda madre dichiarato dal firmware (ACPI), sul bus LPC o no.
+/// `None` per le risorse di sistema (timer, interruzioni, orologio, pulsanti…), che non sono
+/// collegamenti.
+fn acpi_item(dev: &Dev, lpc: bool) -> Option<Item> {
+    let hid = dev.id.split('\\').nth(1).unwrap_or_default().to_ascii_uppercase();
+    let (icon, role) = match dev.class.as_str() {
+        "keyboard" => (Icon::Keyboard, "tastiera PS/2 o integrata"),
+        "mouse" => (Icon::Mouse, "mouse PS/2 o touchpad"),
+        "ports" => (Icon::Chip, "porta seriale o parallela"),
+        "securitydevices" => (Icon::Chip, "sicurezza"),
+        "battery" => (Icon::Chip, "batteria"),
+        "hidclass" => (Icon::Chip, "dispositivo di input"),
+        "system" if hid == "PNP0C09" => (Icon::Chip, "controller integrato (EC)"),
+        "system" | "processor" | "computer" | "" => return None,
+        _ => (Icon::Chip, ""),
+    };
+    let mut lines = Vec::new();
+    if !role.is_empty() {
+        lines.push(role.to_string());
+    }
+    lines.push(hid.clone());
+    let mut it = item(format!("dev:{}", dev.id), Kind::Device, icon, dev.name.clone(), lines, dev.name.clone());
+    it.node.domain = Link::Other;
+    it.node.link = Link::Other;
+    it.node.edge = if lpc { "LPC" } else { "ACPI" }.into();
+    it.node.ids = dev_ids(dev, "");
+    it.node.bw_tip = if lpc {
+        "Bus LPC della scheda madre: collega i dispositivi lenti, come porte seriali, controller integrato e TPM \
+         separato."
+            .into()
+    } else {
+        "Dispositivo dichiarato dal firmware della scheda madre (ACPI): Windows non dice per quale bus passa.".into()
+    };
+    it.node.order = format!("z{hid}");
+    Some(it)
+}
+
+/// Ciò che sta attaccato a un dispositivo già nel grafo e non porta oltre: monitor, codec audio,
+/// dispositivi LPC o ACPI.
+fn attached_item(dev: &Dev, lpc: bool) -> Option<Item> {
+    let up = dev.id.to_ascii_uppercase();
+    if dev.class == "monitor" {
+        Some(monitor_item(dev))
+    } else if up.starts_with("HDAUDIO\\FUNC_01") {
+        Some(codec_item(dev))
+    } else if up.starts_with("ACPI\\") {
+        acpi_item(dev, lpc)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1559,39 +1962,49 @@ fn volume_size_line(v: &Volume) -> String {
 // Costruzione
 // ---------------------------------------------------------------------------------------------
 
-/// Costruisce il grafo: tutti i dischi, i dispositivi PCIe, i volumi su più dischi, i contenitori e i
-/// volumi senza un disco fisico.
-pub fn build(inv: &Inventory) -> Graph {
+/// Aggiunge un riquadro sotto `parent` (o come radice), se non c'è già; restituisce il suo numero.
+fn add_item(g: &mut Graph, index: &mut HashMap<String, usize>, parent: Option<usize>, it: Item) -> usize {
+    if let Some(&n) = index.get(&it.key) {
+        return n;
+    }
+    let n = g.nodes.len();
+    g.nodes.push(it.node);
+    index.insert(it.key, n);
+    match parent {
+        Some(p) => g.nodes[p].children.push(n),
+        None => g.roots.push(n),
+    }
+    n
+}
+
+/// Costruisce il grafo: tutti i dischi, i controller di dischi, i volumi su più dischi, i contenitori
+/// e i volumi senza un disco fisico. `full`: anche tutti gli altri dispositivi e i loro collegamenti.
+pub fn build(inv: &Inventory, full: bool) -> Graph {
     let cpu = cpu_name();
-    let mut g = Graph::default();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let add = |g: &mut Graph, index: &mut HashMap<String, usize>, parent: Option<usize>, it: Item| -> usize {
-        if let Some(&n) = index.get(&it.key) {
-            return n;
-        }
-        let n = g.nodes.len();
-        g.nodes.push(it.node);
-        index.insert(it.key, n);
-        match parent {
-            Some(p) => g.nodes[p].children.push(n),
-            None => g.roots.push(n),
-        }
-        n
+    let mut g = Graph {
+        full,
+        ..Graph::default()
     };
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let add = add_item;
 
     // I dischi, ciascuno con il suo percorso.
     let mut merged: HashSet<String> = HashSet::new();
+    let mut disk_usb: HashSet<String> = HashSet::new();
     for d in &inv.disks {
-        let (items, nvme) = path_of(d, &cpu);
+        let (items, nvme, usb) = path_of(d, &cpu);
         merged.extend(nvme);
+        disk_usb.extend(usb);
         let mut parent = None;
         for it in items {
             parent = Some(add(&mut g, &mut index, parent, it));
         }
     }
 
-    // Gli altri dispositivi PCIe: scheda grafica, rete, audio, controller senza dischi, porte libere.
-    let chains: Vec<Vec<Dev>> = pci_devices().into_iter().map(chain_of).filter(|c| !c.is_empty()).collect();
+    // Gli altri dispositivi PCIe: controller senza dischi e porte libere; nel grafo completo anche
+    // scheda grafica, rete, audio e le funzioni della scheda madre.
+    let chains: Vec<Vec<Dev>> =
+        present_devices("PCI").into_iter().map(chain_of).filter(|c| !c.is_empty()).collect();
     let mut gpus: HashSet<(u32, u32)> = HashSet::new();
     let mut audio: HashSet<(u32, u32)> = HashSet::new();
     for c in &chains {
@@ -1614,10 +2027,82 @@ pub fn build(inv: &Inventory) -> Graph {
         if index.contains_key(&format!("pci:{}", dev.id)) || merged.contains(&dev.id) {
             continue;
         }
-        let Some(items) = device_path(c, &cpu, &gpu_audio) else { continue };
+        let Some(items) = device_path(c, &cpu, &gpu_audio, full) else { continue };
         let mut parent = None;
         for it in items {
             parent = Some(add(&mut g, &mut index, parent, it));
+        }
+    }
+
+    if full {
+        // Tutti gli hub e i dispositivi USB, con il loro percorso. Le interfacce sono parti del
+        // dispositivo; i bridge e le chiavette dei dischi ci sono già.
+        for node in present_devices("USB") {
+            let Some(id) = device_id(node) else { continue };
+            let up = id.to_ascii_uppercase();
+            if up.starts_with("USB\\ROOT_HUB") || up.contains("&MI_") || disk_usb.contains(&id) {
+                continue;
+            }
+            let chain = chain_of(node);
+            let Some(dev) = chain.last().filter(|_| chain.first().is_some_and(is_root)) else { continue };
+            let hub = dev.service.starts_with("usbhub");
+            let w = walk(&chain, if hub { chain.len() } else { chain.len() - 1 }, &cpu, false);
+            let mut parent = None;
+            for it in w.items {
+                parent = Some(add(&mut g, &mut index, parent, it));
+            }
+            if !hub {
+                add(&mut g, &mut index, parent, usb_device_item(dev));
+            }
+        }
+
+        // Ciò che sta attaccato ai dispositivi del grafo: monitor delle schede grafiche (anche USB),
+        // codec audio, dispositivi della scheda madre sul bus LPC; sotto il processore i dispositivi
+        // ACPI della piattaforma (TPM, batteria…).
+        let mut known: Vec<(usize, String)> = index.iter().map(|(k, &n)| (n, k.clone())).collect();
+        known.sort();
+        let mut extra: Vec<(usize, Item)> = Vec::new();
+        for (n, key) in &known {
+            let Some((kind, id)) = key.split_once(':') else { continue };
+            let Some(node) = locate(id) else { continue };
+            match kind {
+                "pci" | "usbdev" => {
+                    let lpc = pci_class(node) == Some((0x06, 0x01));
+                    for c in children_of(node) {
+                        let Some(dev) = dev_at(c) else { continue };
+                        if let Some(it) = attached_item(&dev, lpc) {
+                            extra.push((*n, it));
+                        } else if dev.id.to_ascii_uppercase().contains("&MI_") {
+                            // I monitor delle schede video USB stanno sotto un'interfaccia.
+                            for cc in children_of(c) {
+                                if let Some(m) = dev_at(cc).filter(|m| m.class == "monitor") {
+                                    extra.push((*n, monitor_item(&m)));
+                                }
+                            }
+                        }
+                    }
+                }
+                "cpu" => {
+                    // I dispositivi ACPI sotto il complesso radice e accanto a lui.
+                    let mut acpi = 0u32;
+                    let mut around = children_of(node);
+                    if unsafe { CM_Get_Parent(&mut acpi, node, 0) } == 0 {
+                        around.extend(children_of(acpi).into_iter().filter(|&c| c != node));
+                    }
+                    for c in around {
+                        let Some(dev) = dev_at(c).filter(|d| d.id.to_ascii_uppercase().starts_with("ACPI\\")) else {
+                            continue;
+                        };
+                        if let Some(it) = acpi_item(&dev, false) {
+                            extra.push((*n, it));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (parent, it) in extra {
+            add(&mut g, &mut index, Some(parent), it);
         }
     }
 
@@ -1815,4 +2300,71 @@ pub fn build(inv: &Inventory) -> Graph {
     }
     g.roots.sort_by_key(|&r| (g.nodes[r].kind != Kind::Cpu, g.nodes[r].title.starts_with("Senza")));
     g
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usb_dev(class: &str, name: &str) -> Dev {
+        Dev {
+            node: 0,
+            id: r"USB\VID_046D&PID_C081\1".into(),
+            service: String::new(),
+            class: class.into(),
+            name: name.into(),
+            location: String::new(),
+            address: Some(2),
+            paths: Vec::new(),
+            slot: None,
+        }
+    }
+
+    #[test]
+    fn edid_name_maker_and_native_resolution() {
+        let mut e = vec![0u8; 128];
+        e[..8].copy_from_slice(&[0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]);
+        // «DEL»: D=4, E=5, L=12 → 00100 00101 01100.
+        e[8..10].copy_from_slice(&((4u16 << 10) | (5 << 5) | 12).to_be_bytes());
+        // Primo descrittore: 2560×1440 (A00 × 5A0).
+        e[54..56].copy_from_slice(&24150u16.to_le_bytes());
+        e[56] = 0x00;
+        e[58] = 0xA0;
+        e[59] = 0xA0;
+        e[61] = 0x50;
+        // Nome del monitor nel quarto descrittore.
+        e[108..113].copy_from_slice(&[0, 0, 0, 0xFC, 0]);
+        e[113..126].copy_from_slice(b"DELL U2717D\n ");
+        let (name, maker, native) = parse_edid(&e).unwrap();
+        assert_eq!((name.as_str(), maker.as_str(), native), ("DELL U2717D", "DEL", Some((2560, 1440))));
+        e[0] = 1;
+        assert!(parse_edid(&e).is_none());
+    }
+
+    #[test]
+    fn usb_roles_from_interfaces_and_name() {
+        let subs = |v: &[&str]| v.iter().map(|c| (c.to_string(), String::new())).collect::<Vec<_>>();
+        // Un mouse che dichiara anche una tastiera (per le macro) resta un mouse.
+        let mouse = usb_dev("usb", "Dispositivo USB composito");
+        assert_eq!(usb_role(&mouse, "Gaming Mouse G900", &subs(&["hidclass", "mouse", "keyboard"])).1, "mouse");
+        // Un ricevitore senza nome che dica di più: tastiera e mouse.
+        assert_eq!(usb_role(&mouse, "USB Receiver", &subs(&["hidclass", "keyboard", "mouse"])).1, "tastiera e mouse");
+        // Cuffie: audio, anche con i tasti HID; schede video USB prima dell'audio che hanno anche loro.
+        assert_eq!(usb_role(&mouse, "B25", &subs(&["media", "hidclass", "audioendpoint"])).1, "audio");
+        assert_eq!(usb_role(&mouse, "", &subs(&["display", "monitor", "media"])).0, Icon::Monitor);
+        assert_eq!(usb_role(&usb_dev("usbdevice", "USB Billboard Device"), "", &[]).0, Icon::UsbDevice);
+        assert_eq!(usb_role(&mouse, "", &subs(&["bluetooth"])).1, "adattatore Bluetooth");
+    }
+
+    #[test]
+    fn acpi_system_resources_are_not_shown() {
+        let mut dev = usb_dev("system", "Timer di sistema");
+        dev.id = r"ACPI\PNP0100\4&24015488&0".into();
+        assert!(acpi_item(&dev, true).is_none());
+        dev.id = r"ACPI\PNP0C09\4&24015488&0".into();
+        assert_eq!(acpi_item(&dev, true).unwrap().node.edge, "LPC");
+        dev.class = "securitydevices".into();
+        dev.id = r"ACPI\MSFT0101\1".into();
+        assert_eq!(acpi_item(&dev, false).unwrap().node.edge, "ACPI");
+    }
 }

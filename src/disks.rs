@@ -12,8 +12,9 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, GetVolumePathNamesForVolumeNameW,
 };
+use windows_sys::Win32::Storage::Vhd::GetStorageDependencyInformation;
 use windows_sys::core::GUID;
 
 use crate::win::{self, ascii_at, rd_u32, rd_u64};
@@ -57,9 +58,40 @@ pub struct PhysDisk {
     /// Il disco non risponde: i dati sono quelli dell'ultima lettura riuscita, e finché resta
     /// così non gli si manda altro.
     pub stuck: bool,
+    /// Per un disco virtuale, il file che lo contiene (VHD, VHDX, ISO), con la lettera del volume
+    /// che lo ospita; vuoto per gli altri dischi o se Windows non lo dice.
+    pub backing_file: String,
 }
 
+/// Dischi virtuali che Windows crea da sé, riconosciuti dalla cartella del loro file: nome breve
+/// e spiegazione.
+const KNOWN_VIRTUAL: &[(&str, &str, &str)] = &[(
+    r"\microsoft\windows\containers\baseimages\",
+    "Sandbox di Windows",
+    "Disco base di Sandbox di Windows: Windows lo crea e lo collega da sé all'avvio, con una copia di \
+     riferimento dei file di sistema da cui partono le sandbox. Resta finché la funzione «Sandbox di \
+     Windows» è attiva; non va toccato.",
+)];
+
 impl PhysDisk {
+    /// Un disco virtuale di Windows riconosciuto: nome breve e spiegazione.
+    pub fn known_virtual(&self) -> Option<(&'static str, &'static str)> {
+        let file = self.backing_file.to_lowercase();
+        KNOWN_VIRTUAL
+            .iter()
+            .find(|(folder, _, _)| file.contains(folder))
+            .map(|(_, name, text)| (*name, *text))
+    }
+
+    /// Per i dischi virtuali: che cosa sono, o almeno il nome del loro file.
+    pub fn virtual_note(&self) -> Option<String> {
+        if let Some((name, _)) = self.known_virtual() {
+            return Some(name.to_string());
+        }
+        let name = self.backing_file.rsplit('\\').next().filter(|n| !n.is_empty())?;
+        Some(format!("file {name}"))
+    }
+
     pub fn device_path(&self) -> String {
         format!(r"\\.\PhysicalDrive{}", self.number)
     }
@@ -226,7 +258,77 @@ fn probe_disk(number: u32) -> Option<PhysDisk> {
     if d.bus == BUS_NVME {
         d.ssd = Some(true);
     }
+    if matches!(d.bus, 14 | 15) {
+        d.backing_file = backing_file(&h);
+    }
     Some(d)
+}
+
+/// Il file che contiene un disco virtuale, come lo dice Windows (anche senza privilegi): il volume
+/// che lo ospita, scritto con la sua lettera se ne ha una, e il percorso del file su quel volume.
+fn backing_file(h: &win::Handle) -> String {
+    const HOST_VOLUMES: i32 = 1;
+    const DISK_HANDLE: i32 = 2;
+    // STORAGE_DEPENDENCY_INFO versione 2: 8 byte di intestazione, poi una voce per livello (il
+    // disco stesso è il livello 0, i genitori dei dischi differenziali vengono dopo) con quattro
+    // puntatori a stringhe che stanno nello stesso buffer.
+    let mut buf = vec![0u64; 2048];
+    let size = buf.len() * 8;
+    let base = buf.as_mut_ptr() as *mut u8;
+    let mut used = 0u32;
+    let err = unsafe {
+        *(base as *mut u32) = 2;
+        GetStorageDependencyInformation(h.raw(), HOST_VOLUMES | DISK_HANDLE, size as u32, base as *mut _, &mut used)
+    };
+    if err != 0 {
+        return String::new();
+    }
+    let b = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+    let ptr_size = std::mem::size_of::<usize>();
+    let entry = 32 + 4 * ptr_size;
+    let count = (rd_u32(b, 4) as usize).min((size - 8) / entry);
+    let Some(at) = (0..count).map(|i| 8 + i * entry).min_by_key(|&at| rd_u32(b, at + 28)) else {
+        return String::new();
+    };
+    let text = |k: usize| -> String {
+        let off = at + 32 + k * ptr_size;
+        let mut raw = [0u8; 8];
+        raw[..ptr_size].copy_from_slice(&b[off..off + ptr_size]);
+        let p = usize::from_le_bytes(raw) as *const u16;
+        // Le stringhe devono stare dentro il buffer restituito.
+        let start = b.as_ptr() as usize;
+        if p.is_null() || (p as usize) < start || (p as usize) >= start + size {
+            return String::new();
+        }
+        let max = (start + size - p as usize) / 2;
+        let s = unsafe { std::slice::from_raw_parts(p, max) };
+        win::from_wide(s)
+    };
+    let (host, path) = (text(1), text(3));
+    if path.is_empty() {
+        return String::new();
+    }
+    let host = format!("{}\\", host.trim_end_matches('\\'));
+    let root = volume_paths(&host)
+        .into_iter()
+        .min_by_key(|p| p.len())
+        .unwrap_or(host);
+    format!("{}\\{}", root.trim_end_matches('\\'), path.trim_start_matches('\\'))
+}
+
+/// Dove è montato un volume (`\\?\Volume{…}\`): lettere e cartelle, nell'ordine di Windows.
+pub fn volume_paths(guid: &str) -> Vec<String> {
+    let name = win::wide(guid);
+    let mut buf = vec![0u16; 4096];
+    let mut len = 0u32;
+    if unsafe { GetVolumePathNamesForVolumeNameW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32, &mut len) } == 0 {
+        return Vec::new();
+    }
+    buf.truncate((len as usize).min(buf.len()));
+    buf.split(|&c| c == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
 }
 
 fn volume_disks(letter: char) -> Vec<u32> {
@@ -629,4 +731,25 @@ pub fn scan() -> Inventory {
         inv.volumes.push(v);
     }
     inv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_base_disk_is_recognized() {
+        let mut d = PhysDisk {
+            bus: 15,
+            backing_file: r"C:\ProgramData\Microsoft\Windows\Containers\BaseImages\2c9e958b-84e6-4522-9d84-1d01017e83d7\BaseLayer.vhdx".into(),
+            ..Default::default()
+        };
+        assert_eq!(d.known_virtual().map(|k| k.0), Some("Sandbox di Windows"));
+        assert_eq!(d.virtual_note().as_deref(), Some("Sandbox di Windows"));
+        d.backing_file = r"D:\Macchine\prova.vhdx".into();
+        assert_eq!(d.known_virtual(), None);
+        assert_eq!(d.virtual_note().as_deref(), Some("file prova.vhdx"));
+        d.backing_file.clear();
+        assert_eq!(d.virtual_note(), None);
+    }
 }

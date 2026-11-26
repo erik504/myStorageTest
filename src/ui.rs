@@ -264,6 +264,7 @@ fn link_color(link: topology::Link) -> Color32 {
         Link::Sata => Color32::from_rgb(45, 212, 191),
         Link::Usb => Color32::from_rgb(192, 132, 252),
         Link::Soft => Color32::from_rgb(148, 160, 180),
+        Link::Other => Color32::from_rgb(244, 114, 182),
     }
 }
 
@@ -856,7 +857,11 @@ fn draw_graph(
                     ui.label(bold(format!("{} → {}", from.title, to.title), 13.5).color(TEXT));
                     let mut what = e.link.name().to_string();
                     if !to.edge.is_empty() && !side(e.to) {
-                        what = if to.edge.starts_with(&what) { to.edge.clone() } else { format!("{what} · {}", to.edge) };
+                        what = if to.edge.starts_with(&what) || e.link == Link::Other {
+                            to.edge.clone()
+                        } else {
+                            format!("{what} · {}", to.edge)
+                        };
                     }
                     ui.label(RichText::new(what).color(link_color(e.link)).size(12.5));
                     match e.bw {
@@ -1290,10 +1295,11 @@ impl App {
         let scripted = script.is_some();
 
         let inventory = disks::scan();
-        let wanted = std::env::var("MYSTORAGETEST_VOL")
-            .ok()
-            .and_then(|s| s.chars().next())
-            .map(|c| Sel::Volume(c.to_ascii_uppercase()));
+        // Una lettera sceglie il volume, un numero il disco (per i dischi senza lettera).
+        let wanted = std::env::var("MYSTORAGETEST_VOL").ok().and_then(|s| match s.trim().parse::<u32>() {
+            Ok(n) => Some(Sel::Disk(n)),
+            Err(_) => s.chars().next().map(|c| Sel::Volume(c.to_ascii_uppercase())),
+        });
         let selected = startup
             .selected
             .or(wanted)
@@ -2039,7 +2045,8 @@ impl App {
                                             .size(13.0),
                                     );
                                 } else {
-                                    ui.label(dim(format!("{} · {}", bus_name(d.bus), human_bytes(d.size))));
+                                    let note = d.virtual_note().map(|n| format!(" · {n}")).unwrap_or_default();
+                                    ui.label(dim(format!("{}{note} · {}", bus_name(d.bus), human_bytes(d.size))));
                                 }
                             })
                             .response;
@@ -2204,26 +2211,40 @@ impl App {
                 ui.label(dim(format!("letto il {at}")));
             }
         });
-        ui.label(dim(
-            "Come sono collegati i dischi e gli altri dispositivi PCIe: dal processore e dal chipset, attraverso \
-             le porte PCIe, i controller SATA e USB, gli hub e i bridge dei contenitori USB, fino ai dischi; a \
-             destra i volumi su più dischi e i \
-             contenitori cifrati, in fondo i volumi senza disco con il driver che li crea. Il colore dice il tipo \
-             di collegamento, lo spessore la banda teorica; in giallo i collegamenti più lenti di quanto il \
+        let full = self.settings.graph_full;
+        ui.label(dim(if full {
+            "Come sono collegati tutti i dispositivi: dal processore e dal chipset, attraverso le porte PCIe, i \
+             controller SATA e USB e gli hub, fino ai dischi, alle schede (grafica, rete, audio), ai dispositivi \
+             USB con le porte che usano, ai monitor, ai codec audio e ai dispositivi della scheda madre (SMBus, \
+             bus LPC, TPM); a destra i volumi su più dischi e i contenitori cifrati, in fondo i volumi senza \
+             disco. Il colore dice il tipo di collegamento, lo spessore la banda teorica; in giallo i \
+             collegamenti più lenti di quanto il dispositivo potrebbe. Passa sopra a un riquadro o a una linea \
+             per i dettagli; un clic su un disco lo apre. La rotellina (o + e −) ingrandisce, trascinando con il \
+             mouse (o con le frecce) ci si sposta, 0 torna alla vista iniziale; «Aggiorna» rilegge tutto, anche \
+             i dispositivi collegati da poco."
+        } else {
+            "Come sono collegati i dischi: dal processore e dal chipset, attraverso le porte PCIe, i controller \
+             SATA e USB, gli hub e i bridge dei contenitori USB, fino ai dischi; a destra i volumi su più dischi \
+             e i contenitori cifrati, in fondo i volumi senza disco con il driver che li crea. Il colore dice il \
+             tipo di collegamento, lo spessore la banda teorica; in giallo i collegamenti più lenti di quanto il \
              dispositivo potrebbe. Passa sopra a un riquadro o a una linea per i dettagli; un clic su un disco lo \
              apre. La rotellina (o + e −) ingrandisce, trascinando con il mouse (o con le frecce) ci si sposta, \
-             0 torna alla vista iniziale; «Aggiorna» rilegge tutto.",
-        ));
+             0 torna alla vista iniziale; «Aggiorna» rilegge tutto."
+        }));
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             use topology::Link;
-            for (link, name) in [
+            let mut links = vec![
                 (Link::Pcie, "PCIe e NVMe"),
                 (Link::Sata, "SATA"),
                 (Link::Usb, "USB"),
                 (Link::Soft, "software (volumi, dischi virtuali)"),
-            ] {
+            ];
+            if full {
+                links.push((Link::Other, "video, HD Audio, LPC e ACPI"));
+            }
+            for (link, name) in links {
                 let (r, _) = ui.allocate_exact_size(vec2(18.0, 14.0), Sense::hover());
                 ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(3.0, link_color(link)));
                 ui.label(RichText::new(format!("{name}   ")).color(DIM).size(12.5));
@@ -2240,16 +2261,29 @@ impl App {
         });
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
-            for (icon, name) in [
+            let mut legend = vec![
                 (Icon::Cpu, "processore"),
                 (Icon::Chipset, "chipset"),
                 (Icon::SataController, "controller"),
                 (Icon::UsbController, "USB"),
                 (Icon::Hub, "hub"),
                 (Icon::Bridge, "bridge USB"),
-                (Icon::Gpu, "scheda grafica"),
-                (Icon::Network, "rete"),
-                (Icon::Audio, "audio"),
+            ];
+            if full {
+                legend.extend([
+                    (Icon::Gpu, "scheda grafica"),
+                    (Icon::Network, "rete"),
+                    (Icon::Audio, "audio"),
+                    (Icon::Monitor, "monitor"),
+                    (Icon::Keyboard, "tastiera"),
+                    (Icon::Mouse, "mouse"),
+                    (Icon::Camera, "webcam"),
+                    (Icon::Bluetooth, "Bluetooth"),
+                    (Icon::UsbDevice, "dispositivo USB"),
+                    (Icon::Chip, "scheda madre"),
+                ]);
+            }
+            legend.extend([
                 (Icon::Nvme, "NVMe"),
                 (Icon::Ssd, "SSD"),
                 (Icon::Hdd, "disco meccanico"),
@@ -2260,13 +2294,47 @@ impl App {
                 (Icon::Raid, "volume su più dischi"),
                 (Icon::Locked, "cifrato"),
                 (Icon::Cloud, "cloud"),
-            ] {
+            ]);
+            for (icon, name) in legend {
+                // Icona e nome vanno a capo insieme.
+                let text = format!("{name}  ");
+                let need = 19.0 + ui.painter().layout_no_wrap(text.clone(), FontId::proportional(12.0), DIM).size().x;
+                if ui.available_size_before_wrap().x < need {
+                    ui.end_row();
+                }
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
                 icons::paint(ui.painter(), r, icon, DIM);
-                ui.label(RichText::new(format!("{name}  ")).color(DIM).size(12.0));
+                ui.add(egui::Label::new(RichText::new(text).color(DIM).size(12.0)).wrap_mode(egui::TextWrapMode::Extend));
             }
         });
         ui.add_space(4.0);
+        // Sopra il grafo: con tutti i dispositivi o solo con quelli dei dischi.
+        ui.horizontal(|ui| {
+            let mut on = self.settings.graph_full;
+            let resp = ui
+                .checkbox(&mut on, RichText::new("Grafo completo").size(13.5).color(TEXT))
+                .on_hover_text(
+                    "Mostra tutti i collegamenti: hub e dispositivi USB, scheda grafica con i monitor, audio, rete \
+                     e i dispositivi della scheda madre. Senza la spunta il grafo mostra solo i dischi e ciò che \
+                     li collega al processore.",
+                );
+            if resp.changed() {
+                self.settings.graph_full = on;
+            }
+            let waiting = self.graph_rx.is_some()
+                || self.graph.as_ref().is_some_and(|(_, g)| g.full != self.settings.graph_full);
+            if waiting {
+                ui.spinner();
+                ui.label(dim("lettura dei collegamenti…"));
+            } else {
+                ui.label(dim(if full {
+                    "tutti i dispositivi e i collegamenti che usano"
+                } else {
+                    "solo i dischi: la spunta aggiunge hub, dispositivi USB, schede, monitor e scheda madre"
+                }));
+            }
+        });
+        ui.add_space(2.0);
         let Some((_, graph)) = &self.graph else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -2410,6 +2478,9 @@ impl App {
             .filter_map(|n| self.inventory.disk(*n))
             .map(|d| {
                 let mut s = format!("Disco {} · {} · {}", d.number, d.title(), bus_name(d.bus));
+                if let Some(note) = d.virtual_note() {
+                    s.push_str(&format!(" · {note}"));
+                }
                 if !d.kind_label().is_empty() {
                     s.push_str(&format!(" · {}", d.kind_label()));
                 }
@@ -2542,9 +2613,20 @@ impl App {
                             ui.end_row();
                             for p in &x.partitions {
                                 ui.label(p.number.to_string());
-                                ui.label(p.letter.map(|l| format!("{l}:")).unwrap_or_else(|| "—".into()));
-                                ui.label(if p.active { format!("{} · attiva", p.kind) } else { p.kind.clone() });
-                                ui.label(dim(p.name.as_str()));
+                                match p.letter {
+                                    Some(l) => {
+                                        ui.label(format!("{l}:"));
+                                    }
+                                    None if !p.folders.is_empty() => {
+                                        ui.label("cartella").on_hover_text(p.folders.join("\n"));
+                                    }
+                                    None => {
+                                        ui.label("—");
+                                    }
+                                }
+                                let kind = p.kind_text();
+                                ui.label(if p.active { format!("{kind} · attiva") } else { kind });
+                                ui.label(dim(p.names()));
                                 ui.label(human_bytes(p.offset));
                                 ui.label(human_bytes(p.length));
                                 ui.end_row();
@@ -6137,17 +6219,24 @@ impl eframe::App for App {
         if let Some(rx) = &self.graph_rx {
             if let Ok(g) = rx.try_recv() {
                 self.graph_rx = None;
+                // Passando dal grafo dei dischi a quello completo (o viceversa) la vista torna a
+                // mostrare tutto il grafo.
+                if self.graph.as_ref().is_some_and(|(_, old)| old.full != g.full) {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("vista del grafo storage"), None::<GraphView>));
+                }
                 self.graph = Some((win::now_string(), g));
             }
         }
         let scan_due = self.last_scan.elapsed() > Duration::from_secs(4) && !self.testing();
         if self.graph_rx.is_none() && self.inventory_rx.is_none() && !scan_due {
             let key = graph_signature(&self.inventory);
-            if self.graph_dirty || key != self.graph_key {
+            let mode_changed = self.graph.as_ref().is_some_and(|(_, g)| g.full != self.settings.graph_full);
+            if self.graph_dirty || mode_changed || key != self.graph_key {
                 self.graph_dirty = false;
                 self.graph_key = key;
                 let inv = self.inventory.clone();
-                self.graph_rx = Some(background(ctx, move || topology::build(&inv)));
+                let full = self.settings.graph_full;
+                self.graph_rx = Some(background(ctx, move || topology::build(&inv, full)));
             }
         }
         if let Some(rx) = &self.eject_rx {
