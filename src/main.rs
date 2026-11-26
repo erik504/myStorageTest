@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod cli;
+mod conout;
 mod disks;
 mod errors;
 mod eventlog;

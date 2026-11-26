@@ -75,7 +75,8 @@ pub fn run(args: &[String]) -> Option<i32> {
     unsafe {
         AttachConsole(u32::MAX);
     }
-    Some(match first {
+    let converter = crate::conout::start();
+    let code = match first {
         "--quit" => {
             match crate::tray::quit_running_instance() {
                 Some(true) => {
@@ -135,7 +136,11 @@ pub fn run(args: &[String]) -> Option<i32> {
             println!("{HELP}");
             0
         }
-    })
+    };
+    if let Some(c) = converter {
+        c.finish();
+    }
+    Some(code)
 }
 
 fn list() -> i32 {

@@ -1484,12 +1484,13 @@ fn ata_read(disk: &PhysDisk, h: &Handle, via: AtaVia, predict: bool) -> Option<S
 /// Perché attraverso i bridge USB-NVMe Realtek e ASMedia l'autodiagnosi non si avvia.
 fn forward_only_reads(via: NvmeVia) -> &'static str {
     match via {
-        // Provato su un RTL9210B (0BDA:9210, firmware 1.00) e su un RTL9210C (3535:9210, firmware
-        // 1.01): il comando di lettura E4h con il codice della prova viene rifiutato come «comando
-        // non valido» (20/00), con e senza dati.
+        // Provato su un RTL9210B (0BDA:9210) con il firmware Realtek 1.23.5 e poi con il 1.35.6, il
+        // più recente a novembre 2026, e su un RTL9210C (3535:9210): il comando di lettura E4h con il
+        // codice della prova viene rifiutato come «comando non valido» (20/00), con e senza dati.
         NvmeVia::Realtek => {
-            "Il bridge Realtek di questo contenitore inoltra al disco solo i comandi di lettura: un RTL9210B e un \
-             RTL9210C hanno rifiutato quello di autodiagnosi. La prova non si può avviare da qui."
+            "Il bridge Realtek di questo contenitore inoltra al disco solo i comandi di lettura: un RTL9210B, \
+             anche con il firmware più recente (1.35.6), e un RTL9210C hanno rifiutato quello di autodiagnosi. \
+             La prova non si può avviare da qui."
         }
         _ => {
             "Per i bridge ASMedia è noto solo un comando di lettura, che non porta quello di autodiagnosi: la prova \
