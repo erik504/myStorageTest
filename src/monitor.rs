@@ -109,8 +109,16 @@ impl Monitor {
 impl Drop for Monitor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Il controllo può essere fermo su un disco che non risponde: lo si aspetta poco, poi lo si
+        // lascia andare, invece di bloccare la chiusura della finestra.
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !t.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
         self.tray.set_visible(false);
     }
@@ -227,6 +235,28 @@ impl Worker {
                 continue;
             }
             let id = format!("{}|{}", d.model, d.serial);
+            let name = if d.letters.is_empty() {
+                format!("Disco {} ({})", d.number, d.title())
+            } else {
+                let letters: Vec<String> = d.letters.iter().map(|l| format!("{l}:")).collect();
+                format!("{} ({})", letters.join(" "), d.title())
+            };
+            // Un disco che non risponde non si interroga: lo si segnala, e resta la lettura di prima.
+            if d.stuck {
+                self.raise(
+                    format!("bloccato:{id}:{}", d.instance_id),
+                    Health::Critical,
+                    format!("{name} — il disco non risponde"),
+                    "Windows non riceve risposta dal disco da più di qualche secondo. Se è un contenitore USB e \
+                     non si riprende, scollegalo e ricollegalo."
+                        .into(),
+                    1,
+                );
+                if let Some(before) = self.latest.get(&id) {
+                    snapshot.push((d.number, name, before.clone()));
+                }
+                continue;
+            }
             // La prima lettura di ogni disco è completa. Le successive non svegliano i dischi
             // fermi: per quelli resta buona la lettura di prima.
             let mut rep = match self.latest.get(&id) {
@@ -238,12 +268,6 @@ impl Worker {
             };
             rep.disk = d.number;
             self.latest.insert(id.clone(), rep.clone());
-            let name = if d.letters.is_empty() {
-                format!("Disco {} ({})", d.number, d.title())
-            } else {
-                let letters: Vec<String> = d.letters.iter().map(|l| format!("{l}:")).collect();
-                format!("{} ({})", letters.join(" "), d.title())
-            };
             if rep.available {
                 self.compare(&id, &name, &rep);
                 self.previous.insert(id, rep.clone());

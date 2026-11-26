@@ -383,7 +383,7 @@ pub struct Links {
 pub fn links(d: &PhysDisk) -> Links {
     let usb = usb_link(&d.usb_node);
     let pcie = if d.bus == disks::BUS_NVME && !d.is_usb() { pcie_link(&d.instance_id) } else { None };
-    let id = if matches!(d.bus, 14 | 15 | 16) { None } else { smart::identity(d).0 };
+    let id = if matches!(d.bus, 14 | 15 | 16) || d.stuck { None } else { smart::identity(d).0 };
     let rpm = id.as_deref().and_then(|id| match rd_u16(id, 217 * 2) {
         1 => Some(0),
         r @ 0x0401..=0xFFFE => Some(r),

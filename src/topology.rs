@@ -1145,6 +1145,10 @@ fn path_of(d: &PhysDisk, cpu: &str) -> (Vec<Item>, Option<String>) {
     if let Some(rpm) = links.rpm.filter(|r| *r > 0) {
         lines.push(format!("disco meccanico · {rpm} giri al minuto"));
     }
+    if d.stuck {
+        lines.insert(1, "non risponde".into());
+        n.warn = true;
+    }
     // Porta SATA del controller: Windows la dà come «Bus Number N» del disco.
     if w.items.last().is_some_and(|it| it.node.kind == Kind::SataController) {
         if let Some(disk_dev) = chain.last() {
@@ -1531,7 +1535,8 @@ impl Loose {
 }
 
 fn probe_loose(v: &Volume, drivers: &[String], containers: &HashMap<char, String>) -> Loose {
-    let found = drivers_in_path(v.letter, drivers);
+    // Un volume che non risponde non si apre: la domanda resterebbe ferma come lui.
+    let found = if v.stuck { Vec::new() } else { drivers_in_path(v.letter, drivers) };
     let generic = |d: &str| GENERIC_DRIVERS.iter().any(|g| g.eq_ignore_ascii_case(d));
     let standard = |d: &str| STANDARD_FS.iter().any(|g| g.eq_ignore_ascii_case(d));
     Loose {
@@ -1622,7 +1627,8 @@ pub fn build(inv: &Inventory) -> Graph {
         if hosts.is_empty() {
             continue;
         }
-        let (what, how) = match volume_layout(v.letter) {
+        let layout = if v.stuck { Layout::Unknown } else { volume_layout(v.letter) };
+        let (what, how) = match layout {
             Layout::Striped => (
                 "a strisce (RAID 0)",
                 "Windows divide i dati a blocchi da 64 KB alternando i dischi: letture e scritture lunghe usano \
@@ -1776,10 +1782,31 @@ pub fn build(inv: &Inventory) -> Graph {
         }
     }
 
-    // Tutti in una colonna a destra dei dischi: chi è ospitato da un altro riquadro di quella colonna
-    // (un contenitore su un volume su più dischi) gli sta sotto.
+    // A destra dei dischi, una colonna dopo ciò che li ospita: un volume su più dischi subito dopo i
+    // suoi dischi, un contenitore cifrato dopo il disco o il volume che contiene il suo file (un
+    // contenitore su un volume su più dischi sta quindi una colonna più in là di quel volume).
+    let side_set: HashSet<usize> = g.side.iter().copied().collect();
     for &s in &g.side.clone() {
         g.nodes[s].side_col = 1;
+    }
+    for _ in 0..g.side.len() {
+        let mut changed = false;
+        for &s in &g.side.clone() {
+            let after = g.nodes[s]
+                .hosts
+                .iter()
+                .filter(|h| side_set.contains(h))
+                .map(|&h| g.nodes[h].side_col)
+                .max()
+                .unwrap_or(0);
+            if g.nodes[s].side_col != after + 1 {
+                g.nodes[s].side_col = after + 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
     // Fratelli in ordine di porta; il processore prima dei gruppi.
     let orders: Vec<String> = g.nodes.iter().map(|n| n.order.clone()).collect();

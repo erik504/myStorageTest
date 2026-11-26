@@ -439,7 +439,10 @@ fn draw_graph(
         }
         place(g, r, 0, &mut depth, &mut y, &mut row);
     }
-    let leaf_col = (0..n).filter(|&i| !aligned(i) && !side(i)).map(|i| depth[i] + 1).max().unwrap_or(0);
+    // I bridge dei contenitori USB tutti in una colonna, subito prima dei dischi.
+    let bridge = |i: usize| g.nodes[i].kind == Kind::Bridge;
+    let bridge_col = (0..n).filter(|&i| !aligned(i) && !side(i) && !bridge(i)).map(|i| depth[i] + 1).max().unwrap_or(0);
+    let leaf_col = bridge_col + usize::from((0..n).any(bridge));
     let side_cols = g.side.iter().map(|&s| g.nodes[s].side_col).max().unwrap_or(0);
     // A destra: all'altezza media di ciò che li ospita, senza sovrapporsi; chi è ospitato da un
     // riquadro della stessa colonna gli sta subito sotto.
@@ -453,8 +456,10 @@ fn draw_graph(
     };
     for c in 1..=side_cols {
         let mut items: Vec<usize> = g.side.iter().copied().filter(|&s| g.nodes[s].side_col == c).collect();
-        let (mut first, stacked): (Vec<usize>, Vec<usize>) =
-            items.iter().partition(|&&s| g.nodes[s].hosts.iter().all(|&h| !side(h)));
+        // Chi è ospitato da un riquadro di una colonna precedente gli sta alla stessa altezza.
+        let (mut first, stacked): (Vec<usize>, Vec<usize>) = items
+            .iter()
+            .partition(|&&s| g.nodes[s].hosts.iter().all(|&h| !side(h) || g.nodes[h].side_col < c));
         for &s in &first {
             let hosts = &g.nodes[s].hosts;
             y[s] = hosts.iter().map(|&h| y[h]).sum::<f32>() / hosts.len().max(1) as f32;
@@ -469,9 +474,20 @@ fn draw_graph(
     }
     let rows = (0..n).filter(|&i| side(i)).map(|i| y[i] + 1.0).fold(row, f32::max);
     let ncols = leaf_col + 1 + side_cols;
+    let col = |i: usize| {
+        if side(i) {
+            leaf_col + g.nodes[i].side_col
+        } else if aligned(i) {
+            leaf_col
+        } else if bridge(i) {
+            bridge_col
+        } else {
+            depth[i]
+        }
+    };
     let mut col_w_1 = vec![0.0f32; ncols];
     for i in (0..n).filter(|&i| !aligned(i) && !side(i)) {
-        col_w_1[depth[i]] = col_w_1[depth[i]].max(box_w_1(g.nodes[i].kind));
+        col_w_1[col(i)] = col_w_1[col(i)].max(box_w_1(g.nodes[i].kind));
     }
     col_w_1[leaf_col] = LEAF_W_1;
     for c in 1..=side_cols {
@@ -567,15 +583,6 @@ fn draw_graph(
     let row_h = ROW_1 * s;
     let lines_of = |i: usize| g.nodes[i].lines.len().min(3) as f32;
     let height = |i: usize| (24.0 + 14.5 * lines_of(i)) * s;
-    let col = |i: usize| {
-        if side(i) {
-            leaf_col + g.nodes[i].side_col
-        } else if aligned(i) {
-            leaf_col
-        } else {
-            depth[i]
-        }
-    };
     let width = |i: usize| col_w_1[col(i)].min(if aligned(i) || side(i) { 1e9 } else { box_w_1(g.nodes[i].kind) }) * s;
     let font = |size: f32| FontId::proportional(size * s);
 
@@ -635,7 +642,7 @@ fn draw_graph(
             let curves: Vec<[egui::Pos2; 4]> = edges
                 .iter()
                 .map(|e| {
-                    if side(e.from) && side(e.to) {
+                    if side(e.from) && side(e.to) && g.nodes[e.from].side_col == g.nodes[e.to].side_col {
                         // Nella stessa colonna: una parentesi sul lato destro, dall'ospite al contenitore.
                         let (a, b) = (rects[e.from].right_center(), rects[e.to].right_center());
                         return [a, a + vec2(26.0 * s, 0.0), b + vec2(26.0 * s, 0.0), b];
@@ -1436,11 +1443,13 @@ impl App {
         if self.smart_rx.is_some() {
             return;
         }
+        // I dischi che non rispondono si lasciano stare: un comando in più resterebbe fermo come loro,
+        // e con lui tutte le letture dello SMART.
         let list: Vec<PhysDisk> = self
             .inventory
             .disks
             .iter()
-            .filter(|d| which(d))
+            .filter(|d| which(d) && !d.stuck)
             .cloned()
             .collect();
         if list.is_empty() {
@@ -1963,15 +1972,20 @@ impl App {
                                 };
                                 title_with_status(ui, RichText::new(label).size(14.0), temp, health, warn_at, testing);
                             });
-                            usage_bar(ui, 1.0 - v.free as f32 / v.total.max(1) as f32);
-                            ui.add(
-                                egui::Label::new(dim(format!(
-                                    "{kind} · {} liberi di {}",
-                                    human_bytes(v.free),
-                                    human_bytes(v.total)
-                                )))
-                                .truncate(),
-                            );
+                            usage_bar(ui, if v.total == 0 { 0.0 } else { 1.0 - v.free as f32 / v.total as f32 });
+                            let stuck = v.stuck || disk.is_some_and(|d| d.stuck);
+                            let line = if stuck {
+                                // Di un volume mai letto non si sa su che cosa stia.
+                                let what = if v.disks.is_empty() && v.total == 0 {
+                                    "non risponde".to_string()
+                                } else {
+                                    format!("{kind} · non risponde")
+                                };
+                                RichText::new(what).color(WARN).size(13.0)
+                            } else {
+                                dim(format!("{kind} · {} liberi di {}", human_bytes(v.free), human_bytes(v.total)))
+                            };
+                            ui.add(egui::Label::new(line).truncate());
                         })
                         .response;
                     let resp = ui
@@ -2018,7 +2032,15 @@ impl App {
                                         false,
                                     );
                                 });
-                                ui.label(dim(format!("{} · {}", bus_name(d.bus), human_bytes(d.size))));
+                                if d.stuck {
+                                    ui.label(
+                                        RichText::new(format!("{} · non risponde", bus_name(d.bus)))
+                                            .color(WARN)
+                                            .size(13.0),
+                                    );
+                                } else {
+                                    ui.label(dim(format!("{} · {}", bus_name(d.bus), human_bytes(d.size))));
+                                }
                             })
                             .response;
                         let resp = ui.interact(resp.rect, ui.scope_id().with(("disk", d.number)), Sense::click());
@@ -2413,6 +2435,20 @@ impl App {
         let ctx = ui.ctx().clone();
         let disks = self.sel_disks();
         let vol = self.sel_volume().cloned();
+        let stuck = vol.as_ref().is_some_and(|v| v.stuck)
+            || disks.iter().filter_map(|n| self.inventory.disk(*n)).any(|d| d.stuck);
+        if stuck {
+            ui.label(
+                RichText::new(
+                    "Il disco o il volume non risponde ai comandi: Windows non riceve risposta da qualche \
+                     secondo, e finché resta così il programma non gli chiede altro. Se è un contenitore USB e \
+                     non si riprende, scollegalo e ricollegalo.",
+                )
+                .color(WARN)
+                .size(13.5),
+            );
+            return;
+        }
         // I dati di dettaglio si leggono una volta per disco, in background.
         let key = self.info_key();
         if self.info_rx.is_none() && self.info.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -4368,8 +4404,16 @@ impl App {
                 wait(self.script.as_mut().unwrap(), 1500);
             }
             42 => {
-                // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto.
-                if self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some() {
+                // Attende i dati di dettaglio e la prima lettura dello SMART, che porta il rapporto;
+                // per un disco che non risponde la scheda dice solo questo, e non c'è da aspettare.
+                let stuck = match self.selected {
+                    Some(Sel::Volume(l)) => self.inventory.volume(l).is_some_and(|v| {
+                        v.stuck || v.disks.iter().any(|n| self.inventory.disk(*n).is_some_and(|d| d.stuck))
+                    }),
+                    Some(Sel::Disk(n)) => self.inventory.disk(n).is_some_and(|d| d.stuck),
+                    None => false,
+                };
+                if !stuck && (self.info_rx.is_some() || self.info.is_none() || self.smart_rx.is_some()) {
                     let script = self.script.as_mut().unwrap();
                     script.step = 42;
                     wait(script, 200);

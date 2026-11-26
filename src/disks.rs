@@ -1,7 +1,11 @@
 //! Elenco dei volumi e dei dischi fisici, senza bisogno di privilegi di amministratore.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW, CM_Get_Parent, SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
@@ -50,6 +54,9 @@ pub struct PhysDisk {
     /// Lo stesso dispositivo, se Windows lo dichiara scollegabile: è quello a cui chiedere la
     /// rimozione sicura.
     pub eject_node: String,
+    /// Il disco non risponde: i dati sono quelli dell'ultima lettura riuscita, e finché resta
+    /// così non gli si manda altro.
+    pub stuck: bool,
 }
 
 impl PhysDisk {
@@ -93,6 +100,8 @@ pub struct Volume {
     pub removable: bool,
     /// Numeri dei dischi fisici su cui si estende il volume.
     pub disks: Vec<u32>,
+    /// Il volume non risponde (vedi `PhysDisk::stuck`).
+    pub stuck: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -169,7 +178,22 @@ fn volume_descriptor(letter: char) -> Option<(String, String, u32)> {
     ))
 }
 
+/// Solo per le verifiche automatiche: `MYSTORAGETEST_FAKE_STUCK=8,L@6` fa restare senza risposta le
+/// domande al disco 8 e al volume L: a partire da 6 secondi dopo la prima lettura dell'elenco (senza
+/// «@», da subito), come con un contenitore USB bloccato.
+fn fake_stuck(what: &str) -> bool {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let start = *START;
+    let Ok(spec) = std::env::var("MYSTORAGETEST_FAKE_STUCK") else { return false };
+    let (targets, after) = spec.split_once('@').unwrap_or((spec.as_str(), "0"));
+    let after = Duration::from_secs(after.trim().parse().unwrap_or(0));
+    start.elapsed() >= after && targets.split(',').any(|t| t.trim().eq_ignore_ascii_case(what))
+}
+
 fn probe_disk(number: u32) -> Option<PhysDisk> {
+    if fake_stuck(&number.to_string()) {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
     let h = win::open_device_query(&format!(r"\\.\PhysicalDrive{number}")).ok()?;
     let mut d = PhysDisk {
         number,
@@ -228,6 +252,9 @@ fn volume_disks(letter: char) -> Vec<u32> {
 }
 
 fn probe_volume(letter: char) -> Option<Volume> {
+    if fake_stuck(&letter.to_string()) {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
     let root = win::wide(&format!("{letter}:\\"));
     let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
     if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE && kind != DRIVE_RAMDISK {
@@ -265,7 +292,73 @@ fn probe_volume(letter: char) -> Option<Volume> {
         free: avail,
         removable: kind == DRIVE_REMOVABLE,
         disks: volume_disks(letter),
+        stuck: false,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Domande con un tempo massimo
+// ---------------------------------------------------------------------------------------------
+
+/// Quanto si aspetta ogni disco e ogni volume, tutti insieme. Di norma rispondono in pochi
+/// millesimi; un disco che non risponde (un bridge USB bloccato) terrebbe fermo tutto l'elenco, e
+/// con lui la finestra, il grafo e il monitoraggio.
+const WAIT: Duration = Duration::from_millis(2500);
+/// Dopo quanto tempo senza risposta un disco o un volume già visto si dichiara bloccato.
+const STUCK_AFTER: Duration = Duration::from_secs(8);
+
+/// Domande ancora senza risposta, per dispositivo, e da quando. Finché una è in sospeso non se ne
+/// manda un'altra allo stesso dispositivo: un disco bloccato tiene ferma una richiesta sola.
+static PENDING: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+/// Ultima risposta di ogni disco, volume e posto nell'albero, da usare finché non rispondono.
+static LAST_DISKS: LazyLock<Mutex<HashMap<u32, PhysDisk>>> = LazyLock::new(Default::default);
+static LAST_VOLUMES: LazyLock<Mutex<HashMap<char, Volume>>> = LazyLock::new(Default::default);
+static LAST_NUMBERS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Default::default);
+
+fn pending() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Fa la domanda `work` in un thread suo; `None` se al dispositivo `key` ne è già stata fatta una
+/// che non ha ancora avuto risposta.
+fn ask<T: Send + 'static>(key: String, work: impl FnOnce() -> T + Send + 'static) -> Option<Receiver<T>> {
+    {
+        let mut p = pending();
+        if p.contains_key(&key) {
+            return None;
+        }
+        p.insert(key.clone(), Instant::now());
+    }
+    let (tx, rx) = channel();
+    let k = key.clone();
+    let started = std::thread::Builder::new().stack_size(256 * 1024).spawn(move || {
+        let out = work();
+        pending().remove(&k);
+        let _ = tx.send(out);
+    });
+    if started.is_err() {
+        pending().remove(&key);
+        return None;
+    }
+    Some(rx)
+}
+
+/// La risposta, se arriva entro `deadline`.
+fn answer<T>(rx: Option<Receiver<T>>, deadline: Instant) -> Option<T> {
+    rx?.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()
+}
+
+/// Il dispositivo `key` non risponde da almeno `STUCK_AFTER`.
+fn stuck_for_long(key: &str) -> bool {
+    pending().get(key).is_some_and(|t| t.elapsed() >= STUCK_AFTER)
+}
+
+/// Il numero di un disco dal suo percorso nell'albero dei dispositivi.
+fn disk_number(path: &str) -> Option<u32> {
+    let h = win::open_device_query(path).ok()?;
+    let mut dn = [0u8; 12];
+    win::ioctl(&h, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut dn).ok()?;
+    Some(rd_u32(&dn, 4))
 }
 
 /// Interfaccia dei dischi: {53F56307-B6BF-11D0-94F2-00A0C91EFB8B}.
@@ -323,12 +416,12 @@ fn node_removable(node: u32) -> bool {
     rc == 0 && value & CM_DEVCAP_REMOVABLE != 0
 }
 
-/// Per ogni disco trova il suo posto nell'albero dei dispositivi e, risalendolo, il bridge USB a
-/// cui è collegato (VID e PID) e il dispositivo da scollegare per la rimozione sicura.
-fn disk_nodes() -> Vec<DiskNode> {
+/// Le interfacce dei dischi presenti: percorso e nodo nell'albero dei dispositivi. Non interroga i
+/// dischi: lo fa Windows dai suoi elenchi.
+fn disk_interfaces() -> Vec<(String, u32)> {
     const DIGCF_PRESENT: u32 = 0x2;
     const DIGCF_DEVICEINTERFACE: u32 = 0x10;
-    let mut out = Vec::new();
+    let mut found: Vec<(String, u32)> = Vec::new();
     unsafe {
         let set = SetupDiGetClassDevsW(
             &GUID_DEVINTERFACE_DISK,
@@ -337,7 +430,7 @@ fn disk_nodes() -> Vec<DiskNode> {
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         );
         if set as isize == -1 || set as isize == 0 {
-            return out;
+            return Vec::new();
         }
         for index in 0..256u32 {
             let mut ifd: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
@@ -361,19 +454,54 @@ fn disk_nodes() -> Vec<DiskNode> {
             }
             let chars = (needed as usize - 4) / 2;
             let path_ptr = (detail as *const u8).add(4) as *const u16;
-            let path = win::from_wide(std::slice::from_raw_parts(path_ptr, chars));
+            found.push((win::from_wide(std::slice::from_raw_parts(path_ptr, chars)), info.DevInst));
+        }
+        SetupDiDestroyDeviceInfoList(set);
+    }
+    found
+}
 
-            let Ok(h) = win::open_device_query(&path) else { continue };
-            let mut dn = [0u8; 12];
-            if win::ioctl(&h, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut dn).is_err() {
+/// Domanda di numero fatta a un disco: la risposta, il percorso, il nodo nell'albero.
+type NumberAsked = (Option<Receiver<Option<u32>>>, String, u32);
+
+fn ask_numbers() -> Vec<NumberAsked> {
+    disk_interfaces()
+        .into_iter()
+        .map(|(path, inst)| {
+            let p = path.clone();
+            (ask(format!("numero {path}"), move || disk_number(&p)), path, inst)
+        })
+        .collect()
+}
+
+/// Per ogni disco trova il suo posto nell'albero dei dispositivi e, risalendolo, il bridge USB a
+/// cui è collegato (VID e PID) e il dispositivo da scollegare per la rimozione sicura. Il numero di
+/// ogni disco lo dà il disco stesso: chi non risponde entro `deadline` tiene quello di prima.
+fn disk_nodes(asked: Vec<NumberAsked>, deadline: Instant) -> Vec<DiskNode> {
+    let mut out = Vec::new();
+    let mut last = LAST_NUMBERS.lock().unwrap_or_else(|e| e.into_inner());
+    for (rx, path, inst) in asked {
+        let number = match answer(rx, deadline) {
+            Some(Some(n)) => {
+                last.insert(path, n);
+                n
+            }
+            Some(None) => {
+                last.remove(&path);
                 continue;
             }
-            let mut node = DiskNode {
-                number: rd_u32(&dn, 4),
-                instance_id: device_id(info.DevInst).unwrap_or_default(),
-                ..Default::default()
-            };
-            let mut at = info.DevInst;
+            None => match last.get(&path) {
+                Some(&n) => n,
+                None => continue,
+            },
+        };
+        let mut node = DiskNode {
+            number,
+            instance_id: device_id(inst).unwrap_or_default(),
+            ..Default::default()
+        };
+        unsafe {
+            let mut at = inst;
             for _ in 0..4 {
                 let mut parent = 0u32;
                 if CM_Get_Parent(&mut parent, at, 0) != 0 {
@@ -396,22 +524,60 @@ fn disk_nodes() -> Vec<DiskNode> {
                 }
                 at = parent;
             }
-            out.push(node);
         }
-        SetupDiDestroyDeviceInfoList(set);
+        out.push(node);
     }
     out
 }
 
-/// Fotografia di volumi e dischi presenti in questo momento.
+/// Fotografia di volumi e dischi presenti in questo momento. Ogni disco e ogni volume si interroga
+/// in un thread suo, e si aspetta al massimo `WAIT`: chi non risponde resta com'era alla lettura
+/// precedente e, dopo `STUCK_AFTER`, è segnato come bloccato.
 pub fn scan() -> Inventory {
+    fake_stuck("");
+    let deadline = Instant::now() + WAIT;
+    // Tutte le domande partono insieme, e si aspettano insieme: un disco che non risponde non
+    // ritarda le altre.
+    let asked_disks: Vec<_> = (0..64u32)
+        .map(|n| (n, ask(format!("disco {n}"), move || probe_disk(n))))
+        .collect();
+    let asked_numbers = ask_numbers();
+    let mask = unsafe { GetLogicalDrives() };
+    let asked_volumes: Vec<_> = (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| {
+            let letter = (b'A' + i) as char;
+            let probe = move || probe_volume(letter).map(|v| (v, volume_descriptor(letter)));
+            (letter, ask(format!("volume {letter}"), probe))
+        })
+        .collect();
+
     let mut inv = Inventory::default();
-    for n in 0..64u32 {
-        if let Some(d) = probe_disk(n) {
-            inv.disks.push(d);
+    {
+        let mut last = LAST_DISKS.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, rx) in asked_disks {
+            match answer(rx, deadline) {
+                Some(Some(d)) => {
+                    last.insert(n, d.clone());
+                    inv.disks.push(d);
+                }
+                Some(None) => {
+                    last.remove(&n);
+                }
+                // Un numero senza disco risponde subito (non si apre): chi tace è un disco che c'è.
+                None => {
+                    let key = format!("disco {n}");
+                    let mut d = last.get(&n).cloned().unwrap_or_else(|| PhysDisk {
+                        number: n,
+                        ..Default::default()
+                    });
+                    d.stuck = !last.contains_key(&n) || stuck_for_long(&key);
+                    inv.disks.push(d);
+                }
+            }
         }
     }
-    for node in disk_nodes() {
+    for node in disk_nodes(asked_numbers, deadline) {
         if let Some(d) = inv.disks.iter_mut().find(|d| d.number == node.number) {
             d.usb_id = node.usb_id;
             d.instance_id = node.instance_id;
@@ -419,31 +585,48 @@ pub fn scan() -> Inventory {
             d.eject_node = node.eject_node;
         }
     }
-    let mask = unsafe { GetLogicalDrives() };
-    for i in 0..26u32 {
-        if mask & (1 << i) == 0 {
-            continue;
-        }
-        let letter = (b'A' + i as u8) as char;
-        if let Some(mut v) = probe_volume(letter) {
-            // Le unità virtuali (cloud, dischi RAM) a volte dichiarano di stare sul disco 0:
-            // si accetta il disco solo se il volume risponde con lo stesso modello e bus.
-            if v.disks.len() == 1 {
-                let same = match (volume_descriptor(letter), inv.disk(v.disks[0])) {
-                    (Some((model, serial, bus)), Some(d)) => model == d.model && serial == d.serial && bus == d.bus,
-                    _ => false,
-                };
-                if !same {
-                    v.disks.clear();
+    let mut last = LAST_VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
+    for (letter, rx) in asked_volumes {
+        let v = match answer(rx, deadline) {
+            Some(Some((mut v, descriptor))) => {
+                // Le unità virtuali (cloud, dischi RAM) a volte dichiarano di stare sul disco 0:
+                // si accetta il disco solo se il volume risponde con lo stesso modello e bus.
+                if v.disks.len() == 1 {
+                    let same = match (descriptor, inv.disk(v.disks[0])) {
+                        (Some((model, serial, bus)), Some(d)) => {
+                            d.stuck || (model == d.model && serial == d.serial && bus == d.bus)
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        v.disks.clear();
+                    }
                 }
+                last.insert(letter, v.clone());
+                v
             }
-            for n in &v.disks {
-                if let Some(d) = inv.disks.iter_mut().find(|d| d.number == *n) {
-                    d.letters.push(letter);
-                }
+            Some(None) => {
+                last.remove(&letter);
+                continue;
             }
-            inv.volumes.push(v);
+            // Un volume che non risponde (il file system aspetta il disco): quello di prima, o solo
+            // la lettera se non lo si è mai letto.
+            None => {
+                let key = format!("volume {letter}");
+                let mut v = last.get(&letter).cloned().unwrap_or_else(|| Volume {
+                    letter,
+                    ..Default::default()
+                });
+                v.stuck = !last.contains_key(&letter) || stuck_for_long(&key);
+                v
+            }
+        };
+        for n in &v.disks {
+            if let Some(d) = inv.disks.iter_mut().find(|d| d.number == *n) {
+                d.letters.push(letter);
+            }
         }
+        inv.volumes.push(v);
     }
     inv
 }

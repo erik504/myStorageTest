@@ -144,8 +144,9 @@ fn list() -> i32 {
     for d in &inv.disks {
         let usb = d.usb_id.map(|(v, p)| format!(" [{v:04X}:{p:04X}]")).unwrap_or_default();
         let letters: String = d.letters.iter().map(|l| format!(" {l}:")).collect();
+        let stuck = if d.stuck { "   NON RISPONDE" } else { "" };
         println!(
-            "  {:>2}  {:<32} {:<8}{} {:<4} {:>9} {}",
+            "  {:>2}  {:<32} {:<8}{} {:<4} {:>9} {}{stuck}",
             d.number,
             d.title(),
             bus_name(d.bus),
@@ -157,8 +158,9 @@ fn list() -> i32 {
     }
     println!("\nVolumi:");
     for v in &inv.volumes {
+        let stuck = if v.stuck { "   NON RISPONDE" } else { "" };
         println!(
-            "  {}:  {:<22} {:<6} {:>9} totali, {:>9} liberi   dischi {:?}",
+            "  {}:  {:<22} {:<6} {:>9} totali, {:>9} liberi   dischi {:?}{stuck}",
             v.letter,
             v.label,
             v.fs,

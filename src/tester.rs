@@ -530,7 +530,17 @@ impl TestRun {
 impl Drop for TestRun {
     fn drop(&mut self) {
         self.stop();
-        self.join();
+        // Una prova ferma su un disco che non risponde non deve bloccare la chiusura del programma:
+        // la si aspetta poco, poi la si lascia andare.
+        if let Some(t) = self.thread.take() {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !t.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
     }
 }
 

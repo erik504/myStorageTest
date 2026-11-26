@@ -16,8 +16,8 @@ casella che lo accende e lo spegne, e la voce **Grafo Storage**.
 
 **Grafo Storage**, la pagina che si apre all'avvio: come sono collegati i dischi e gli altri dispositivi
 PCIe. Da sinistra a destra il processore, il chipset (sulle schede AMD è uno switch PCIe collegato a una
-porta del processore), i controller SATA e USB, gli hub USB in cascata, i bridge dei contenitori USB, e in
-una colonna i dischi, ognuno con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, i
+porta del processore), i controller SATA e USB, gli hub USB in cascata, i bridge dei contenitori USB (tutti
+in una colonna, subito prima dei dischi), e in una colonna i dischi, ognuno con dimensione, lettere, collegamento (NVMe su PCIe 4.0 x4, SATA 6 Gbit/s, i
 giri al minuto dei dischi meccanici quando li dichiarano), salute SMART e temperatura. Il riquadro del
 bridge dice il chip (per esempio Realtek RTL9210B-CG o JMicron JMS581, anche quando il contenitore ha
 l'identificativo USB del suo produttore), se collega un disco NVMe o SATA, l'identificativo USB, la velocità
@@ -33,7 +33,8 @@ teorici», o che dietro il chipset tutto divide il suo collegamento con il proce
 collegamenti più lenti di quanto il dispositivo potrebbe (un NVMe x4 su una sola linea, una scheda grafica
 x16 che lavora a x8). A destra dei dischi i volumi che ne usano più d'uno, collegati a ciascuno, con il
 modo in cui li usano (a strisce, esteso, in mirroring, chiesto a Windows), e i contenitori cifrati
-VeraCrypt o TrueCrypt, collegati al disco o al volume che contiene il loro file. In fondo i dischi virtuali
+VeraCrypt o TrueCrypt, collegati al disco o al volume che contiene il loro file, una colonna più a destra
+di chi li ospita (un contenitore su un volume a strisce sta a destra di quel volume). In fondo i dischi virtuali
 e i volumi senza un disco fisico, ciascuno con il driver che lo crea (per esempio Google Drive con il suo
 driver di file system): Windows dice se un driver sta sul percorso delle richieste di un volume, e lo si
 chiede per ogni driver caricato. Il grafo sta in un riquadro suo e all'inizio vi entra tutto (non sotto
@@ -156,6 +157,14 @@ Se al posto di un disco ne compare un altro con lo stesso numero e la stessa let
 staccando un contenitore USB e collegandone un altro), la finestra se ne accorge alla rilettura
 dell'elenco dei dischi, ogni 4 secondi: toglie lo SMART e le note del disco di prima e legge subito il
 nuovo. Con la finestra nascosta nell'area di notifica l'elenco si rilegge prima di ogni lettura periodica.
+Un disco o un volume che non risponde (per esempio un contenitore USB con il bridge bloccato) non ferma il
+programma: nella lettura dell'elenco ogni disco e ogni volume si interroga per conto suo, con al massimo
+2,5 secondi per rispondere e una sola domanda in sospeso alla volta; chi tace resta com'era alla lettura
+precedente e dopo 8 secondi è segnato «non risponde» nella colonna a sinistra, nel grafo e in `--list`. A
+un disco così non si mandano comandi SMART, la scheda Info dice solo che non risponde, il monitoraggio lo
+segnala con un avviso, e alla chiusura la finestra non aspetta il lavoro rimasto fermo su di lui. Windows
+però non lascia terminare un programma che ha una richiesta in sospeso verso un dispositivo: finché il
+disco non viene scollegato il processo può restare nel Task Manager, anche dopo «Termina attività».
 
 **Eventi di sistema**: gli errori e gli avvisi di dischi, controller e file system registrati da Windows
 nelle ultime 24 ore, 7 giorni o 30 giorni, con una spiegazione per i codici più comuni. «Aggiorna»
@@ -355,6 +364,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - scheda Info e `--info` su tredici dischi (NVMe e SATA interni, un volume distribuito su due dischi, dischi USB, chiavette, un disco virtuale) e sui volumi senza un disco fisico: partizioni GPT e MBR con le lettere al loro posto, settori, TRIM, cache in scrittura; velocità USB coerente con gli hub attraversati (dischi a 5 Gbit/s dietro un hub USB 3, una chiavetta USB 3 riconosciuta come limitata a 480 Mbit/s dietro un hub USB 2); per ogni disco USB il dispositivo a cui «Espelli» chiederebbe la rimozione, confrontato con l'albero dei dispositivi di Windows;
 - interfaccia e collegamento attuale senza privilegi: sei NVMe (versione NVMe e PCIe confrontate con quelle che Windows riporta per il dispositivo; uno PCIe 4.0 x4 collegato a x1 viene segnalato), due SATA interni a 6 Gbit/s con la revisione SATA 3.3, cinque dispositivi USB con la velocità e il tipo di porta (USB 2 o 3, USB-C);
 - Grafo Storage su un PC con Ryzen 9 3900X e chipset X570 e tredici dischi, confrontato con l'albero dei dispositivi di Windows: due NVMe sulle porte PCIe del processore, tre su porte del chipset (quello a PCIe 4.0 x1 in giallo), due SATA sul controller AHCI del chipset con la loro porta, i dischi USB sui due controller USB del chipset attraverso fino a tre hub in cascata, un disco virtuale e quattro volumi senza disco fisico; alla dimensione normale e grande della finestra. Poi gli altri canali PCIe (scheda grafica a PCIe 4.0 x8 su 16 linee possibili con il suo audio HDMI, rete Intel I211, audio e USB interni al processore, un controller SATA senza dischi), le bande teoriche e i fumetti delle linee, i colori per tipo di collegamento, le icone dei tipi di disco anche nella colonna, il volume a strisce sui due NVMe riconosciuto come tale da Windows, tre contenitori VeraCrypt collegati ai volumi che contengono i loro file (uno dei quali è proprio il volume a strisce), un volume di Google Drive con il suo driver di file system, e l'evidenziazione reciproca fra grafo e colonna (con un puntatore simulato); `--graph` stampa lo stesso grafo come testo. La vista del grafo con eventi simulati: rotellina e tasto + ingrandiscono attorno al puntatore, le frecce spostano, 0 torna alla vista iniziale, e un trascinamento che parte sopra un disco sposta la vista senza aprirlo. Gli identificativi di porte, controller, NVMe, hub radice, hub e dispositivi USB e volumi, confrontati con le proprietà che Windows dà per ciascun dispositivo (ID istanza, indirizzi PCI, percorsi di posizione, nomi ACPI delle porte del processore e del chipset); il clic destro che li copia non è nelle verifiche automatiche, per non toccare gli appunti.
+- disco che non risponde: il caso reale di un contenitore Realtek RTL9210B bloccato (più di 1.000 letture ritentate e 12 reimpostazioni del bridge in un quarto d'ora), con cui la versione precedente non apriva la finestra, non si chiudeva e non elencava i dischi; poi, con la simulazione `MYSTORAGETEST_FAKE_STUCK=8,L` (domande al disco 8 e al volume L: che non tornano mai, dall'avvio o dopo qualche secondo con `@3`): `--list` risponde in 2,6 secondi invece di restare fermo, la finestra mostra la prima schermata in 3,3 secondi e completa la sequenza di verifica, con il disco e il volume segnati «non risponde» (dall'avvio solo con il numero e la lettera, dopo con i dati letti prima), il grafo intatto e la chiusura da sola; senza simulazione nulla cambia (`--list` in 0,4 secondi, 0,4 s di processore in 40 secondi a finestra aperta);
 - bridge dei contenitori USB nel Grafo Storage, senza privilegi: un Realtek RTL9210B-CG (0BDA:9210) a 10 Gbit/s con UAS e due dischi Seagate (0BC2:3322 e 0BC2:61B7) dietro un hub USB 3, ciascuno con il suo bridge fra l'hub e il disco; il nome del chip e il prodotto USB confrontati con le proprietà di Windows. Il tipo di disco dietro un bridge che sa collegare sia NVMe sia SATA si conosce dopo la lettura dello SMART, che senza privilegi non c'è; chiavette e lettori di schede restano senza bridge;
 
 Non ancora verificato:
