@@ -243,9 +243,11 @@ comando proprietario di lettura (E4h e E6h, gli stessi di smartmontools), che po
 NVMe ma non il namespace e prevede sempre dati in arrivo: l'avvio dell'autodiagnosi non ha una strada
 documentata. `--selftest X: breve --realtek` prova comunque a mandarlo attraverso il comando dei Realtek,
 prima senza dati e poi come lettura, e controlla nel registro del disco se la prova è partita. Un RTL9210B
-(0BDA:9210, firmware 1.00) lo rifiuta in entrambe le forme come «comando non valido» (codice 20/00),
-subito e senza conseguenze: il bridge controlla il codice del comando NVMe e quello dell'autodiagnosi non
-lo accetta.
+(0BDA:9210, firmware 1.00) e un RTL9210C (3535:9210, firmware 1.01) lo rifiutano in entrambe le forme come
+«comando non valido» (codice 20/00), subito e senza conseguenze: il bridge controlla il codice del comando
+NVMe e quello dell'autodiagnosi non lo accetta. Molti contenitori Realtek hanno l'identificativo USB del
+produttore del contenitore invece di quello di Realtek (0BDA), come quel RTL9210C: se il dispositivo si
+dichiara un SSD, il programma prova comunque le letture ASMedia e Realtek e tiene quella che risponde.
 
 «Rapporto di diagnosi», nella scheda SMART, scrive in `%LOCALAPPDATA%\myStorageTest\diagnosi-smart.txt` i
 comandi inviati a ogni disco e le risposte ricevute, e lo apre: serve a capire perché un disco o un bridge
@@ -334,6 +336,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - lettura degli eventi di sistema, compresa una raffica reale di circa 38.000 errori di un disco USB, con i testi confrontati uno a uno con quelli di Windows;
 - autodiagnosi attraverso un bridge JMicron JMS581 (152D:0581), da amministratore, con `--selftest H: breve`: le letture dello SMART attraverso il bridge rispondono in circa 200 ms, il comando di avvio viene accettato, ma la sua esecuzione non finisce, né in 8 né in 60 secondi; Windows reimposta il bridge, che va scollegato e ricollegato (sette tentativi, a 10 e a 5 Gbit/s). Da qui il blocco della prova sui JMS581;
 - autodiagnosi attraverso un bridge Realtek RTL9210B (0BDA:9210, firmware 1.00), da amministratore, con `--selftest H: breve --realtek`: le letture attraverso il bridge (registro SMART, Identify, registro delle prove) rispondono in 2–3 ms; il comando di autodiagnosi dentro il comando E4h viene rifiutato come «comando non valido» (20/00) sia senza dati sia come lettura, in 1–2 ms, e il disco resta collegato;
+- SMART e autodiagnosi attraverso un bridge Realtek RTL9210C con l'identificativo USB di un altro produttore (3535:9210, firmware 1.01, USB 3.2 Gen 2 con UAS), da amministratore: SAT e lettura ASMedia vengono rifiutate subito, la lettura Realtek risponde in 1–9 ms con SMART, Identify e registro delle prove di un SSD Kingston; il comando di autodiagnosi viene rifiutato come sull'RTL9210B, in 0 ms, senza eventi di errore nel registro di sistema;
 - disco sostituito da un altro con lo stesso numero e la stessa lettera, con la verifica automatica `MYSTORAGETEST_AUTOTEST=sostituzione`: al disco del volume scelto vengono date identità e SMART finti di un contenitore JMicron JMS581, con la lettura periodica rimandata di dieci minuti; alla rilettura dell'elenco dei dischi lo SMART finto sparisce e quello vero compare dopo circa 4 secondi. Con la finestra nascosta nell'area di notifica il programma resta fermo (0,14 s di processore in 70 secondi) e si chiude con `--quit`;
 - blocco e avvertenza per l'autodiagnosi attraverso i bridge JMicron USB-NVMe: prove automatiche su quali bridge sono bloccati (JMS581, 0581 e 1581) e quali hanno l'avvertenza (JMS583, JMS586 e gli altri PID JMicron USB-NVMe; non i bridge JMicron USB-SATA, Realtek e i dischi non USB), e i due testi verificati a schermo nella scheda SMART su un disco interno con un bridge simulato (`MYSTORAGETEST_FAKE_JMICRON=0581` e `=0583`);
 - decodifica di comando e risposta negli eventi 153 e 154, con prove automatiche (`cargo test`) sui dati di eventi veri e confrontata con la decodifica a mano di circa 100.000 eventi reali: un SSD NVMe in contenitore USB con bridge JMicron che a tratti smette di rispondere (letture, scritture, svuotamento della cache, verifica di prontezza e lettura della capacità, tutte con errore hardware 4/44/81) e dischi USB con letture ritentate per tempo scaduto o interrotte;
