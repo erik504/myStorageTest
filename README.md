@@ -458,6 +458,11 @@ parziale, sceglie un tratto trascinando sul grafico e lo fa rileggere, e scrive 
 `superficie.txt`; `MYSTORAGETEST_SURFACE_PHASE=1` la chiude dopo
 l'arresto, per verificare al lancio successivo che la memoria sia rimasta.
 
+Gli script PowerShell in `prove\` lanciano queste verifiche in un'istanza isolata, che non prende il
+fuoco e non tocca quella in uso: `scenario.ps1` (prova completa con schermate), `schermate.ps1`,
+`superficie.ps1`, `riavvio.ps1`, `amministratore.ps1` e `installa.ps1`. Le regole di lavoro e gli
+appunti tecnici dello sviluppo sono in `CLAUDE.md` e `NOTE-TECNICHE.md`.
+
 ## Licenza
 
 [MIT](LICENSE).
