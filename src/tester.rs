@@ -78,6 +78,54 @@ impl QueueGroup {
     }
 }
 
+/// Punto del disco in cui la prova «inizio, metà e fine» misura la lettura in sequenza.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Zone {
+    Start,
+    Middle,
+    End,
+}
+
+impl Zone {
+    pub const ALL: [Zone; 3] = [Zone::Start, Zone::Middle, Zone::End];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Zone::Start => "inizio",
+            Zone::Middle => "metà",
+            Zone::End => "fine",
+        }
+    }
+}
+
+/// Secondi di lettura in ciascun punto del disco proposti nelle opzioni.
+pub const ZONE_SECS_CHOICES: [u32; 6] = [3, 5, 10, 20, 30, 60];
+
+/// Tratto del disco letto in uno dei tre punti della prova «inizio, metà e fine».
+#[derive(Clone, Debug)]
+pub struct ZoneSpan {
+    pub zone: Zone,
+    /// Da dove a dove si è letto, in byte (la fine è esclusa), e dimensione di ciò che si legge.
+    pub from: u64,
+    pub to: u64,
+    pub length: u64,
+    /// Che cosa si legge: «disco 2», «volume D:».
+    pub target: String,
+    /// Il tratto è finito prima del tempo ed è stato riletto da capo.
+    pub wrapped: bool,
+}
+
+impl ZoneSpan {
+    /// Posizione del tratto in percentuale del disco: «49,98–50,02 %».
+    pub fn position(&self) -> String {
+        let pct = |b: u64| {
+            let s = format!("{:.2}", b as f64 * 100.0 / self.length.max(1) as f64).replace('.', ",");
+            s.trim_end_matches('0').trim_end_matches(',').to_string()
+        };
+        format!("{}–{} %", pct(self.from), pct(self.to))
+    }
+}
+
 /// Una riga della tabella «velocità per blocco e profondità della coda».
 pub struct QueueRow {
     pub group: QueueGroup,
@@ -160,6 +208,8 @@ pub enum Phase {
     /// Rilettura dei blocchi appena scritti dalla scrittura casuale e dal flush, per controllarli.
     Verify,
     FileScan,
+    /// Lettura grezza in sequenza in uno dei tre punti del disco, per il tempo scelto.
+    Zone(Zone),
     Surface,
 }
 
@@ -179,6 +229,9 @@ impl Phase {
             Phase::Flush => "Flush su disco",
             Phase::Verify => "Verifica dei blocchi scritti",
             Phase::FileScan => "Scansione dei file esistenti",
+            Phase::Zone(Zone::Start) => "Lettura sequenziale all'inizio del disco",
+            Phase::Zone(Zone::Middle) => "Lettura sequenziale a metà del disco",
+            Phase::Zone(Zone::End) => "Lettura sequenziale alla fine del disco",
             Phase::Surface => "Scansione della superficie",
         }
     }
@@ -198,6 +251,9 @@ impl Phase {
             Phase::Flush => "Flush",
             Phase::Verify => "Verifica",
             Phase::FileScan => "File esistenti",
+            Phase::Zone(Zone::Start) => "Lettura inizio",
+            Phase::Zone(Zone::Middle) => "Lettura metà",
+            Phase::Zone(Zone::End) => "Lettura fine",
             Phase::Surface => "Superficie",
         }
     }
@@ -228,6 +284,10 @@ pub struct TestConfig {
     pub file_scan: bool,
     /// Limite in byte della scansione dei file; 0 = tutto il volume.
     pub file_scan_limit: u64,
+    /// Lettura grezza in sequenza all'inizio, a metà e alla fine del disco (solo da amministratore).
+    pub zones: bool,
+    /// Secondi di lettura in ciascuno dei tre punti.
+    pub zone_secs: f64,
     /// Lettura grezza del volume (solo da amministratore).
     pub surface: bool,
     /// Tratto del volume da leggere, come frazioni da 0 a 1: da dove a dove.
@@ -350,6 +410,12 @@ pub struct Shared {
     pub cleaned: Option<bool>,
     /// Eventi di sistema sul disco registrati durante la prova.
     pub sys_events: Vec<StorEvent>,
+    /// Le prove sul file temporaneo erano richieste.
+    pub file_tests: bool,
+    /// Secondi di lettura in ogni punto della prova «inizio, metà e fine»; 0 = prova non richiesta.
+    pub zone_secs: f64,
+    /// Tratti letti da quella prova, nell'ordine: inizio, metà, fine.
+    pub zone_spans: Vec<ZoneSpan>,
     /// Scansione della superficie, lungo il disco e non nel tempo: i tratti letti, in ordine.
     pub surface: Vec<Tract>,
     /// Posizioni in byte dei blocchi che non si sono lasciati leggere.
@@ -436,6 +502,18 @@ fn surface_point(tract: (u64, u64, f64, f64, u32)) -> Tract {
     }
 }
 
+/// Velocità di un punto del disco rispetto all'inizio: «12 % più lenta che all'inizio».
+pub fn compare_to_start(mbps: f64, start: f64) -> String {
+    let diff = (mbps / start - 1.0) * 100.0;
+    if diff.abs() < 1.0 {
+        "come all'inizio".to_string()
+    } else if diff < 0.0 {
+        format!("{} % più lenta che all'inizio", (-diff).round())
+    } else {
+        format!("{} % più veloce che all'inizio", diff.round())
+    }
+}
+
 /// Microsecondi rappresentati dal limite inferiore di un secchio dell'istogramma.
 pub fn bucket_micros(i: usize) -> f64 {
     10f64.powf(i as f64 / HIST_PER_DECADE as f64)
@@ -462,6 +540,8 @@ impl TestRun {
         let shared = Arc::new(Mutex::new(Shared {
             running: true,
             status: "Preparazione…".into(),
+            file_tests: config.file_tests,
+            zone_secs: if config.zones { config.zone_secs } else { 0.0 },
             ..Default::default()
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1079,6 +1159,9 @@ impl Engine {
         }
         if self.cfg.file_scan && !self.halted() {
             self.file_scan(own_file.as_deref());
+        }
+        if self.cfg.zones && !self.halted() {
+            self.zones();
         }
         if self.cfg.surface && !self.halted() {
             self.surface();
@@ -2281,6 +2364,228 @@ impl Engine {
 
     /// Lettura grezza del volume, settore per settore, sul tratto richiesto (richiede privilegi di
     /// amministratore).
+    /// Lettura grezza in sequenza in tre punti del disco, all'inizio, a metà e alla fine, per
+    /// `zone_secs` secondi ciascuno, a blocchi da 1 MiB e una richiesta alla volta. Si legge il disco
+    /// fisico intero quando il volume sta su un disco solo (sui dischi meccanici la velocità dipende
+    /// dalla posizione sul disco, non nel volume), altrimenti il volume.
+    fn zones(&self) {
+        let first = Phase::Zone(Zone::Start);
+        // Solo per le verifiche automatiche, come per la superficie: al posto del disco si legge un file.
+        let stand_in = std::env::var("MYSTORAGETEST_SURFACE_FILE").ok().filter(|p| !p.is_empty());
+        let mut targets: Vec<(String, String)> = Vec::new();
+        match (&stand_in, self.cfg.disks.as_slice()) {
+            (Some(file), _) => targets.push((file.clone(), "file letto al posto del disco".into())),
+            (None, [n]) => targets.push((format!(r"\\.\PhysicalDrive{n}"), format!("disco {n}"))),
+            _ => {}
+        }
+        if stand_in.is_none() {
+            targets.push((format!(r"\\.\{}:", self.cfg.letter), format!("volume {}:", self.cfg.letter)));
+        }
+        let mut opened = None;
+        let mut first_error = 0u32;
+        for (path, target) in targets {
+            match win::open(
+                &path,
+                win::GENERIC_READ,
+                win::SHARE_ALL,
+                win::OPEN_EXISTING,
+                win::FLAG_NO_BUFFERING | win::FLAG_SEQUENTIAL_SCAN,
+            ) {
+                Ok(h) => {
+                    opened = Some((h, path, target));
+                    break;
+                }
+                Err(code) if first_error == 0 => first_error = code,
+                Err(_) => {}
+            }
+        }
+        let skip = |note: String| {
+            self.begin(first);
+            self.log(LogLevel::Warn, format!("Lettura a inizio, metà e fine del disco — {note}"));
+            self.shared.lock().unwrap().skipped += 1;
+            Sampler::new(first).finish(self, false, note);
+        };
+        let Some((h, path, target)) = opened else {
+            skip(if first_error == 5 {
+                "Saltata: serve avviare il programma come amministratore".to_string()
+            } else {
+                format!("Saltata: {}", win::error_text(first_error))
+            });
+            return;
+        };
+        let length = if stand_in.is_some() {
+            let mut size = 0i64;
+            unsafe { windows_sys::Win32::Storage::FileSystem::GetFileSizeEx(h.raw(), &mut size) };
+            size.max(0) as u64
+        } else {
+            let mut len_buf = [0u8; 8];
+            match win::ioctl(&h, IOCTL_DISK_GET_LENGTH_INFO, &[], &mut len_buf) {
+                Ok(_) => u64::from_le_bytes(len_buf),
+                Err(_) => self.cfg.total,
+            }
+        };
+        let block = SEQ_BLOCK as u64;
+        let end_all = length / block * block;
+        // Ogni punto ha il suo terzo del disco e non ne esce: così i tratti letti non si sovrappongono.
+        let third = end_all / 3 / block * block;
+        if third == 0 {
+            skip(format!("Saltata: {} troppo piccolo ({})", target, win::human_bytes(length)));
+            return;
+        }
+        let secs = self.cfg.zone_secs.max(0.5);
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Lettura in sequenza del {target} ({}): {} s all'inizio, a metà e alla fine, a blocchi da 1 MB, \
+                 una richiesta alla volta",
+                win::human_bytes(length),
+                secs.round()
+            ),
+        );
+        let mut buf = AlignedBuf::new(SEQ_BLOCK);
+        // Byte letti al secondo in ogni punto già fatto, misurati sul tempo trascorso (non sulla sola
+        // durata delle letture): servono a prevedere quanto disco coprirà il punto successivo.
+        let mut paces: Vec<f64> = Vec::new();
+        let mut start_mbps: Option<f64> = None;
+        let mut speeds: Vec<String> = Vec::new();
+        let up = |bytes: f64| ((bytes.max(0.0) as u64).div_ceil(block) * block).max(block);
+        for zone in Zone::ALL {
+            if self.halted() {
+                break;
+            }
+            let phase = Phase::Zone(zone);
+            self.begin(phase);
+            let mut s = Sampler::new(phase);
+            let (lo, hi) = match zone {
+                Zone::Start => (0, third),
+                Zone::Middle => (third, end_all - third),
+                Zone::End => (end_all - third, end_all),
+            };
+            // Quanto disco si prevede di leggere nel tempo scelto. Per la fine si ripete il calo visto
+            // fra inizio e metà (sui dischi meccanici la fine è la parte più lenta), al massimo della metà.
+            let pace = match paces.as_slice() {
+                [] => 0.0,
+                [start, middle] if *start > 0.0 => middle * (middle / start).clamp(0.5, 1.0),
+                [.., last] => *last,
+            };
+            let expect = if pace > 0.0 { up(pace * secs).min(hi - lo) } else { hi - lo };
+            // L'inizio parte dal primo blocco; la metà si centra sulla metà del disco; la fine parte
+            // in modo da arrivare all'ultimo blocco.
+            let first_at = match zone {
+                Zone::Start => lo,
+                Zone::Middle => ((end_all / 2).saturating_sub(expect / 2) / block * block).clamp(lo, hi - expect),
+                Zone::End => hi - expect,
+            };
+            let mut span = ZoneSpan {
+                zone,
+                from: first_at,
+                to: first_at,
+                length,
+                target: target.clone(),
+                wrapped: false,
+            };
+            self.shared.lock().unwrap().zone_spans.push(span.clone());
+            let publish = |span: &ZoneSpan| {
+                if let Some(z) = self.shared.lock().unwrap().zone_spans.iter_mut().find(|z| z.zone == span.zone) {
+                    *z = span.clone();
+                }
+            };
+            let started = Instant::now();
+            let mut tick = Instant::now();
+            let mut off = first_at;
+            // Dove finisce il tratto in lettura: per inizio e metà il bordo del loro terzo, per la
+            // fine l'ultimo blocco del disco.
+            let mut seg_end = hi;
+            let mut zone_bytes = 0u64;
+            let mut completed = true;
+            loop {
+                if self.halted() {
+                    completed = false;
+                    break;
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                if elapsed >= secs {
+                    break;
+                }
+                if off >= seg_end {
+                    let below = span.from;
+                    if zone == Zone::End && below > lo {
+                        // La fine è arrivata all'ultimo blocco prima del tempo: continua con il tratto
+                        // subito prima di quello già letto, invece di rileggerlo.
+                        let now_pace = if elapsed > 0.0 { zone_bytes as f64 / elapsed } else { pace };
+                        let more = up(now_pace * (secs - elapsed)).max(16 << 20);
+                        seg_end = below;
+                        off = below.saturating_sub(more).max(lo);
+                        span.from = off;
+                    } else {
+                        // Il terzo del disco è finito prima del tempo (disco piccolo o molto veloce):
+                        // si rilegge da dove si era cominciato.
+                        off = span.from;
+                        seg_end = span.to;
+                        span.wrapped = true;
+                    }
+                }
+                let (r, dt) = self.io(|| read_at(&h, off, buf.as_mut_slice()));
+                match r {
+                    Ok(n) if n > 0 => {
+                        s.add(self, n as u64, dt, "lettura in sequenza del disco");
+                        off += n as u64;
+                        zone_bytes += n as u64;
+                        span.to = span.to.max(off);
+                    }
+                    // Fine dei dati prima della lunghezza dichiarata: non c'è altro da leggere qui.
+                    Ok(_) => {
+                        completed = false;
+                        break;
+                    }
+                    Err(code) => {
+                        s.errors += 1;
+                        let class = self.error(phase, "lettura", &path, off, block as u32, code);
+                        if class.is_fatal() || s.errors > MAX_PHASE_ERRORS {
+                            completed = false;
+                            break;
+                        }
+                        off += block;
+                        span.to = span.to.max(off);
+                    }
+                }
+                if stand_in.is_some() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if tick.elapsed() >= Duration::from_millis(100) {
+                    tick = Instant::now();
+                    self.progress(elapsed / secs);
+                    publish(&span);
+                }
+            }
+            publish(&span);
+            let wall = started.elapsed().as_secs_f64();
+            paces.push(if wall > 0.0 { zone_bytes as f64 / wall } else { 0.0 });
+            let mbps = if s.secs > 0.0 { s.bytes as f64 / s.secs / 1e6 } else { 0.0 };
+            let mut note = format!("posizione {} del {target}", span.position());
+            match start_mbps {
+                Some(base) if mbps > 0.0 => note.push_str(&format!(" · {}", compare_to_start(mbps, base))),
+                None if zone == Zone::Start && mbps > 0.0 => start_mbps = Some(mbps),
+                _ => {}
+            }
+            if span.wrapped {
+                note.push_str(
+                    " · tratto finito prima del tempo e riletto da capo: la cache del disco può gonfiare la velocità",
+                );
+            }
+            if mbps > 0.0 {
+                speeds.push(format!("{} {} MB/s", zone.name(), win::thousands(mbps.round() as u64)));
+            }
+            s.finish(self, completed, note);
+            if !completed {
+                break;
+            }
+        }
+        if !speeds.is_empty() {
+            self.log(LogLevel::Good, format!("Lettura in sequenza del {target}: {}", speeds.join(" · ")));
+        }
+    }
+
     fn surface(&self) {
         self.begin(Phase::Surface);
         let mut s = Sampler::new(Phase::Surface);
@@ -2441,5 +2746,32 @@ impl Engine {
             )
         };
         s.finish(self, completed, note);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posizione_dei_tratti_in_percentuale() {
+        let span = |from: u64, to: u64| ZoneSpan {
+            zone: Zone::Middle,
+            from,
+            to,
+            length: 4_000_000_000_000,
+            target: "disco 2".into(),
+            wrapped: false,
+        };
+        assert_eq!(span(0, 2_000_000_000).position(), "0–0,05 %");
+        assert_eq!(span(1_999_000_000_000, 2_001_000_000_000).position(), "49,98–50,02 %");
+        assert_eq!(span(3_998_000_000_000, 4_000_000_000_000).position(), "99,95–100 %");
+    }
+
+    #[test]
+    fn confronto_con_l_inizio() {
+        assert_eq!(compare_to_start(100.0, 200.0), "50 % più lenta che all'inizio");
+        assert_eq!(compare_to_start(199.0, 200.0), "come all'inizio");
+        assert_eq!(compare_to_start(230.0, 200.0), "15 % più veloce che all'inizio");
     }
 }

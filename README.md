@@ -139,6 +139,20 @@ il grosso delle risposte e lascia fuori lo 0,5 % più lento:
 - rilettura di verifica dei blocchi scritti dalla scrittura casuale e dal flush: è una fase a sé
   («Verifica»), visibile nello stato, nel registro delle attività e nei grafici;
 - lettura dei file già presenti sul volume, in sola lettura, per trovare settori illeggibili;
+- lettura in sequenza all'inizio, a metà e alla fine del disco (solo da amministratore), per un tempo a
+  scelta in ciascun punto: 3, 5, 10, 20, 30 o 60 secondi (10 s di partenza, ricordato). Si legge il disco
+  fisico intero, non solo il volume (il volume, se sta su più dischi), a blocchi da 1 MB e una richiesta
+  alla volta, senza scrivere nulla. L'inizio parte dal primo blocco, la metà si centra sul 50 % del disco
+  e la fine arriva all'ultimo blocco: quanto disco coprirà ogni punto si calcola dalla velocità misurata
+  nei punti precedenti, e se avanza tempo la fine legge il tratto subito prima invece di rileggere lo
+  stesso. Velocità e latenza dei tre punti stanno nei grafici nel tempo con le altre prove, ognuno con il
+  suo colore (arancioni, più scuri lontano dall'inizio) e un fumetto che dice anche la posizione letta,
+  per esempio «99,95–100 % del disco 2»; tre riquadri danno MB/s, latenza media e differenza rispetto
+  all'inizio, e passandoci sopra latenza p99 e massima. Sui dischi meccanici la fine, sulle tracce
+  interne, è di solito molto più lenta dell'inizio; sugli SSD le zone mai scritte o liberate con TRIM si
+  leggono senza toccare la memoria flash e risultano più veloci. Su un disco tanto piccolo o veloce che
+  un terzo del disco finisce prima del tempo, il tratto si rilegge da capo e il risultato lo dice, perché
+  la cache del disco può gonfiare la velocità;
 - lettura grezza della superficie del volume (solo da amministratore), su due grafici a parte, uno sopra
   l'altro e con lo stesso asse: velocità e latenza (media e lettura più lenta) lungo il disco, con i
   blocchi illeggibili segnati, mentre la scansione gira e alla fine. Si può scandire tutta o solo un
@@ -247,6 +261,7 @@ journal NTFS). L'autodiagnosi la esegue il disco e il suo esito resta nel regist
 | Autodiagnosi: stato e prove registrate (NVMe interni) | sì | sì |
 | Autodiagnosi: stato ed esito dell'ultima prova (SATA interni) | sì | sì, con il registro completo |
 | Autodiagnosi: avvio e interruzione | no | sì |
+| Lettura a inizio, metà e fine del disco | no | sì |
 | Scansione della superficie | no | sì |
 
 «Riavvia come amministratore» in basso a sinistra rilancia il programma con i privilegi necessari. Per
@@ -324,6 +339,8 @@ mystoragetest --test X: [opzioni] esegue le prove sul volume X:
     --size MB    dimensione del file di prova (predefinito 256)
     --secs N     durata delle prove casuali (predefinito 5)
     --scan MB    legge anche i file esistenti fino a MB (0 = tutti)
+    --zones      lettura in sequenza all'inizio, a metà e alla fine del disco (solo da amministratore)
+    --zone-secs N      secondi di lettura in ciascuno dei tre punti (predefinito 10)
     --surface    scansione della superficie (solo da amministratore)
     --from P     inizio della scansione della superficie, in percentuale (predefinito 0)
     --to P       fine della scansione della superficie, in percentuale (predefinito 100)
@@ -388,6 +405,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - decodifica di comando e risposta negli eventi 153 e 154, con prove automatiche (`cargo test`) sui dati di eventi veri e confrontata con la decodifica a mano di circa 100.000 eventi reali: un SSD NVMe in contenitore USB con bridge JMicron che a tratti smette di rispondere (letture, scritture, svuotamento della cache, verifica di prontezza e lettura della capacità, tutte con errore hardware 4/44/81) e dischi USB con letture ritentate per tempo scaduto o interrotte;
 - storico delle temperature degli SSD interni;
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
+- lettura a inizio, metà e fine del disco eseguita su un file da 2 GB al posto del disco, senza privilegi (`prove\zone.ps1` e `--test C: --no-write --zones`): con 3 secondi per punto i tratti letti sono 0–13,5 %, 43,3–56,8 % (centrato sul 50 %) e 86,5–100 % (fino all'ultimo byte), con 28 punti di velocità e di latenza ciascuno; con 1 secondo 0–4,5 %, 47,7–52,3 % e 94,7–100 %. Fumetti dei grafici e dei riquadri con un puntatore simulato, alla dimensione normale e grande della finestra; con la sola prova dei tre punti restano solo i loro riquadri e «Errori». Su un file da 96 MB i tratti finiscono prima del tempo e vengono riletti con l'avvertenza; su uno da 2 MB la prova viene saltata con un avviso (uscita 1). Le velocità misurate sul file non contano: non è mai stato scritto, e Windows restituisce zeri senza leggere il disco;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
 - fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato; sui grafici di velocità e latenza uno sopra l'altro, il segno e la fascia della misura sullo stesso istante di entrambi e, nelle prove con coda, la coda della misura (Q2 con blocchi da 1M in sequenza, Q4 con blocchi da 256K a caso), confrontata con gli intervalli registrati;
 - «Riavvia come amministratore» e l'avvio diretto da amministratore (`--admin` e «Avvia sempre come amministratore»): la sequenza di rilancio, provata senza elevazione;
@@ -411,6 +429,7 @@ Non ancora verificato:
 - **SMART dei dischi USB con bridge Realtek e ASMedia, con i vecchi bridge JMicron, Cypress, Sunplus e Prolific** e **registri SCSI**: i comandi sono scritti secondo i protocolli documentati ma non c'era un dispositivo su cui eseguirli («Rapporto di diagnosi» serve proprio a controllarli);
 - **disco fermo lasciato stare**: la domanda al disco funziona, ma un disco davvero fermo durante una lettura periodica non è ancora stato osservato;
 - **scansione della superficie di un volume vero**: richiede l'amministratore; tutto il resto della scansione è stato provato leggendo un file al posto del volume;
+- **lettura a inizio, metà e fine di un disco vero**: richiede l'amministratore (lettura di `\\.\PhysicalDriveN`, o del volume se sta su più dischi); tratti, tempi, grafici e riquadri sono stati provati leggendo un file al posto del disco;
 - avviso del monitoraggio per un'autodiagnosi fallita: non c'era un disco con una prova fallita;
 - storico delle temperature dei dischi USB;
 - riapertura della finestra dall'icona e chiusura nell'area di notifica;
@@ -429,7 +448,7 @@ precedenti all'ultimo avvio vengono attribuiti a un disco solo tramite la letter
 | `src/info.rs` | dati di dettaglio di volumi e dischi (partizioni, settori, collegamenti PCIe, SATA e USB) ed espulsione |
 | `src/topology.rs` | Grafo Storage: catena di ogni disco e dispositivo PCI nell'albero dei dispositivi, fino al processore; bande teoriche, volumi su più dischi, contenitori cifrati, driver dei volumi senza disco; nel grafo completo dispositivi USB, monitor (EDID), codec audio, dispositivi LPC e ACPI |
 | `src/icons.rs` | iconcine disegnate a vettori: tipi di disco e componenti del grafo, anche monitor, tastiera, mouse, webcam, Bluetooth, chip della scheda madre |
-| `src/tester.rs` | motore delle prove di I/O |
+| `src/tester.rs` | motore delle prove di I/O, compresa la lettura a inizio, metà e fine del disco |
 | `src/errors.rs` | classificazione dei codici d'errore |
 | `src/smart.rs` | SMART e autodiagnosi (NVMe, ATA, pass-through USB) |
 | `src/eventlog.rs` | registro eventi di Windows: query, sottoscrizione, testi veloci |
@@ -457,10 +476,13 @@ la sequenza ferma la scansione, verifica il punto ricordato, la riprende, prova 
 parziale, sceglie un tratto trascinando sul grafico e lo fa rileggere, e scrive ciò che osserva in
 `superficie.txt`; `MYSTORAGETEST_SURFACE_PHASE=1` la chiude dopo
 l'arresto, per verificare al lancio successivo che la memoria sia rimasta.
+Lo stesso file serve alla lettura a inizio, metà e fine del disco: con `MYSTORAGETEST_AUTOTEST=zone` la
+sequenza fa solo quella prova, con `MYSTORAGETEST_ZONE_SECS` secondi per punto (3 se non indicato),
+salva le schermate con i fumetti di grafici e riquadri e scrive tratti e risultati in `zone.txt`.
 
 Gli script PowerShell in `prove\` lanciano queste verifiche in un'istanza isolata, che non prende il
 fuoco e non tocca quella in uso: `scenario.ps1` (prova completa con schermate), `schermate.ps1`,
-`superficie.ps1`, `riavvio.ps1`, `amministratore.ps1` e `installa.ps1`. Le regole di lavoro e gli
+`superficie.ps1`, `zone.ps1`, `riavvio.ps1`, `amministratore.ps1` e `installa.ps1`. Le regole di lavoro e gli
 appunti tecnici dello sviluppo sono in `CLAUDE.md` e `NOTE-TECNICHE.md`.
 
 ## Licenza

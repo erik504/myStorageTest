@@ -75,7 +75,7 @@ Le ha mostrate nelle richieste fatte finora.
      - «Stato delle verifiche», con solo ciò che è stato davvero provato e in che modo; il resto va in
        «Non ancora verificato»;
      - la tabella «Struttura del codice».
-  3. `cargo build --release` senza avvisi e `cargo test` (oggi 15 prove).
+  3. `cargo build --release` senza avvisi e `cargo test` (oggi 17 prove).
   4. Verifica con le istanze di prova e le schermate (vedi sotto). **Le schermate vanno guardate**:
      testi tagliati, legende spezzate e grafici fuori dallo schermo si vedono solo lì.
   5. Installazione con `prove\installa.ps1`. Copia la build in `myStorageTest.exe` nella radice del
@@ -168,6 +168,7 @@ Le ha mostrate nelle richieste fatte finora.
 | `scenario.ps1 -Vol J [-Vol2 E]` | scenario completo: prova vera, fumetti, tutte le schede, schermate; circa 2 minuti; riuscita = uscita 0, una ventina di schermate, nessun file rimasto |
 | `schermate.ps1 -Vol C [-Grafo completo]` | schermate senza prove sui dischi (grafo, Info, SMART, eventi…); `-Vol 9` per un disco senza lettera |
 | `superficie.ps1` | scansione della superficie su un file da 2 GB, in due avvii (arresto e ripresa), con `superficie.txt` |
+| `zone.ps1 [-SecondiPunto 3]` | lettura a inizio, metà e fine del disco sullo stesso file da 2 GB, con fumetti e `zone.txt` (tratti, risultati, registro); circa 30 secondi |
 | `riavvio.ps1` | «Riavvia come amministratore» senza elevazione vera |
 | `amministratore.ps1 -Vol C` | `--admin` e «Avvia sempre come amministratore» senza elevazione vera |
 | `installa.ps1` | copia la build in `myStorageTest.exe` (o rinomina quello in uso) e pulisce i dati di prova |
@@ -188,9 +189,11 @@ comunque è lenta.
 | `MYSTORAGETEST_AUTOTEST=1` | con `SHOT`: fa anche una prova vera sul volume scelto |
 | `MYSTORAGETEST_AUTOTEST=superficie` | sequenza della scansione della superficie (con `SURFACE_FILE`) |
 | `MYSTORAGETEST_AUTOTEST=sostituzione` | disco sostituito da un altro con lo stesso numero e la stessa lettera |
+| `MYSTORAGETEST_AUTOTEST=zone` | solo la lettura a inizio, metà e fine del disco (con `SURFACE_FILE` se non si è amministratori), schermate e `zone.txt` |
+| `MYSTORAGETEST_ZONE_SECS=3` | secondi per punto in quella sequenza |
 | `MYSTORAGETEST_VOL=C` oppure `=9` | volume da scegliere (lettera) o disco senza lettera (numero) |
 | `MYSTORAGETEST_VOL2=E` | una seconda prova, insieme alla prima, su un altro volume |
-| `MYSTORAGETEST_SURFACE_FILE=<file>` | la scansione legge adagio il file al posto del volume: si prova senza amministratore |
+| `MYSTORAGETEST_SURFACE_FILE=<file>` | la scansione della superficie e la lettura a inizio, metà e fine leggono il file al posto del volume o del disco (adagio): si prova senza amministratore |
 | `MYSTORAGETEST_SURFACE_PHASE=1` | chiude dopo l'arresto della scansione (prima metà della prova di ripresa) |
 | `MYSTORAGETEST_RESTART_TEST=1` | il rilancio usa "open" al posto di "runas" |
 | `MYSTORAGETEST_FAKE_ALERT` | un avviso simulato del monitoraggio |

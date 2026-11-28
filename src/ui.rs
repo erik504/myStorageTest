@@ -23,7 +23,7 @@ use crate::info;
 use crate::monitor::Monitor;
 use crate::settings::{self, Settings};
 use crate::smart::{self, Health, SelfTestCmd, SmartReport};
-use crate::tester::{self, HIST_BUCKETS, LogLevel, Outcome, Phase, QueueGroup, TestConfig, TestRun};
+use crate::tester::{self, HIST_BUCKETS, LogLevel, Outcome, Phase, QueueGroup, TestConfig, TestRun, Zone};
 use crate::topology;
 use crate::tray::{self, Tray, TrayEvent};
 use crate::win::{self, human_bytes};
@@ -59,6 +59,10 @@ fn phase_color(p: Phase) -> Color32 {
         Phase::Flush => Color32::from_rgb(167, 139, 250),
         Phase::Verify => Color32::from_rgb(250, 204, 21),
         Phase::FileScan => Color32::from_rgb(52, 211, 153),
+        // Inizio, metà e fine del disco negli arancioni: più scuro il punto più lontano dall'inizio.
+        Phase::Zone(Zone::Start) => Color32::from_rgb(253, 186, 116),
+        Phase::Zone(Zone::Middle) => Color32::from_rgb(249, 115, 22),
+        Phase::Zone(Zone::End) => Color32::from_rgb(194, 65, 12),
         Phase::Surface => Color32::from_rgb(163, 177, 198),
     }
 }
@@ -1098,6 +1102,8 @@ struct TestOptions {
     rand_write: bool,
     flush: bool,
     file_scan: bool,
+    /// Lettura in sequenza all'inizio, a metà e alla fine del disco.
+    zones: bool,
     surface: bool,
     log_speed: bool,
     log_latency: bool,
@@ -1122,6 +1128,8 @@ struct Script {
     surface: bool,
     /// Sequenza dedicata a un disco sostituito da un altro (`MYSTORAGETEST_AUTOTEST=sostituzione`).
     swap: bool,
+    /// Sequenza dedicata alla lettura a inizio, metà e fine del disco (`MYSTORAGETEST_AUTOTEST=zone`).
+    zones: bool,
     /// Quando è stato sostituito.
     swapped_at: Option<Instant>,
     /// Quello che la sequenza della superficie osserva, scritto in `superficie.txt`.
@@ -1231,7 +1239,7 @@ pub struct App {
     /// Rettangoli dei grafici nell'ultimo fotogramma: velocità, latenza, distribuzione, superficie,
     /// temperatura; del riquadro «Lettura Q1–32» e della prima casella «migliore» della tabella con
     /// coda, che hanno anche loro un fumetto.
-    chart_rects: [egui::Rect; 7],
+    chart_rects: [egui::Rect; 8],
     /// Solo per le verifiche automatiche: puntatore simulato, per provare i fumetti dei grafici
     /// senza toccare il mouse vero.
     fake_pointer: Option<egui::Pos2>,
@@ -1289,6 +1297,7 @@ impl App {
             second: None,
             surface: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("superficie"),
             swap: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("sostituzione"),
+            zones: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("zone"),
             swapped_at: None,
             report: Vec::new(),
         });
@@ -1357,6 +1366,7 @@ impl App {
                 rand_write: true,
                 flush: true,
                 file_scan: true,
+                zones: true,
                 surface: false,
                 log_speed: false,
                 log_latency: true,
@@ -1384,7 +1394,7 @@ impl App {
             script,
             restart_test: (std::env::var_os("MYSTORAGETEST_RESTART_TEST").is_some() && startup.after.is_none())
                 .then(|| Instant::now() + Duration::from_millis(1500)),
-            chart_rects: [egui::Rect::NOTHING; 7],
+            chart_rects: [egui::Rect::NOTHING; 8],
             fake_pointer: None,
             fake_pointer_gone: false,
             script_scroll: None,
@@ -1428,6 +1438,128 @@ impl App {
             Some(Sel::Volume(l)) => self.inventory.volume(l).map(|v| v.disks.clone()).unwrap_or_default(),
             Some(Sel::Disk(n)) => vec![n],
             None => Vec::new(),
+        }
+    }
+
+    /// Verifica automatica della lettura a inizio, metà e fine del disco (`MYSTORAGETEST_AUTOTEST=zone`;
+    /// senza amministratore con `MYSTORAGETEST_SURFACE_FILE`, un file letto al posto del disco). Fa solo
+    /// quella prova, con `MYSTORAGETEST_ZONE_SECS` secondi per punto (predefinito 3), poi schermate con
+    /// i fumetti dei grafici e del riquadro della fine; i risultati vanno in `zone.txt`.
+    fn drive_zone_script(&mut self, ctx: &egui::Context) {
+        let Some(Sel::Volume(letter)) = self.selected else { return };
+        let step = {
+            let script = self.script.as_mut().unwrap();
+            script.step += 1;
+            script.step - 1
+        };
+        let wait = |app: &mut App, ms: u64| {
+            app.script.as_mut().unwrap().next_at = Instant::now() + Duration::from_millis(ms);
+        };
+        let shot = |app: &mut App, name: &str| script_shot(ctx, app.script.as_mut().unwrap(), name);
+        let point = |app: &mut App, rect: egui::Rect, fx: f32, fy: f32| {
+            if rect.is_positive() {
+                app.fake_pointer = Some(rect.left_top() + vec2(rect.width() * fx, rect.height() * fy));
+            }
+        };
+        match step {
+            0 => {
+                self.opt.file_tests = false;
+                self.opt.file_scan = false;
+                self.opt.surface = false;
+                self.opt.zones = true;
+                self.settings.zone_secs = std::env::var("MYSTORAGETEST_ZONE_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                self.start_test();
+                wait(self, 1500);
+            }
+            1 => shot(self, "zone-1-in-corso.png"),
+            2 => {
+                if self.testing() {
+                    self.script.as_mut().unwrap().step = 2;
+                    wait(self, 250);
+                } else {
+                    wait(self, 600);
+                }
+            }
+            3 => {
+                let mut lines = Vec::new();
+                if let Some(run) = self.runs.get(&letter) {
+                    let sh = run.shared.lock().unwrap();
+                    for r in sh.results.iter().filter(|r| matches!(r.phase, Phase::Zone(_))) {
+                        lines.push(format!(
+                            "{}: {:.1} MB/s, {} letture, {} letti, latenza media {:.3} ms, p99 {:.3} ms, max {:.2} ms, \
+                             errori {}, completata {} — {}",
+                            r.phase.label(),
+                            r.mbps,
+                            r.ops,
+                            human_bytes(r.bytes),
+                            r.lat_avg_ms,
+                            r.lat_p99_ms,
+                            r.lat_max_ms,
+                            r.errors,
+                            r.completed,
+                            r.note
+                        ));
+                    }
+                    for z in &sh.zone_spans {
+                        lines.push(format!(
+                            "tratto {}: da {} a {} byte su {} ({}), {}, riletto da capo {}",
+                            z.zone.name(),
+                            z.from,
+                            z.to,
+                            z.length,
+                            z.target,
+                            z.position(),
+                            z.wrapped
+                        ));
+                    }
+                    for (phase, series) in sh.series.iter().filter(|(p, _)| matches!(p, Phase::Zone(_))) {
+                        let first = series.speed.first().map(|p| p[0]).unwrap_or(0.0);
+                        let last = series.speed.last().map(|p| p[0]).unwrap_or(0.0);
+                        lines.push(format!(
+                            "punti di {}: {} di velocità, {} di latenza, da {first:.1} a {last:.1} s",
+                            phase.short(),
+                            series.speed.len(),
+                            series.lat_avg.len()
+                        ));
+                    }
+                    lines.push(format!("esito: {:?}", sh.outcome));
+                    for (t, _, msg) in &sh.log {
+                        lines.push(format!("{t:7.1} s  {msg}"));
+                    }
+                }
+                let script = self.script.as_mut().unwrap();
+                let _ = std::fs::create_dir_all(&script.dir);
+                let _ = std::fs::write(script.dir.join("zone.txt"), lines.join("\n") + "\n");
+                shot(self, "zone-2-finita.png");
+            }
+            4 => {
+                point(self, self.chart_rects[0], 0.17, 0.4);
+                wait(self, 500);
+            }
+            5 => shot(self, "zone-3-fumetto-velocita-inizio.png"),
+            6 => {
+                point(self, self.chart_rects[1], 0.84, 0.45);
+                wait(self, 500);
+            }
+            7 => shot(self, "zone-4-fumetto-latenza-fine.png"),
+            8 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                wait(self, 300);
+            }
+            9 => {
+                point(self, self.chart_rects[7], 0.5, 0.5);
+                wait(self, 1200);
+            }
+            10 => shot(self, "zone-5-riquadro-fine.png"),
+            11 => {
+                self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            _ => {}
         }
     }
 
@@ -1791,6 +1923,8 @@ impl App {
             rand_secs: self.settings.rand_secs as f64,
             file_scan: whole && self.opt.file_scan,
             file_scan_limit: (self.settings.scan_limit_gb as u64) << 30,
+            zones: whole && self.opt.zones && self.can_surface,
+            zone_secs: self.settings.zone_secs.max(1) as f64,
             surface: (!whole || self.opt.surface) && self.can_surface,
             surface_from,
             surface_to,
@@ -2886,6 +3020,40 @@ impl App {
                             }
                             self.surface_range.insert(vol_key.clone(), (from, to));
                         });
+                        // Lettura grezza in sequenza in tre punti del disco, per il tempo scelto.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_enabled_ui(self.can_surface, |ui| {
+                                ui.checkbox(&mut self.opt.zones, "Lettura sequenziale a inizio, metà e fine del disco")
+                                    .on_hover_text(
+                                        "Legge il disco direttamente, in sequenza, a blocchi da 1 MB e una richiesta \
+                                         alla volta: per i secondi scelti all'inizio, poi attorno alla metà, poi fino \
+                                         all'ultimo blocco. Si legge il disco fisico intero, non solo il volume (se il \
+                                         volume sta su più dischi, il volume). Sui dischi meccanici l'inizio, sulle \
+                                         tracce esterne, è di solito molto più veloce della fine. Sugli SSD le zone mai \
+                                         scritte o liberate con TRIM si leggono senza toccare la memoria flash e \
+                                         risultano più veloci di quelle con dati. Non scrive nulla.",
+                                    )
+                                    .on_disabled_hover_text(
+                                        "La lettura diretta del disco richiede l'avvio come amministratore",
+                                    );
+                            });
+                            ui.add_enabled_ui(self.can_surface && self.opt.zones, |ui| {
+                                egui::ComboBox::from_id_salt("durata-zone")
+                                    .width(60.0)
+                                    .selected_text(format!("{} s", self.settings.zone_secs))
+                                    .show_ui(ui, |ui| {
+                                        for s in tester::ZONE_SECS_CHOICES {
+                                            ui.selectable_value(&mut self.settings.zone_secs, s, format!("{s} s"));
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Quanto dura la lettura in ciascuno dei tre punti del disco.");
+                                ui.label(dim(format!(
+                                    "per punto, {} in tutto",
+                                    fmt_duration(3.0 * self.settings.zone_secs as f64)
+                                )));
+                            });
+                        });
                     });
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2900,7 +3068,8 @@ impl App {
                             }
                         }
                     } else {
-                        let any = self.opt.file_tests || self.opt.file_scan || (self.opt.surface && self.can_surface);
+                        let raw = (self.opt.surface || self.opt.zones) && self.can_surface;
+                        let any = self.opt.file_tests || self.opt.file_scan || raw;
                         let b = egui::Button::new(RichText::new("Avvia test").size(15.0).color(Color32::WHITE))
                             .fill(ACCENT)
                             .min_size(vec2(132.0, 40.0))
@@ -2923,6 +3092,7 @@ impl App {
                     "Lettura e scrittura con coda da 1 a 32 (richieste in volo insieme), a blocchi da 1M e 256K in sequenza e a caso e da 4K a caso, come nei programmi di benchmark: è con più richieste insieme che NVMe e RAID mostrano quello che fanno davvero.",
                     "Lettura e scrittura casuale a blocchi da 4 KiB: operazioni al secondo e latenza (media, percentili, massimo).",
                     "Flush su disco: l'operazione che fallisce per prima quando un disco o un bridge USB smette di rispondere.",
+                    "Lettura sequenziale all'inizio, a metà e alla fine del disco, per i secondi scelti, con velocità e latenza nel tempo: sui dischi meccanici mostra quanto rallenta il disco verso le tracce interne (da amministratore).",
                     "Lettura dei file già presenti, per trovare settori illeggibili senza modificare nulla.",
                     "Errori di I/O classificati (supporto, hardware, collegamento, timeout, file system, dati corrotti) ed eventi del registro di sistema comparsi durante la prova.",
                 ] {
@@ -3075,6 +3245,30 @@ impl App {
                 _ => ("—".to_string(), "", String::new()),
             };
             tiles.push(TileData::new("Flush", value, unit, sub, phase_color(Phase::Flush)));
+            // Lettura in sequenza all'inizio, a metà e alla fine del disco, se richiesta.
+            if sh.zone_secs > 0.0 {
+                let start = r(Phase::Zone(Zone::Start)).filter(|res| res.mbps > 0.0).map(|res| res.mbps);
+                for zone in Zone::ALL {
+                    let p = Phase::Zone(zone);
+                    let (value, sub) = match (r(p), last_speed(p)) {
+                        (Some(res), _) if res.mbps > 0.0 => {
+                            let mut sub = format!("media {}", fmt_ms(res.lat_avg_ms));
+                            if let (Some(base), true) = (start, zone != Zone::Start) {
+                                let diff = (res.mbps / base - 1.0) * 100.0;
+                                let sign = if diff.round() < 0.0 { "−" } else { "+" };
+                                sub.push_str(&format!(" · {sign}{} %", num(diff.abs(), 0)));
+                            }
+                            (num(res.mbps, 0), sub)
+                        }
+                        (Some(_), _) => ("—".into(), "saltata".into()),
+                        (None, Some(v)) if live(p) => (num(v, 0), "in corso…".into()),
+                        _ => ("—".into(), String::new()),
+                    };
+                    let mut t = TileData::new(p.short(), value, "MB/s", sub, phase_color(p));
+                    t.zone = Some(p);
+                    tiles.push(t);
+                }
+            }
             let faults = sh.fault_count;
             tiles.push(TileData::new(
                 "Errori",
@@ -3084,9 +3278,20 @@ impl App {
                 if faults > 0 { BAD } else { GOOD },
             ));
         }
-        // Sotto questa larghezza i titoli dei sette riquadri non stanno su una riga.
-        let per_row = if ui.available_width() < 820.0 { 4 } else { tiles.len() };
-        let mut peak_rect = egui::Rect::NOTHING;
+        // Prova dei tre punti del disco senza le prove su file: i loro riquadri resterebbero vuoti.
+        if sh.zone_secs > 0.0 && !sh.file_tests {
+            tiles.retain(|t| t.zone.is_some() || t.title == "Errori");
+        }
+        // Sotto questa larghezza i titoli dei sette riquadri non stanno su una riga; con i tre punti del
+        // disco i riquadri sono dieci e vanno su due righe.
+        let per_row = if ui.available_width() < 820.0 {
+            4
+        } else if tiles.len() > 7 {
+            tiles.len().div_ceil(2)
+        } else {
+            tiles.len()
+        };
+        let (mut peak_rect, mut zone_rect) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
         for (row, chunk) in tiles.chunks(per_row).enumerate() {
             if row > 0 {
                 ui.add_space(2.0);
@@ -3094,6 +3299,13 @@ impl App {
             ui.columns(per_row, |cols| {
                 for (t, col) in chunk.iter().zip(cols.iter_mut()) {
                     let resp = tile(col, t.title, &t.value, t.unit, &t.sub, t.color);
+                    if let Some(p) = t.zone {
+                        if p == Phase::Zone(Zone::End) {
+                            zone_rect = resp.rect;
+                        }
+                        resp.on_hover_ui(|ui| zone_tip(ui, &sh, p));
+                        continue;
+                    }
                     let Some(note) = &t.peak_note else { continue };
                     peak_rect = resp.rect;
                     resp.on_hover_ui(|ui| {
@@ -3289,6 +3501,7 @@ impl App {
         self.chart_rects[..4].copy_from_slice(&rects);
         self.chart_rects[5] = peak_rect;
         self.chart_rects[6] = queue_rect;
+        self.chart_rects[7] = zone_rect;
         if toggle_speed {
             self.opt.log_speed = !self.opt.log_speed;
         }
@@ -4221,6 +4434,10 @@ impl App {
             self.drive_swap_script(ctx);
             return;
         }
+        if script.zones {
+            self.drive_zone_script(ctx);
+            return;
+        }
         let shot = |script: &mut Script, name: &str| {
             let path = script.dir.join(name);
             let busy = script.busy.clone();
@@ -4725,6 +4942,8 @@ struct TileData {
     color: Color32,
     /// Solo per «Lettura max»: i passi della prova, per il fumetto.
     peak_note: Option<String>,
+    /// Solo per i punti del disco: la fase, per il fumetto con posizione e latenze.
+    zone: Option<Phase>,
 }
 
 impl TileData {
@@ -4736,6 +4955,7 @@ impl TileData {
             sub,
             color,
             peak_note: None,
+            zone: None,
         }
     }
 }
@@ -4935,6 +5155,44 @@ fn draw_series<'a>(p: &mut egui_plot::PlotUi<'a>, name: &str, pts: Vec<[f64; 2]>
     }
 }
 
+/// Fumetto di un riquadro della prova «inizio, metà e fine del disco»: risultato, posizione e latenze.
+fn zone_tip(ui: &mut Ui, sh: &tester::Shared, p: Phase) {
+    ui.set_max_width(380.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("●").color(phase_color(p)).size(11.0));
+        ui.label(bold(p.label(), 14.0).color(TEXT));
+    });
+    match sh.result(p) {
+        Some(res) if res.mbps > 0.0 => {
+            tip_value(ui, format!("{} MB/s", num(res.mbps, 0)));
+            ui.label(
+                RichText::new(format!(
+                    "{} letti · latenza media {}, p99 {}, massima {}",
+                    human_bytes(res.bytes),
+                    fmt_ms(res.lat_avg_ms),
+                    fmt_ms(res.lat_p99_ms),
+                    fmt_ms(res.lat_max_ms)
+                ))
+                .color(TEXT)
+                .size(13.0),
+            );
+            if res.errors > 0 {
+                ui.label(RichText::new(format!("{} errori di lettura", res.errors)).color(BAD).size(13.0));
+            }
+            tip_note(ui, &res.note);
+        }
+        Some(res) => tip_note(ui, &res.note),
+        None => {
+            if let Some(span) = sh.zone_spans.iter().find(|z| Phase::Zone(z.zone) == p) {
+                tip_note(ui, &format!("In corso: posizione {} del {}", span.position(), span.target));
+            } else {
+                tip_note(ui, &format!("Da fare: {} s di lettura", num(sh.zone_secs, 0)));
+            }
+        }
+    }
+    tip_note(ui, phase_meaning(p));
+}
+
 /// Che cosa fa una prova, in una riga: compare nei fumetti dei grafici.
 fn phase_meaning(p: Phase) -> &'static str {
     match p {
@@ -4979,6 +5237,19 @@ fn phase_meaning(p: Phase) -> &'static str {
              controlla che contengano i dati attesi."
         }
         Phase::FileScan => "La prova legge i file già presenti sul volume, senza modificarli.",
+        Phase::Zone(Zone::Start) => {
+            "La prova legge il disco in sequenza dall'inizio, a blocchi da 1 MB e una richiesta alla volta, per il \
+             tempo scelto nelle opzioni. Sui dischi meccanici l'inizio corrisponde alle tracce esterne, le più veloci."
+        }
+        Phase::Zone(Zone::Middle) => {
+            "La prova legge il disco in sequenza attorno alla metà, a blocchi da 1 MB e una richiesta alla volta, per \
+             il tempo scelto nelle opzioni."
+        }
+        Phase::Zone(Zone::End) => {
+            "La prova legge il disco in sequenza fino all'ultimo blocco, a blocchi da 1 MB e una richiesta alla volta, \
+             per il tempo scelto nelle opzioni. Sui dischi meccanici la fine corrisponde alle tracce interne, le più \
+             lente."
+        }
         Phase::Surface => "La prova legge l'intero volume da un capo all'altro, anche dove non ci sono file.",
     }
 }
@@ -5709,6 +5980,12 @@ fn queue_mark_text(m: &tester::QueueMark) -> String {
 
 /// Nel fumetto: la coda della misura in corso in quell'istante, per le prove con coda.
 fn tip_queue(ui: &mut Ui, sh: &tester::Shared, phase: Phase, secs: f64) {
+    // Lettura in un punto del disco: dove si sta leggendo.
+    if let Phase::Zone(z) = phase {
+        if let Some(span) = sh.zone_spans.iter().find(|s| s.zone == z) {
+            ui.label(dim(format!("posizione {} del {}", span.position(), span.target)));
+        }
+    }
     if let Some(m) = sh.queue_mark_at(phase, secs) {
         ui.label(RichText::new(queue_mark_text(m)).color(TEXT).size(13.5));
         ui.label(dim(format!(

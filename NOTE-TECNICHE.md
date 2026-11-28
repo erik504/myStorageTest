@@ -110,7 +110,8 @@ Le regole di lavoro sono in [CLAUDE.md](CLAUDE.md).
 6. Flush, seguito dalla verifica.
 7. Scritture con coda.
 8. Lettura dei file esistenti.
-9. Superficie.
+9. Lettura a inizio, metà e fine del disco.
+10. Superficie.
 
 Note sull'ordine:
 - La verifica, cioè la rilettura dei blocchi scritti, è una fase a sé, «Verifica». Spiega l'intervallo
@@ -161,6 +162,29 @@ Note sull'ordine:
   - con «Riscandisci» rilegge solo il tratto scelto e non sposta quel punto.
 - Istogramma della latenza: 24 classi per decade (192 in tutto); la vista lineare usa 80 classi e
   taglia allo 0,5 % più lento.
+
+### Lettura a inizio, metà e fine del disco
+- Tre fasi, `Phase::Zone(Zone::Start|Middle|End)`, ognuna con il suo `Sampler`: entrano da sole nei
+  grafici nel tempo, nell'istogramma e nella riga di comando. Lo stato condiviso ha `zone_secs` (0 = non
+  richiesta), `zone_spans` (tratto letto da ogni punto, aggiornato ogni 100 ms) e `file_tests`, che
+  serve a nascondere i riquadri vuoti delle prove su file.
+- Si apre `\\.\PhysicalDriveN` quando il volume sta su un disco solo (sui dischi meccanici conta la
+  posizione sul disco, non nel volume); altrimenti, o se l'apertura fallisce, il volume `\\.\X:`. Le
+  due strade richiedono l'amministratore. La lunghezza viene da `IOCTL_DISK_GET_LENGTH_INFO`.
+- Ogni punto resta nel suo terzo del disco. L'ampiezza del tratto si prevede dalla velocità **sul tempo
+  trascorso** del punto prima (byte letti diviso secondi di orologio), non da quella delle singole
+  letture: la prima versione usava questa, sovrastimava (sul file sostitutivo le letture durano 0,1 ms
+  e la pausa da 10 ms non conta) e leggeva la «metà» al 33–47 % e la «fine» al 67–80 %.
+  - Metà: centrata sul 50 % con l'ampiezza prevista dalla velocità dell'inizio.
+  - Fine: parte da `fine − ampiezza prevista`, con la velocità della metà moltiplicata per il calo visto
+    fra inizio e metà (fra 0,5 e 1): sui dischi meccanici la fine è più lenta della metà. Senza margine:
+    con il 5 % in più la fine si fermava al 99,3 %. Se arriva all'ultimo blocco prima del tempo, legge il
+    tratto subito prima di quello già letto (un solo salto indietro) invece di rileggerlo.
+  - Se un terzo intero finisce prima del tempo (disco piccolo o velocissimo) si rilegge da capo e la nota
+    del risultato lo dice: la cache del disco può gonfiare la velocità.
+- Con `MYSTORAGETEST_SURFACE_FILE` si legge il file: è creato con `SetLength`, quindi oltre la valid
+  data length Windows restituisce zeri senza toccare il disco (velocità di 10–20 GB/s, che non contano).
+  Una pausa di 10 ms per lettura tiene i tratti piccoli.
 - `Drop for TestRun` aspetta il thread al massimo 3 s.
 
 ## Elenco dei dischi (`disks.rs`)

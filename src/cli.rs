@@ -41,6 +41,8 @@ Opzioni di --test:
   --size MB      dimensione del file di prova (predefinito 256)
   --secs N       durata delle prove casuali (predefinito 5)
   --scan MB      legge anche i file esistenti fino a MB (0 = tutti)
+  --zones        lettura in sequenza all'inizio, a metà e alla fine del disco (solo da amministratore)
+  --zone-secs N  secondi di lettura in ciascuno dei tre punti (predefinito 10)
   --surface      scansione della superficie (solo da amministratore)
   --from P       inizio della scansione della superficie, in percentuale (predefinito 0)
   --to P         fine della scansione della superficie, in percentuale (predefinito 100)
@@ -452,6 +454,14 @@ fn test(args: &[String]) -> i32 {
         rand_secs: opt("--secs").unwrap_or(5) as f64,
         file_scan: scan.is_some(),
         file_scan_limit: scan.unwrap_or(0) << 20,
+        zones: flag("--zones"),
+        zone_secs: args
+            .iter()
+            .position(|a| a == "--zone-secs")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.replace(',', ".").parse::<f64>().ok())
+            .unwrap_or(10.0)
+            .clamp(1.0, 600.0),
         surface: flag("--surface"),
         surface_from: percent("--from", 0.0) / 100.0,
         surface_to: percent("--to", 100.0) / 100.0,
