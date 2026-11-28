@@ -1130,6 +1130,8 @@ struct Script {
     swap: bool,
     /// Sequenza dedicata alla lettura a inizio, metà e fine del disco (`MYSTORAGETEST_AUTOTEST=zone`).
     zones: bool,
+    /// Prove dei tre punti già finite in quella sequenza.
+    zone_runs: usize,
     /// Quando è stato sostituito.
     swapped_at: Option<Instant>,
     /// Quello che la sequenza della superficie osserva, scritto in `superficie.txt`.
@@ -1298,6 +1300,7 @@ impl App {
             surface: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("superficie"),
             swap: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("sostituzione"),
             zones: std::env::var("MYSTORAGETEST_AUTOTEST").as_deref() == Ok("zone"),
+            zone_runs: 0,
             swapped_at: None,
             report: Vec::new(),
         });
@@ -1444,7 +1447,9 @@ impl App {
     /// Verifica automatica della lettura a inizio, metà e fine del disco (`MYSTORAGETEST_AUTOTEST=zone`;
     /// senza amministratore con `MYSTORAGETEST_SURFACE_FILE`, un file letto al posto del disco). Fa solo
     /// quella prova, con `MYSTORAGETEST_ZONE_SECS` secondi per punto (predefinito 3), poi schermate con
-    /// i fumetti dei grafici e del riquadro della fine; i risultati vanno in `zone.txt`.
+    /// i fumetti dei grafici e del riquadro della fine; i risultati vanno in `zone.txt`. Con più valori
+    /// separati da virgole («2,4,3») fa una prova per valore, una dopo l'altra: le schermate sono
+    /// dell'ultima, con le precedenti in trasparenza.
     fn drive_zone_script(&mut self, ctx: &egui::Context) {
         let Some(Sel::Volume(letter)) = self.selected else { return };
         let step = {
@@ -1452,6 +1457,14 @@ impl App {
             script.step += 1;
             script.step - 1
         };
+        let secs_list: Vec<u32> = std::env::var("MYSTORAGETEST_ZONE_SECS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let secs_list = if secs_list.is_empty() { vec![3] } else { secs_list };
+        let done = self.script.as_ref().unwrap().zone_runs;
+        let last_run = done + 1 >= secs_list.len();
         let wait = |app: &mut App, ms: u64| {
             app.script.as_mut().unwrap().next_at = Instant::now() + Duration::from_millis(ms);
         };
@@ -1467,18 +1480,22 @@ impl App {
                 self.opt.file_scan = false;
                 self.opt.surface = false;
                 self.opt.zones = true;
-                self.settings.zone_secs = std::env::var("MYSTORAGETEST_ZONE_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(3);
+                self.settings.zone_secs = secs_list[done.min(secs_list.len() - 1)];
                 self.start_test();
                 wait(self, 1500);
             }
-            1 => shot(self, "zone-1-in-corso.png"),
+            // Durante l'ultima prova: le precedenti sono già nei grafici, anche nei punti non ancora letti.
+            1 if last_run => shot(self, "zone-1-in-corso.png"),
+            1 => {}
             2 => {
                 if self.testing() {
                     self.script.as_mut().unwrap().step = 2;
                     wait(self, 250);
+                } else if !last_run {
+                    let script = self.script.as_mut().unwrap();
+                    script.zone_runs += 1;
+                    script.step = 0;
+                    wait(self, 400);
                 } else {
                     wait(self, 600);
                 }
@@ -1487,6 +1504,38 @@ impl App {
                 let mut lines = Vec::new();
                 if let Some(run) = self.runs.get(&letter) {
                     let sh = run.shared.lock().unwrap();
+                    lines.push(format!("prove fatte: {}, secondi per punto {:?}", secs_list.len(), secs_list));
+                    for (age, before) in sh.zone_before.iter().enumerate() {
+                        lines.push(format!(
+                            "prova precedente {age}: delle {}, {} s per punto, punti {}",
+                            before.when,
+                            before.secs,
+                            before.zones.len()
+                        ));
+                        for t in &before.zones {
+                            lines.push(format!(
+                                "  {}: {:.1} MB/s, {} punti di velocità da {:.2} a {:.2} s, {} di latenza, {}",
+                                t.span.zone.name(),
+                                t.mbps,
+                                t.speed.len(),
+                                t.speed.first().map_or(0.0, |q| q[0]),
+                                t.speed.last().map_or(0.0, |q| q[0]),
+                                t.lat_avg.len(),
+                                t.span.position()
+                            ));
+                        }
+                    }
+                    for g in zone_ghosts(&sh, true) {
+                        lines.push(format!(
+                            "in trasparenza: {} della prova delle {}, da {:.2} s",
+                            g.trace.span.zone.name(),
+                            g.run.when,
+                            g.at
+                        ));
+                    }
+                    for z in &sh.zone_spans {
+                        lines.push(format!("inizio del punto {}: {:.2} s", z.zone.name(), z.started));
+                    }
                     for r in sh.results.iter().filter(|r| matches!(r.phase, Phase::Zone(_))) {
                         lines.push(format!(
                             "{}: {:.1} MB/s, {} letture, {} letti, latenza media {:.3} ms, p99 {:.3} ms, max {:.2} ms, \
@@ -1555,7 +1604,14 @@ impl App {
             }
             10 => shot(self, "zone-5-riquadro-fine.png"),
             11 => {
+                // Confronto spento: restano solo i punti della prova.
                 self.fake_pointer_gone = self.fake_pointer.take().is_some();
+                self.settings.zone_compare = false;
+                wait(self, 500);
+            }
+            12 => shot(self, "zone-6-senza-confronto.png"),
+            13 => {
+                self.settings.zone_compare = true;
                 self.allow_close = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
@@ -1955,12 +2011,29 @@ impl App {
             let bad: Vec<u64> = sh.surface_bad.iter().filter(|b| outside(**b as f64)).copied().collect();
             Some((sh.surface_len, tracts, bad))
         });
+        // Le ultime prove dei tre punti sul volume restano nei grafici di quella nuova, per il
+        // confronto: si tengono anche se la nuova non li legge, per quella dopo.
+        let zone_before: Vec<tester::ZoneRun> = self
+            .runs
+            .get(&vol.letter)
+            .map(|run| {
+                let sh = run.shared.lock().unwrap();
+                sh.zone_run(&run.started)
+                    .into_iter()
+                    .chain(sh.zone_before.iter().cloned())
+                    .take(tester::ZONE_KEEP)
+                    .collect()
+            })
+            .unwrap_or_default();
         let run = TestRun::start(config);
-        if let Some((length, tracts, bad)) = earlier {
+        {
             let mut sh = run.shared.lock().unwrap();
-            sh.surface_len = length;
-            sh.surface_before = tracts;
-            sh.surface_bad = bad;
+            if let Some((length, tracts, bad)) = earlier {
+                sh.surface_len = length;
+                sh.surface_before = tracts;
+                sh.surface_bad = bad;
+            }
+            sh.zone_before = zone_before;
         }
         self.runs.insert(vol.letter, run);
     }
@@ -3020,39 +3093,61 @@ impl App {
                             }
                             self.surface_range.insert(vol_key.clone(), (from, to));
                         });
-                        // Lettura grezza in sequenza in tre punti del disco, per il tempo scelto.
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add_enabled_ui(self.can_surface, |ui| {
-                                ui.checkbox(&mut self.opt.zones, "Lettura sequenziale a inizio, metà e fine del disco")
-                                    .on_hover_text(
-                                        "Legge il disco direttamente, in sequenza, a blocchi da 1 MB e una richiesta \
-                                         alla volta: per i secondi scelti all'inizio, poi attorno alla metà, poi fino \
-                                         all'ultimo blocco. Si legge il disco fisico intero, non solo il volume (se il \
-                                         volume sta su più dischi, il volume). Sui dischi meccanici l'inizio, sulle \
-                                         tracce esterne, è di solito molto più veloce della fine. Sugli SSD le zone mai \
-                                         scritte o liberate con TRIM si leggono senza toccare la memoria flash e \
-                                         risultano più veloci di quelle con dati. Non scrive nulla.",
-                                    )
-                                    .on_disabled_hover_text(
-                                        "La lettura diretta del disco richiede l'avvio come amministratore",
-                                    );
-                            });
-                            ui.add_enabled_ui(self.can_surface && self.opt.zones, |ui| {
-                                egui::ComboBox::from_id_salt("durata-zone")
-                                    .width(60.0)
-                                    .selected_text(format!("{} s", self.settings.zone_secs))
-                                    .show_ui(ui, |ui| {
-                                        for s in tester::ZONE_SECS_CHOICES {
-                                            ui.selectable_value(&mut self.settings.zone_secs, s, format!("{s} s"));
-                                        }
-                                    })
-                                    .response
-                                    .on_hover_text("Quanto dura la lettura in ciascuno dei tre punti del disco.");
-                                ui.label(dim(format!(
-                                    "per punto, {} in tutto",
-                                    fmt_duration(3.0 * self.settings.zone_secs as f64)
-                                )));
-                            });
+                    });
+                    // Lettura grezza in sequenza in tre punti del disco, per il tempo scelto. Il confronto
+                    // con le prove precedenti riguarda solo i grafici: si può cambiare anche durante la prova.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_enabled_ui(!testing && self.can_surface, |ui| {
+                            ui.checkbox(&mut self.opt.zones, "Lettura sequenziale a inizio, metà e fine del disco")
+                                .on_hover_text(
+                                    "Legge il disco direttamente, in sequenza, a blocchi da 1 MB e una richiesta \
+                                     alla volta: per i secondi scelti all'inizio, poi attorno alla metà, poi fino \
+                                     all'ultimo blocco. Si legge il disco fisico intero, non solo il volume (se il \
+                                     volume sta su più dischi, il volume). Sui dischi meccanici l'inizio, sulle \
+                                     tracce esterne, è di solito molto più veloce della fine. Sugli SSD le zone mai \
+                                     scritte o liberate con TRIM si leggono senza toccare la memoria flash e \
+                                     risultano più veloci di quelle con dati. Non scrive nulla.",
+                                )
+                                .on_disabled_hover_text(if self.can_surface {
+                                    "Attendi la fine della prova in corso"
+                                } else {
+                                    "La lettura diretta del disco richiede l'avvio come amministratore"
+                                });
+                        });
+                        ui.add_enabled_ui(!testing && self.can_surface && self.opt.zones, |ui| {
+                            egui::ComboBox::from_id_salt("durata-zone")
+                                .width(60.0)
+                                .selected_text(format!("{} s", self.settings.zone_secs))
+                                .show_ui(ui, |ui| {
+                                    for s in tester::ZONE_SECS_CHOICES {
+                                        ui.selectable_value(&mut self.settings.zone_secs, s, format!("{s} s"));
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Quanto dura la lettura in ciascuno dei tre punti del disco.");
+                            ui.label(dim(format!(
+                                "per punto, {} in tutto",
+                                fmt_duration(3.0 * self.settings.zone_secs as f64)
+                            )));
+                        });
+                        ui.add_enabled_ui(self.can_surface, |ui| {
+                            // Senza posto va intera alla riga sotto, invece di spezzare il testo.
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            ui.checkbox(
+                                &mut self.settings.zone_compare,
+                                format!("Mostra le {} prove precedenti", tester::ZONE_KEEP),
+                            )
+                            .on_hover_text(format!(
+                                "Nei grafici di velocità e latenza restano, tratteggiate e più chiare, le ultime {} letture a \
+                                 inizio, metà e fine fatte su questo volume: ognuna è allineata all'inizio dello \
+                                 stesso punto della prova nuova, per confrontarle direttamente, e i fumetti ne danno \
+                                 i valori. Le prove si tengono solo in memoria, fino alla chiusura del programma. Si \
+                                 può cambiare anche durante la prova.",
+                                tester::ZONE_KEEP
+                            ))
+                            .on_disabled_hover_text(
+                                "La lettura diretta del disco richiede l'avvio come amministratore",
+                            );
                         });
                     });
                 });
@@ -3292,6 +3387,7 @@ impl App {
             tiles.len()
         };
         let (mut peak_rect, mut zone_rect) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
+        let compare = self.settings.zone_compare;
         for (row, chunk) in tiles.chunks(per_row).enumerate() {
             if row > 0 {
                 ui.add_space(2.0);
@@ -3303,7 +3399,7 @@ impl App {
                         if p == Phase::Zone(Zone::End) {
                             zone_rect = resp.rect;
                         }
-                        resp.on_hover_ui(|ui| zone_tip(ui, &sh, p));
+                        resp.on_hover_ui(|ui| zone_tip(ui, &sh, p, compare));
                         continue;
                     }
                     let Some(note) = &t.peak_note else { continue };
@@ -3386,6 +3482,9 @@ impl App {
                 ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
             }
         };
+        // Prove precedenti dei tre punti, in trasparenza sui grafici nel tempo.
+        let ghosts = zone_ghosts(&sh, self.settings.zone_compare);
+        let ghosts_note = ghosts_note(&sh, &ghosts);
         // Le prove che stanno sui grafici nel tempo: tutte tranne la scansione della superficie.
         let timed = |has_data: fn(&tester::PhaseSeries) -> bool| {
             sh.series
@@ -3418,18 +3517,22 @@ impl App {
                             time_zoom_hint(ui);
                         },
                         |ui| {
-                            legend_row(ui, timed(|s| !s.speed.is_empty()), "");
-                            rects[0] = speed_chart(ui, &sh, log_speed, latency_rect_before);
+                            legend_row(ui, timed(|s| !s.speed.is_empty()), &ghosts_note);
+                            rects[0] = speed_chart(ui, &sh, log_speed, latency_rect_before, &ghosts);
                         },
                     );
                     chart_frame(
                         ui,
-                        "Latenza (linea tenue = massimo · colori come sopra)",
+                        if ghosts.is_empty() {
+                            "Latenza (linea tenue = massimo · colori come sopra)"
+                        } else {
+                            "Latenza (linea tenue = massimo · tratteggiate = prove precedenti · colori come sopra)"
+                        },
                         chart_h,
                         |ui| toggle_latency = log_toggle(ui, log_latency),
                         // Le prove sono le stesse del grafico della velocità, con gli stessi colori:
                         // la legenda sta solo lì e qui l'altezza va tutta al grafico.
-                        |ui| rects[1] = latency_chart(ui, &sh, log_latency, speed_rect),
+                        |ui| rects[1] = latency_chart(ui, &sh, log_latency, speed_rect, &ghosts),
                     );
                     chart_frame(
                         ui,
@@ -5155,8 +5258,9 @@ fn draw_series<'a>(p: &mut egui_plot::PlotUi<'a>, name: &str, pts: Vec<[f64; 2]>
     }
 }
 
-/// Fumetto di un riquadro della prova «inizio, metà e fine del disco»: risultato, posizione e latenze.
-fn zone_tip(ui: &mut Ui, sh: &tester::Shared, p: Phase) {
+/// Fumetto di un riquadro della prova «inizio, metà e fine del disco»: risultato, posizione e latenze;
+/// con `compare`, anche le velocità delle prove precedenti nello stesso punto.
+fn zone_tip(ui: &mut Ui, sh: &tester::Shared, p: Phase, compare: bool) {
     ui.set_max_width(380.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("●").color(phase_color(p)).size(11.0));
@@ -5188,6 +5292,35 @@ fn zone_tip(ui: &mut Ui, sh: &tester::Shared, p: Phase) {
             } else {
                 tip_note(ui, &format!("Da fare: {} s di lettura", num(sh.zone_secs, 0)));
             }
+        }
+    }
+    let Phase::Zone(zone) = p else { return };
+    let before: Vec<(usize, &tester::ZoneRun, &tester::ZoneTrace)> = sh
+        .zone_before
+        .iter()
+        .enumerate()
+        .filter(|_| compare)
+        .filter_map(|(age, run)| Some((age, run, run.trace(zone).filter(|t| t.mbps > 0.0)?)))
+        .collect();
+    if !before.is_empty() {
+        ui.add_space(3.0);
+        ui.label(dim("Prove precedenti in questo punto:"));
+        for (age, run, trace) in before {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ghost_mark(ui, p, age);
+                ui.label(
+                    RichText::new(format!(
+                        "{}   {} MB/s · {} s per punto · {}",
+                        run.when,
+                        num(trace.mbps, 0),
+                        num(run.secs, 0),
+                        trace.span.position()
+                    ))
+                    .color(TEXT)
+                    .size(13.0),
+                );
+            });
         }
     }
     tip_note(ui, phase_meaning(p));
@@ -5526,6 +5659,133 @@ fn selftest_section(
 /// un grafico suo lungo il disco.
 fn timed_series(sh: &tester::Shared) -> impl Iterator<Item = &(Phase, tester::PhaseSeries)> {
     sh.series.iter().filter(|(p, _)| *p != Phase::Surface)
+}
+
+/// Colore di un punto di una prova precedente (`age` 0 = la più recente): quello del punto, in
+/// trasparenza, più tenue per la prova più vecchia.
+fn ghost_color(phase: Phase, age: usize) -> Color32 {
+    phase_color(phase).gamma_multiply(if age == 0 { 0.5 } else { 0.28 })
+}
+
+/// Un punto di una prova precedente dei tre punti, disegnato in trasparenza sui grafici nel tempo.
+struct Ghost<'a> {
+    /// 0 = la prova più recente.
+    age: usize,
+    run: &'a tester::ZoneRun,
+    trace: &'a tester::ZoneTrace,
+    /// Da sommare ai secondi della traccia: dove comincia lo stesso punto in questa prova.
+    at: f64,
+}
+
+impl Ghost<'_> {
+    fn phase(&self) -> Phase {
+        Phase::Zone(self.trace.span.zone)
+    }
+
+    fn color(&self) -> Color32 {
+        ghost_color(self.phase(), self.age)
+    }
+
+    /// Il valore della traccia all'istante `secs` di questa prova: il campione più vicino, se non è
+    /// lontano più di mezzo secondo (fuori dalla traccia non c'è niente da confrontare).
+    fn value_at(&self, pts: &[[f64; 2]], secs: f64) -> Option<f64> {
+        let t = secs - self.at;
+        let i = pts.partition_point(|q| q[0] < t);
+        let q = [i.wrapping_sub(1), i]
+            .into_iter()
+            .filter_map(|j| pts.get(j))
+            .min_by(|a, b| (a[0] - t).abs().total_cmp(&(b[0] - t).abs()))?;
+        ((q[0] - t).abs() <= 0.5).then_some(q[1])
+    }
+}
+
+/// Le prove precedenti dei tre punti allineate a questa: ogni punto comincia dove comincia lo stesso
+/// punto della prova, o, finché la prova va avanti, dove si prevede che cominci (finito il tempo
+/// scelto per il punto prima). Vuoto se il confronto è spento o la prova non legge i tre punti.
+fn zone_ghosts(sh: &tester::Shared, show: bool) -> Vec<Ghost<'_>> {
+    let mut out = Vec::new();
+    if !show || sh.zone_before.is_empty() {
+        return out;
+    }
+    let mut next: Option<f64> = None;
+    for zone in Zone::ALL {
+        let started = sh.zone_spans.iter().find(|s| s.zone == zone).map(|s| s.started);
+        let Some(at) = started.or(next.filter(|_| sh.running)) else { break };
+        next = Some(at + sh.zone_secs);
+        for (age, run) in sh.zone_before.iter().enumerate() {
+            if let Some(trace) = run.trace(zone) {
+                out.push(Ghost { age, run, trace, at });
+            }
+        }
+    }
+    out
+}
+
+/// Disegna un punto di una prova precedente: linea tratteggiata, nel colore del punto in trasparenza,
+/// perché non si confonda con la linea tenue del massimo della latenza.
+fn draw_ghost(p: &mut egui_plot::PlotUi<'_>, g: &Ghost, pts: Vec<[f64; 2]>) {
+    p.line(
+        Line::new(format!("{} · prova delle {}", g.phase().short(), g.run.when), PlotPoints::from(pts))
+            .color(g.color())
+            .width(1.5)
+            .style(LineStyle::Dashed { length: 7.0 }),
+    );
+}
+
+/// Segno di una prova precedente nei fumetti: un breve tratteggio, come nei grafici.
+fn ghost_mark(ui: &mut Ui, phase: Phase, age: usize) {
+    let (r, _) = ui.allocate_exact_size(vec2(18.0, 12.0), Sense::hover());
+    let stroke = Stroke::new(2.0, ghost_color(phase, age));
+    for x in [0.0, 7.0, 14.0] {
+        let a = egui::pos2(r.left() + x, r.center().y);
+        ui.painter().line_segment([a, a + vec2(4.0, 0.0)], stroke);
+    }
+}
+
+/// Le prove precedenti nell'ordine in cui disegnarle: la più vecchia sotto.
+fn ghosts_bottom_up<'g, 'a>(ghosts: &'g [Ghost<'a>]) -> impl Iterator<Item = &'g Ghost<'a>> {
+    (0..tester::ZONE_KEEP).rev().flat_map(move |age| ghosts.iter().filter(move |g| g.age == age))
+}
+
+/// Nota della legenda per le prove precedenti nei grafici: «· tratteggiate: le prove delle 14:31:40 e delle 14:30:12».
+fn ghosts_note(sh: &tester::Shared, ghosts: &[Ghost]) -> String {
+    let whens: Vec<String> = (0..sh.zone_before.len())
+        .filter(|age| ghosts.iter().any(|g| g.age == *age))
+        .map(|age| sh.zone_before[age].when.clone())
+        .collect();
+    match whens.as_slice() {
+        [] => String::new(),
+        [one] => format!("· tratteggiata: la prova delle {one}"),
+        [first, rest @ ..] => format!("· tratteggiate: le prove delle {first} e delle {}", rest.join(" e delle ")),
+    }
+}
+
+/// Nel fumetto di un punto del disco: i valori delle prove precedenti allo stesso istante del punto.
+fn tip_ghosts(
+    ui: &mut Ui,
+    ghosts: &[Ghost],
+    phase: Phase,
+    secs: f64,
+    pts: fn(&tester::ZoneTrace) -> &[[f64; 2]],
+    value: impl Fn(f64) -> String,
+) {
+    let mut head = true;
+    for g in ghosts.iter().filter(|g| g.phase() == phase) {
+        let Some(v) = g.value_at(pts(g.trace), secs) else { continue };
+        if head {
+            head = false;
+            ui.add_space(3.0);
+            ui.label(dim(format!(
+                "Prove precedenti, a {} s dall'inizio del punto:",
+                num((secs - g.at).max(0.0), 1)
+            )));
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ghost_mark(ui, g.phase(), g.age);
+            ui.label(RichText::new(format!("{}   {}", g.run.when, value(v))).color(TEXT).size(13.0));
+        });
+    }
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -6012,7 +6272,7 @@ fn queue_band(p: &mut egui_plot::PlotUi<'_>, sh: &tester::Shared, phase: Phase, 
 
 /// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche e al
 /// collegamento con il grafico della latenza, `other`).
-fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -> egui::Rect {
+fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect, ghosts: &[Ghost]) -> egui::Rect {
     let y_of = move |v: f64| if log { v.max(0.1).log10() } else { v };
     let plot = time_plot("velocita", ui.available_height());
     let plot = if log {
@@ -6023,6 +6283,10 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -
             .y_axis_formatter(|m, _| int(m.value.max(0.0) as u64))
     };
     let out = plot.show(ui, |p| -> Option<(Phase, [f64; 2], bool)> {
+        // Le prove precedenti dei tre punti, sotto quella in corso.
+        for g in ghosts_bottom_up(ghosts) {
+            draw_ghost(p, g, g.trace.speed.iter().map(|q| [g.at + q[0], y_of(q[1])]).collect());
+        }
         for (phase, s) in timed_series(sh) {
             if s.speed.is_empty() {
                 continue;
@@ -6031,12 +6295,17 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -
             draw_series(p, phase.short(), pts, phase_color(*phase), 2.0);
         }
         // Sotto il puntatore (qui o sul grafico della latenza): il campione più vicino, con la linea
-        // verticale sulla sua posizione.
+        // verticale sulla sua posizione, e allo stesso istante quelli delle prove precedenti.
         let (x, own) = linked_hover_x(p, other)?;
         let (phase, i) = nearest_sample(timed_series(sh).map(|(ph, s)| (*ph, s.speed.as_slice())), x)?;
         let q = sh.series.iter().find(|(ph, _)| *ph == phase)?.1.speed[i];
         queue_band(p, sh, phase, q[0]);
-        hover_marks(p, q[0], &[(y_of(q[1]), phase_color(phase))]);
+        let mut marks: Vec<(f64, Color32)> = ghosts_bottom_up(ghosts)
+            .filter(|g| g.phase() == phase)
+            .filter_map(|g| Some((y_of(g.value_at(&g.trace.speed, q[0])?), g.color())))
+            .collect();
+        marks.push((y_of(q[1]), phase_color(phase)));
+        hover_marks(p, q[0], &marks);
         Some((phase, q, own))
     });
     if let Some((phase, q, true)) = out.inner {
@@ -6056,6 +6325,9 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -
                 ui.label(RichText::new(format!("circa {} operazioni al secondo", int(iops))).color(TEXT).size(13.0));
             }
             tip_queue(ui, sh, phase, q[0]);
+            tip_ghosts(ui, ghosts, phase, q[0], |t| &t.speed, |v| {
+                format!("{} MB/s", if v >= 100.0 { int(v.round() as u64) } else { num(v, 1) })
+            });
             tip_note(
                 ui,
                 "Velocità: quanti dati passano ogni secondo in questo momento della prova. Più alta è meglio.",
@@ -6068,7 +6340,7 @@ fn speed_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -
 
 /// Disegna il grafico e restituisce il suo rettangolo (serve alle verifiche automatiche e al
 /// collegamento con il grafico della velocità, `other`).
-fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect) -> egui::Rect {
+fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect, ghosts: &[Ghost]) -> egui::Rect {
     let y_of = move |v: f64| if log { v.max(1e-4).log10() } else { v };
     let map = move |pts: &[[f64; 2]]| -> Vec<[f64; 2]> { pts.iter().map(|p| [p[0], y_of(p[1])]).collect() };
     let plot = time_plot("latenza", ui.available_height());
@@ -6081,6 +6353,10 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect)
     };
     // Istante, latenza media e latenza massima del campione sotto il puntatore.
     let out = plot.show(ui, |p| -> Option<(Phase, f64, f64, Option<f64>, bool)> {
+        // Le prove precedenti dei tre punti, sotto quella in corso: solo la latenza media.
+        for g in ghosts_bottom_up(ghosts) {
+            draw_ghost(p, g, g.trace.lat_avg.iter().map(|q| [g.at + q[0], y_of(q[1])]).collect());
+        }
         for (phase, s) in timed_series(sh) {
             if s.lat_avg.is_empty() {
                 continue;
@@ -6096,10 +6372,14 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect)
         let avg = s.lat_avg[i];
         let max = s.lat_max.get(i).map(|q| q[1]);
         let color = phase_color(phase);
-        let mut marks = vec![(y_of(avg[1]), color)];
+        let mut marks: Vec<(f64, Color32)> = ghosts_bottom_up(ghosts)
+            .filter(|g| g.phase() == phase)
+            .filter_map(|g| Some((y_of(g.value_at(&g.trace.lat_avg, avg[0])?), g.color())))
+            .collect();
         if let Some(max) = max {
-            marks.insert(0, (y_of(max), color.gamma_multiply(0.55)));
+            marks.push((y_of(max), color.gamma_multiply(0.55)));
         }
+        marks.push((y_of(avg[1]), color));
         queue_band(p, sh, phase, avg[0]);
         hover_marks(p, avg[0], &marks);
         Some((phase, avg[0], avg[1], max, own))
@@ -6114,6 +6394,7 @@ fn latency_chart(ui: &mut Ui, sh: &tester::Shared, log: bool, other: egui::Rect)
             };
             ui.label(RichText::new(detail).color(TEXT).size(13.0));
             tip_queue(ui, sh, phase, secs);
+            tip_ghosts(ui, ghosts, phase, secs, |t| &t.lat_avg, |v| format!("{} in media", fmt_ms(v)));
             tip_note(
                 ui,
                 "Latenza: il tempo che il disco impiega a completare una singola operazione. \

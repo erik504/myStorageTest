@@ -1,11 +1,13 @@
 ﻿# Lettura sequenziale a inizio, metà e fine del disco senza amministratore: legge un file da 2 GB al
 # posto del disco (le velocità quindi non contano: si provano tratti, tempi, grafici e fumetti).
-# Fa solo quella prova, con -SecondiPunto secondi per punto, poi schermate dei fumetti di velocità,
-# latenza e del riquadro della fine. Quello che misura lo scrive in zone.txt, accanto alle schermate.
+# Fa solo quella prova, una volta per ogni valore di -SecondiPunto (secondi per punto, separati da
+# virgole), poi schermate dell'ultima con le precedenti in trasparenza: fumetti di velocità, latenza e
+# del riquadro della fine, e la stessa vista con il confronto spento. Con quattro prove la prima esce
+# dal confronto (se ne tengono 2). Quello che misura lo scrive in zone.txt, accanto alle schermate.
 #
 #   .\prove\zone.ps1
 #   .\prove\zone.ps1 -SecondiPunto 10
-param([string]$Exe = '', [string]$Vol = 'C', [int]$SecondiPunto = 3, [string]$Size = '1500,950', [int]$Secondi = 180)
+param([string]$Exe = '', [string]$Vol = 'C', [string]$SecondiPunto = '2,4,3,3', [string]$Size = '1500,950', [int]$Secondi = 240)
 . (Join-Path $PSScriptRoot 'comune.ps1')
 if (-not $Exe) { $Exe = $ExePredefinito }
 $file = Join-Path $Radice 'target\superficie-di-prova.bin'

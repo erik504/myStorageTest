@@ -148,7 +148,13 @@ il grosso delle risposte e lascia fuori lo 0,5 % più lento:
   stesso. Velocità e latenza dei tre punti stanno nei grafici nel tempo con le altre prove, ognuno con il
   suo colore (arancioni, più scuri lontano dall'inizio) e un fumetto che dice anche la posizione letta,
   per esempio «99,95–100 % del disco 2»; tre riquadri danno MB/s, latenza media e differenza rispetto
-  all'inizio, e passandoci sopra latenza p99 e massima. Sui dischi meccanici la fine, sulle tracce
+  all'inizio, e passandoci sopra latenza p99 e massima. Con la casella «Mostra le 2 prove precedenti»
+  (attiva di partenza, ricordata, si può cambiare anche durante la prova) le ultime due
+  letture dei tre punti fatte sullo stesso volume restano nei grafici di velocità e latenza, tratteggiate
+  e più chiare (la più vecchia è la più tenue): ognuna è allineata all'inizio dello stesso punto della prova nuova, e
+  mentre la prova va avanti si vedono già anche nei punti non ancora letti. I fumetti dei grafici danno
+  i loro valori allo stesso istante del punto, quelli dei riquadri velocità, durata e posizione. Le prove
+  precedenti si tengono solo in memoria, fino alla chiusura del programma. Sui dischi meccanici la fine, sulle tracce
   interne, è di solito molto più lenta dell'inizio; sugli SSD le zone mai scritte o liberate con TRIM si
   leggono senza toccare la memoria flash e risultano più veloci. Su un disco tanto piccolo o veloce che
   un terzo del disco finisce prima del tempo, il tratto si rilegge da capo e il risultato lo dice, perché
@@ -406,6 +412,7 @@ Provato su Windows 10 22H2 con dischi NVMe e SATA interni e con dischi USB:
 - storico delle temperature degli SSD interni;
 - scansione della superficie eseguita su un file al posto del volume: arresto a metà, punto ricordato e riproposto anche dopo la chiusura del programma, ripresa fino in fondo, tratto parziale, grafici di velocità e latenza, zoom con rotellina e tasti, scelta di un tratto trascinando (con un puntatore simulato) e sua rilettura con «Riscandisci»;
 - lettura a inizio, metà e fine del disco eseguita su un file da 2 GB al posto del disco, senza privilegi (`prove\zone.ps1` e `--test C: --no-write --zones`): con 3 secondi per punto i tratti letti sono 0–13,5 %, 43,3–56,8 % (centrato sul 50 %) e 86,5–100 % (fino all'ultimo byte), con 28 punti di velocità e di latenza ciascuno; con 1 secondo 0–4,5 %, 47,7–52,3 % e 94,7–100 %. Fumetti dei grafici e dei riquadri con un puntatore simulato, alla dimensione normale e grande della finestra; con la sola prova dei tre punti restano solo i loro riquadri e «Errori». Su un file da 96 MB i tratti finiscono prima del tempo e vengono riletti con l'avvertenza; su uno da 2 MB la prova viene saltata con un avviso (uscita 1). Le velocità misurate sul file non contano: non è mai stato scritto, e Windows restituisce zeri senza leggere il disco;
+- confronto con le prove precedenti dei tre punti, sullo stesso file da 2 GB: quattro prove di fila con 2, 4, 3 e 3 secondi per punto (`prove\zone.ps1`), alla dimensione normale e grande della finestra. Nell'ultima restano le due precedenti (da 3 e 4 s; quella da 2 s è uscita), allineate all'inizio di ogni punto (0, 3,01 e 6,01 s), già visibili nei punti non ancora letti mentre la prova va avanti; fumetti dei grafici con i loro valori allo stesso istante del punto, fumetto del riquadro con velocità, durata e posizione, e vista con la casella spenta. Con una sola prova precedente la legenda va al singolare;
 - monitoraggio: avvio nascosto, icona, notifica (con un avviso simulato), consumo nullo a riposo, chiusura con `--quit`;
 - fumetti dei grafici (linea verticale, prova, valore e spiegazione) con un puntatore simulato; sui grafici di velocità e latenza uno sopra l'altro, il segno e la fascia della misura sullo stesso istante di entrambi e, nelle prove con coda, la coda della misura (Q2 con blocchi da 1M in sequenza, Q4 con blocchi da 256K a caso), confrontata con gli intervalli registrati;
 - «Riavvia come amministratore» e l'avvio diretto da amministratore (`--admin` e «Avvia sempre come amministratore»): la sequenza di rilancio, provata senza elevazione;
@@ -478,7 +485,9 @@ parziale, sceglie un tratto trascinando sul grafico e lo fa rileggere, e scrive 
 l'arresto, per verificare al lancio successivo che la memoria sia rimasta.
 Lo stesso file serve alla lettura a inizio, metà e fine del disco: con `MYSTORAGETEST_AUTOTEST=zone` la
 sequenza fa solo quella prova, con `MYSTORAGETEST_ZONE_SECS` secondi per punto (3 se non indicato),
-salva le schermate con i fumetti di grafici e riquadri e scrive tratti e risultati in `zone.txt`.
+salva le schermate con i fumetti di grafici e riquadri e scrive tratti e risultati in `zone.txt`. Con
+più valori separati da virgole («2,4,3,3») fa una prova per valore: le schermate sono dell'ultima, con
+le precedenti in trasparenza, e una è con il confronto spento.
 
 Gli script PowerShell in `prove\` lanciano queste verifiche in un'istanza isolata, che non prende il
 fuoco e non tocca quella in uso: `scenario.ps1` (prova completa con schermate), `schermate.ps1`,

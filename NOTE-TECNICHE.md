@@ -166,8 +166,8 @@ Note sull'ordine:
 ### Lettura a inizio, metà e fine del disco
 - Tre fasi, `Phase::Zone(Zone::Start|Middle|End)`, ognuna con il suo `Sampler`: entrano da sole nei
   grafici nel tempo, nell'istogramma e nella riga di comando. Lo stato condiviso ha `zone_secs` (0 = non
-  richiesta), `zone_spans` (tratto letto da ogni punto, aggiornato ogni 100 ms) e `file_tests`, che
-  serve a nascondere i riquadri vuoti delle prove su file.
+  richiesta), `zone_spans` (tratto letto da ogni punto, aggiornato ogni 100 ms), `zone_before` (prove
+  precedenti, vedi sotto) e `file_tests`, che serve a nascondere i riquadri vuoti delle prove su file.
 - Si apre `\\.\PhysicalDriveN` quando il volume sta su un disco solo (sui dischi meccanici conta la
   posizione sul disco, non nel volume); altrimenti, o se l'apertura fallisce, il volume `\\.\X:`. Le
   due strade richiedono l'amministratore. La lunghezza viene da `IOCTL_DISK_GET_LENGTH_INFO`.
@@ -185,6 +185,22 @@ Note sull'ordine:
 - Con `MYSTORAGETEST_SURFACE_FILE` si legge il file: è creato con `SetLength`, quindi oltre la valid
   data length Windows restituisce zeri senza toccare il disco (velocità di 10–20 GB/s, che non contano).
   Una pausa di 10 ms per lettura tiene i tratti piccoli.
+- Confronto con le prove precedenti: ogni `ZoneSpan` ha `started` (secondi dall'inizio della prova).
+  Quando si avvia una prova, `launch` prende dalla prova precedente dello stesso volume
+  `Shared::zone_run` (serie spostate perché partano dall'inizio di ogni punto, senza il massimo della
+  latenza né l'istogramma) più il suo `zone_before`, e ne tiene `ZONE_KEEP` = 2 nel `zone_before` della
+  nuova, come `surface_before` per la superficie. Una prova che non legge i tre punti le passa avanti
+  intatte. Solo in memoria.
+  - Disegno (`zone_ghosts`): ogni punto precedente comincia dove comincia lo stesso punto della prova; per i
+    punti non ancora cominciati, solo mentre la prova va avanti, dove si prevede (inizio del punto prima +
+    `zone_secs`). Finita la prova restano solo i punti letti davvero. Sono disegnati prima delle serie
+    della prova, la più vecchia sotto, con il colore del punto a 0,5 e 0,28 di opacità e tratteggiate:
+    più chiare e basta si confondevano con la linea tenue del massimo della latenza. Della latenza solo
+    la media.
+  - Fumetti: il campione della prova precedente più vicino allo stesso istante dall'inizio del punto,
+    se non è lontano più di mezzo secondo; segno sulla linea verticale anche per quelli.
+  - La casella sta fuori dal blocco disattivato durante la prova (`add_enabled_ui(!testing)`): riguarda
+    solo i grafici. È `Settings::zone_compare`, predefinita vera.
 - `Drop for TestRun` aspetta il thread al massimo 3 s.
 
 ## Elenco dei dischi (`disks.rs`)

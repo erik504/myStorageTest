@@ -29,6 +29,8 @@ pub struct Settings {
     pub scan_limit_gb: u32,
     /// Secondi di lettura in ciascun punto della prova «inizio, metà e fine del disco».
     pub zone_secs: u32,
+    /// Nei grafici nel tempo restano, in trasparenza, le prove precedenti dei tre punti sullo stesso volume.
+    pub zone_compare: bool,
     /// Per ogni volume, la percentuale a cui si è fermata l'ultima scansione della superficie
     /// rimasta a metà: è il punto da cui proporre la prossima.
     pub surface_reached: std::collections::BTreeMap<String, f64>,
@@ -54,6 +56,7 @@ impl Default for Settings {
             queue_step_ms: 1000,
             scan_limit_gb: 8,
             zone_secs: 10,
+            zone_compare: true,
             surface_reached: std::collections::BTreeMap::new(),
             always_admin: false,
             temp_sample_secs: 30,

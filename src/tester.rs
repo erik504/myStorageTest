@@ -113,6 +113,38 @@ pub struct ZoneSpan {
     pub target: String,
     /// Il tratto è finito prima del tempo ed è stato riletto da capo.
     pub wrapped: bool,
+    /// Secondi dall'inizio della prova in cui è cominciata la lettura in questo punto.
+    pub started: f64,
+}
+
+/// Prove precedenti dei tre punti tenute in memoria per volume, per il confronto nei grafici.
+pub const ZONE_KEEP: usize = 2;
+
+/// Un punto di una prova «inizio, metà e fine» già fatta: tratto letto, velocità media e serie dei
+/// grafici, con i secondi contati dall'inizio del punto.
+#[derive(Clone, Debug)]
+pub struct ZoneTrace {
+    pub span: ZoneSpan,
+    pub mbps: f64,
+    pub speed: Vec<[f64; 2]>,
+    pub lat_avg: Vec<[f64; 2]>,
+}
+
+/// Una prova «inizio, metà e fine» già fatta sullo stesso volume, che resta nei grafici delle prove dopo.
+#[derive(Clone, Debug)]
+pub struct ZoneRun {
+    /// Ora di inizio della prova: «14:32:05».
+    pub when: String,
+    /// Secondi di lettura scelti per ogni punto.
+    pub secs: f64,
+    /// I punti letti, nell'ordine.
+    pub zones: Vec<ZoneTrace>,
+}
+
+impl ZoneRun {
+    pub fn trace(&self, zone: Zone) -> Option<&ZoneTrace> {
+        self.zones.iter().find(|t| t.span.zone == zone)
+    }
 }
 
 impl ZoneSpan {
@@ -416,6 +448,9 @@ pub struct Shared {
     pub zone_secs: f64,
     /// Tratti letti da quella prova, nell'ordine: inizio, metà, fine.
     pub zone_spans: Vec<ZoneSpan>,
+    /// Prove precedenti dei tre punti sullo stesso volume, la più recente prima (al massimo
+    /// `ZONE_KEEP`): restano nei grafici per il confronto. Le prepara chi avvia la prova.
+    pub zone_before: Vec<ZoneRun>,
     /// Scansione della superficie, lungo il disco e non nel tempo: i tratti letti, in ordine.
     pub surface: Vec<Tract>,
     /// Posizioni in byte dei blocchi che non si sono lasciati leggere.
@@ -473,6 +508,35 @@ impl Shared {
 
     pub fn result(&self, phase: Phase) -> Option<&PhaseResult> {
         self.results.iter().find(|r| r.phase == phase)
+    }
+
+    /// La lettura dei tre punti di questa prova, pronta per restare nei grafici delle prove dopo:
+    /// i secondi delle serie partono dall'inizio di ogni punto. `None` se non ha letto nulla.
+    pub fn zone_run(&self, when: &str) -> Option<ZoneRun> {
+        let zones: Vec<ZoneTrace> = self
+            .zone_spans
+            .iter()
+            .filter_map(|span| {
+                let phase = Phase::Zone(span.zone);
+                let s = &self.series.iter().find(|(p, _)| *p == phase)?.1;
+                if s.speed.is_empty() && s.lat_avg.is_empty() {
+                    return None;
+                }
+                let shift = |pts: &[[f64; 2]]| pts.iter().map(|q| [q[0] - span.started, q[1]]).collect();
+                Some(ZoneTrace {
+                    span: span.clone(),
+                    mbps: self.result(phase).map_or(0.0, |r| r.mbps),
+                    speed: shift(&s.speed),
+                    lat_avg: shift(&s.lat_avg),
+                })
+            })
+            .collect();
+        (!zones.is_empty()).then(|| ZoneRun {
+            // «28/11/2026 14:32:05» → «14:32:05».
+            when: when.rsplit(' ').next().unwrap_or(when).to_string(),
+            secs: self.zone_secs,
+            zones,
+        })
     }
 }
 
@@ -2483,6 +2547,7 @@ impl Engine {
                 length,
                 target: target.clone(),
                 wrapped: false,
+                started: self.now(),
             };
             self.shared.lock().unwrap().zone_spans.push(span.clone());
             let publish = |span: &ZoneSpan| {
@@ -2762,6 +2827,7 @@ mod tests {
             length: 4_000_000_000_000,
             target: "disco 2".into(),
             wrapped: false,
+            started: 0.0,
         };
         assert_eq!(span(0, 2_000_000_000).position(), "0–0,05 %");
         assert_eq!(span(1_999_000_000_000, 2_001_000_000_000).position(), "49,98–50,02 %");
@@ -2773,5 +2839,42 @@ mod tests {
         assert_eq!(compare_to_start(100.0, 200.0), "50 % più lenta che all'inizio");
         assert_eq!(compare_to_start(199.0, 200.0), "come all'inizio");
         assert_eq!(compare_to_start(230.0, 200.0), "15 % più veloce che all'inizio");
+    }
+
+    #[test]
+    fn prova_dei_tre_punti_tenuta_per_il_confronto() {
+        let mut sh = Shared {
+            zone_secs: 3.0,
+            ..Default::default()
+        };
+        assert!(sh.zone_run("28/11/2026 14:32:05").is_none());
+        for (zone, started) in [(Zone::Start, 0.5), (Zone::Middle, 3.6)] {
+            sh.zone_spans.push(ZoneSpan {
+                zone,
+                from: 0,
+                to: 1 << 20,
+                length: 1 << 30,
+                target: "disco 2".into(),
+                wrapped: false,
+                started,
+            });
+            let s = sh.series_mut(Phase::Zone(zone));
+            s.speed = vec![[started + 0.1, 180.0], [started + 0.2, 182.0]];
+            s.lat_avg = vec![[started + 0.1, 5.5], [started + 0.2, 5.4]];
+        }
+        // La fine è cominciata ma non ha ancora punti: non entra.
+        sh.zone_spans.push(ZoneSpan {
+            zone: Zone::End,
+            started: 6.7,
+            ..sh.zone_spans[0].clone()
+        });
+        let run = sh.zone_run("28/11/2026 14:32:05").unwrap();
+        assert_eq!(run.when, "14:32:05");
+        assert_eq!(run.secs, 3.0);
+        assert_eq!(run.zones.len(), 2);
+        let middle = run.trace(Zone::Middle).unwrap();
+        assert!((middle.speed[0][0] - 0.1).abs() < 1e-9 && (middle.lat_avg[1][0] - 0.2).abs() < 1e-9);
+        assert_eq!(middle.speed[1][1], 182.0);
+        assert!(run.trace(Zone::End).is_none());
     }
 }
